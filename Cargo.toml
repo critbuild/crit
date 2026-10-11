@@ -1,0 +1,28 @@
+[package]
+name = "crit"
+version = "0.1.0"
+edition = "2024"
+description = "A worktree-first terminal for OMP and OpenCode"
+license = "Apache-2.0"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.29"
+jsonc-parser = { version = "0.29", features = ["serde"] }
+libc = "0.2"
+parking_lot = "0.12"
+portable-pty = "0.9"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+unicode-width = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+signal-hook = "0.3"
+tempfile = "3"
+toml = "0.8"
+vt100 = "0.16"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
