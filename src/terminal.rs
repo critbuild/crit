@@ -419,6 +419,11 @@ impl KeyboardModes {
 }
 
 impl vt100::Callbacks for Responses {
+    fn copy_to_clipboard(&mut self, _: &mut vt100::Screen, ty: &[u8], data: &[u8]) {
+        // Clipboard queries intentionally keep the trait's no-op implementation.
+        let _ = crate::clipboard::copy_encoded(ty, data);
+    }
+
     fn unhandled_csi(
         &mut self,
         screen: &mut vt100::Screen,

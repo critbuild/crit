@@ -22,6 +22,9 @@ tempfile = "3"
 toml = "0.8"
 vt100 = "0.16"
 
+[patch.crates-io]
+vt100 = { path = "vendor/vt100" }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

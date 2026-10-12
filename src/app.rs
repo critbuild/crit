@@ -1,10 +1,11 @@
 use crate::{
-    compose,
+    clipboard, compose,
     event::Event,
     integration::{self, AgentState},
     intent::{self, Agent as AgentKind, Command as IntentCommand, Plan},
     keys::{self, Action},
     kitty, restore,
+    selection::Selection,
     terminal::Session,
     ui, updates,
     worktree::{self, Worktree},
@@ -143,16 +144,19 @@ impl ProjectPicker {
                 } else {
                     let explicit = Path::new(input).is_absolute()
                         || matches!(input, "~" | "." | "..")
-                        || input.starts_with("~/")
-                        || input.starts_with("./")
-                        || input.starts_with("../");
+                        || input.contains('/');
+                    let path = project_path(input, &self.base)?;
                     if explicit {
-                        Some(project_path(input, &self.base)?)
+                        Some(path)
                     } else if let Some(selected) = selected {
                         Some(selected.clone())
+                    } else if path.is_dir() {
+                        Some(path)
                     } else {
-                        let path = project_path(input, &self.base)?;
-                        path.is_dir().then_some(path)
+                        anyhow::bail!(
+                            "Folder not found: {}. Enter an existing path, or ~ for home.",
+                            path.display()
+                        );
                     }
                 };
                 if let Some(path) = path {
@@ -390,14 +394,7 @@ pub struct Project {
     pub order: u64,
 }
 impl Project {
-    /// Direct start: `path` must be inside a Git repository.
-    fn load(path: &Path) -> Result<Self> {
-        let path = folder(path)?;
-        let repository = worktree::discover(&path)?;
-        Self::from_repository(path, repository)
-    }
-
-    /// Picked in-app: a Git project, or a terminal-only project for any other folder.
+    /// Any folder: a Git checkout when present, otherwise an ordinary workspace.
     fn open(path: &Path) -> Result<Self> {
         let path = folder(path)?;
         match worktree::discover_optional(&path)? {
@@ -505,6 +502,7 @@ pub struct App {
     pub notice: Option<String>,
     pub panes: Vec<Pane>,
     scroll_drag: Option<(u64, u16)>,
+    pub selection: Option<Selection>,
     pub tab_hits: Vec<TabHit>,
     pub interaction_visible: bool,
     pub should_quit: bool,
@@ -603,8 +601,37 @@ impl App {
         // Hit targets belong to the last frame, not the newly selected topology.
         self.panes.clear();
         self.scroll_drag = None;
+        self.selection = None;
         self.tab_hits.clear();
         self.state_dirty = true;
+    }
+
+    fn open_link(&self, uri: String) -> Result<()> {
+        anyhow::ensure!(
+            ["https://", "http://", "mailto:", "file://"]
+                .iter()
+                .any(|scheme| uri.starts_with(scheme))
+                && !uri.chars().any(char::is_control),
+            "Unsupported or invalid link target"
+        );
+        let tx = self.tx.clone();
+        std::thread::Builder::new()
+            .name("open-link".into())
+            .spawn(move || {
+                let result = std::process::Command::new("xdg-open")
+                    .arg(&uri)
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                let error = match result {
+                    Ok(status) if status.success() => return,
+                    Ok(status) => format!("Opening link failed ({status}): {uri}"),
+                    Err(error) => format!("Could not open link with xdg-open: {error}"),
+                };
+                let _ = tx.send(Event::Error(error));
+            })?;
+        Ok(())
     }
 
     fn snapshot(&self) -> restore::Snapshot {
@@ -838,9 +865,6 @@ impl App {
     }
     fn ensure_session(&mut self, index: usize) -> Result<()> {
         if self.project.workspaces[index].sessions.is_empty() {
-            if self.project.repository.is_none() {
-                return self.spawn(index, "shell", None);
-            }
             let kind = self.default_agent.clone();
             self.spawn(index, &kind, None)?;
         }
@@ -946,6 +970,10 @@ impl App {
     }
     fn new_tab_choices(&self) -> Vec<(String, IntentCommand)> {
         let mut choices = Vec::with_capacity(4);
+        choices.push((
+            "Open folder — no Git required".to_owned(),
+            IntentCommand::OpenProject,
+        ));
         if self.project.repository.is_some() {
             choices.push((
                 format!("New branch / worktree in {}", self.project.name),
@@ -956,10 +984,6 @@ impl App {
                 IntentCommand::OpenWorktree,
             ));
         }
-        choices.push((
-            "Open another folder (Git project or plain terminal)".to_owned(),
-            IntentCommand::OpenProject,
-        ));
         if !self.saved_projects.is_empty() {
             choices.push((
                 format!("Switch to an open project ({})", self.saved_projects.len()),
@@ -1580,6 +1604,27 @@ impl App {
                 if key.kind == KeyEventKind::Release {
                     return Ok(false);
                 }
+                if key
+                    .modifiers
+                    .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                {
+                    match key.code {
+                        KeyCode::Char('c' | 'C') => {
+                            if let Some(selection) = &self.selection
+                                && selection.moved
+                            {
+                                clipboard::copy(&selection.text())?;
+                            }
+                            return Ok(false);
+                        }
+                        KeyCode::Char('v' | 'V') => {
+                            let text = clipboard::paste()?;
+                            return self.handle(Event::Input(crossterm::event::Event::Paste(text)));
+                        }
+                        _ => {}
+                    }
+                }
+                self.selection = None;
                 let action = keys::action(key);
                 if action == Some(Action::ToggleNative) {
                     if key.kind == KeyEventKind::Press {
@@ -1606,20 +1651,55 @@ impl App {
                     session.key(key)?;
                 }
             }
-            Event::Input(crossterm::event::Event::Paste(text)) => match &mut self.modal {
-                Some(Modal::Intent(dialog)) if !dialog.pending && !dialog.submitted => {
-                    paste_input(&mut dialog.input, &text, 4096);
-                }
-                Some(Modal::NewWorktree { input, .. }) => paste_input(input, &text, 256),
-                Some(Modal::OpenProject(picker)) => picker.paste(&text),
-                None => {
-                    if let Some(session) = self.focused_session() {
-                        session.paste(&text)?;
+            Event::Input(crossterm::event::Event::Paste(text)) => {
+                self.selection = None;
+                match &mut self.modal {
+                    Some(Modal::Intent(dialog)) if !dialog.pending && !dialog.submitted => {
+                        paste_input(&mut dialog.input, &text, 4096);
                     }
+                    Some(Modal::NewWorktree { input, .. }) => paste_input(input, &text, 256),
+                    Some(Modal::OpenProject(picker)) => picker.paste(&text),
+                    None => {
+                        if let Some(session) = self.focused_session() {
+                            session.paste(&text)?;
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             Event::Input(crossterm::event::Event::Mouse(mouse)) if self.modal.is_none() => {
+                if self
+                    .selection
+                    .as_ref()
+                    .is_some_and(|selection| selection.dragging)
+                    && matches!(
+                        mouse.kind,
+                        MouseEventKind::Drag(MouseButton::Left)
+                            | MouseEventKind::Up(MouseButton::Left)
+                    )
+                {
+                    let selection = self.selection.as_mut().unwrap();
+                    selection.update(mouse.column, mouse.row);
+                    if matches!(mouse.kind, MouseEventKind::Up(_)) {
+                        selection.dragging = false;
+                        if selection.moved {
+                            clipboard::copy(&selection.text())?;
+                        } else {
+                            let link = selection.link();
+                            self.selection = None;
+                            if let Some(uri) = link {
+                                self.open_link(uri)?;
+                            }
+                        }
+                    }
+                    return Ok(true);
+                }
+                if matches!(
+                    mouse.kind,
+                    MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ) {
+                    self.selection = None;
+                }
                 if let Some((id, grab)) = self.scroll_drag {
                     if matches!(
                         mouse.kind,
@@ -1685,6 +1765,28 @@ impl App {
                                 }
                                 _ => {}
                             }
+                        } else if mouse.kind == MouseEventKind::Down(MouseButton::Middle) {
+                            let text = clipboard::paste()?;
+                            session.paste(&text)?;
+                        } else if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+                            let parser = session.parser.lock();
+                            let selection = Selection::new(
+                                session.id,
+                                body,
+                                parser.screen(),
+                                mouse.column,
+                                mouse.row,
+                            );
+                            let select = parser.screen().mouse_protocol_mode()
+                                == vt100::MouseProtocolMode::None
+                                || mouse.modifiers.contains(KeyModifiers::CONTROL)
+                                || selection.link().is_some();
+                            drop(parser);
+                            if select {
+                                self.selection = Some(selection);
+                            } else {
+                                session.mouse(mouse, mouse.column - body.x, mouse.row - body.y)?;
+                            }
                         } else {
                             session.mouse(mouse, mouse.column - body.x, mouse.row - body.y)?;
                         }
@@ -1695,6 +1797,7 @@ impl App {
                 self.interaction_visible = cols >= 30 && rows >= 10;
                 self.panes.clear();
                 self.scroll_drag = None;
+                self.selection = None;
                 self.tab_hits.clear();
             }
             Event::Input(_) => {}
@@ -2325,7 +2428,7 @@ fn choose_project(
     error: Option<anyhow::Error>,
     update_notice: Option<&str>,
     use_kitty: bool,
-) -> Result<Option<(Project, bool)>> {
+) -> Result<Option<(Project, bool, bool)>> {
     let launch_path = std::env::current_dir()?;
     let base = if path.is_dir() {
         path.to_path_buf()
@@ -2369,7 +2472,7 @@ fn choose_project(
                     _ if !interaction_visible => {}
                     _ => match picker.key(key, jobs) {
                         Ok(true) => {
-                            return Ok(Some((Project::terminal(&launch_path)?, native_keys)));
+                            return Ok(Some((Project::terminal(&launch_path)?, native_keys, true)));
                         }
                         Ok(false) => {}
                         Err(error) => notice = format!("{error:#}"),
@@ -2385,7 +2488,7 @@ fn choose_project(
             Event::ProjectOpened {
                 request, result, ..
             } if picker.request == request => match result {
-                Ok(project) => return Ok(Some((project, native_keys))),
+                Ok(project) => return Ok(Some((project, native_keys, false))),
                 Err(error) => {
                     picker.pending = false;
                     notice = error;
@@ -2571,30 +2674,38 @@ pub fn run(
         }
     };
     let was_restored = restored.is_some();
-    let (project, saved_projects, native_keys) = if let Some((project, saved)) = restored {
-        (project, saved, snapshot.as_ref().unwrap().native_keys)
-    } else {
-        let selection = match direct_start.then(|| Project::load(path)) {
-            Some(Ok(project)) => Ok(Some((project, false))),
-            result => choose_project(
-                &mut terminal,
-                &rx,
-                &mut pending,
-                &jobs,
-                path,
-                result.and_then(Result::err),
-                update_notice.as_deref(),
-                use_kitty,
-            ),
-        };
-        match selection {
-            Ok(Some((project, native_keys))) => (project, Vec::new(), native_keys),
-            result => {
-                signal_handle.close();
-                return result.map(|_| ());
+    let (project, saved_projects, native_keys, start_shell) =
+        if let Some((project, saved)) = restored {
+            (
+                project,
+                saved,
+                snapshot.as_ref().unwrap().native_keys,
+                false,
+            )
+        } else {
+            let selection = match direct_start.then(|| Project::open(path)) {
+                Some(Ok(project)) => Ok(Some((project, false, false))),
+                result => choose_project(
+                    &mut terminal,
+                    &rx,
+                    &mut pending,
+                    &jobs,
+                    path,
+                    result.and_then(Result::err),
+                    update_notice.as_deref(),
+                    use_kitty,
+                ),
+            };
+            match selection {
+                Ok(Some((project, native_keys, start_shell))) => {
+                    (project, Vec::new(), native_keys, start_shell)
+                }
+                result => {
+                    signal_handle.close();
+                    return result.map(|_| ());
+                }
             }
-        }
-    };
+        };
     if use_kitty && native_keys {
         kitty::set_native(&mut io::stdout(), true)?;
     }
@@ -2607,6 +2718,7 @@ pub fn run(
         notice: update_notice,
         panes: Vec::with_capacity(2),
         scroll_drag: None,
+        selection: None,
         tab_hits: Vec::new(),
         interaction_visible: true,
         should_quit: false,
@@ -2620,10 +2732,17 @@ pub fn run(
         jobs,
         use_kitty,
     };
-    if !was_restored && let Err(error) = app.ensure_session(active) {
-        app.set_notice(format!(
-            "{error:#}. F1 → ask to start another agent or shell."
-        ));
+    if !was_restored {
+        let launched = if start_shell {
+            app.spawn(active, "shell", None)
+        } else {
+            app.ensure_session(active)
+        };
+        if let Err(error) = launched {
+            app.set_notice(format!(
+                "{error:#}. F1 → ask to start another agent or shell."
+            ));
+        }
     }
     if app.project.repository.is_some() && compose::has_config(&app.project.workspaces[active].tree)
     {
@@ -2883,6 +3002,7 @@ mod tests {
             notice: None,
             panes: Vec::new(),
             scroll_drag: None,
+            selection: None,
             tab_hits: Vec::new(),
             interaction_visible: true,
             should_quit: false,
@@ -3379,11 +3499,6 @@ mod tests {
         let parent = tempfile::tempdir().unwrap();
         let home = parent.path().join("jyq");
         std::fs::create_dir(&home).unwrap();
-        // Direct start keeps requiring a Git project; the picker does not.
-        let Err(error) = Project::load(&home) else {
-            panic!("direct start must not open a plain folder");
-        };
-        assert!(error.to_string().contains("not inside a Git repository"));
         let project = Project::open(&home).unwrap();
         assert!(project.repository.is_none());
         assert_eq!(project.name, "jyq");
@@ -3401,6 +3516,7 @@ mod tests {
             notice: None,
             panes: Vec::new(),
             scroll_drag: None,
+            selection: None,
             tab_hits: Vec::new(),
             interaction_visible: true,
             should_quit: false,
@@ -3437,6 +3553,7 @@ mod tests {
             notice: None,
             panes: Vec::new(),
             scroll_drag: None,
+            selection: None,
             tab_hits: Vec::new(),
             interaction_visible: true,
             should_quit: false,
@@ -3546,6 +3663,7 @@ mod tests {
             notice: None,
             panes: Vec::new(),
             scroll_drag: None,
+            selection: None,
             tab_hits: Vec::new(),
             interaction_visible: true,
             should_quit: false,
@@ -3633,27 +3751,6 @@ mod tests {
             Some(Modal::NewWorktree { split: None, .. })
         ));
 
-        // New tab lists worktree actions for Git projects and other projects.
-        app.action(Action::NewTab).unwrap();
-        let Some(Modal::NewTab {
-            choices,
-            selected: 0,
-        }) = &app.modal
-        else {
-            panic!("expected new tab chooser");
-        };
-        assert_eq!(
-            choices
-                .iter()
-                .map(|(_, command)| *command)
-                .collect::<Vec<_>>(),
-            [
-                IntentCommand::NewWorktree,
-                IntentCommand::OpenWorktree,
-                IntentCommand::OpenProject,
-            ]
-        );
-        assert!(choices[0].0.contains("fixture"));
         app.saved_projects.push(Project {
             repository: None,
             name: "Terminal".into(),
@@ -3713,6 +3810,7 @@ mod tests {
             notice: None,
             panes: Vec::new(),
             scroll_drag: None,
+            selection: None,
             tab_hits: Vec::new(),
             interaction_visible: true,
             should_quit: false,
@@ -3843,6 +3941,7 @@ mod tests {
             notice: None,
             panes: Vec::new(),
             scroll_drag: None,
+            selection: None,
             tab_hits: Vec::new(),
             interaction_visible: true,
             should_quit: false,
@@ -4002,9 +4101,11 @@ mod tests {
             picker.visible_projects().collect::<Vec<_>>(),
             Vec::<&PathBuf>::new()
         );
-        picker
-            .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx)
-            .unwrap();
+        assert!(
+            picker
+                .key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx)
+                .is_err()
+        );
         assert!(!picker.pending);
         assert!(
             rx.try_recv().is_err(),

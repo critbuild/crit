@@ -380,6 +380,8 @@ pub fn command(
     }
     let mut args = Vec::new();
     if kind == "omp" {
+        // Crit has already chosen the workspace; do not relocate home to /tmp.
+        args.push("--allow-home".into());
         args.push("--extension".into());
         args.push(
             directory

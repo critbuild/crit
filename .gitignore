@@ -1,4 +1,6 @@
 /target/
+/vendor/vt100/Cargo.lock
+/vendor/vt100/target/
 /site/node_modules/
 /site/dist/
 /site/.astro/

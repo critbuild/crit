@@ -3,7 +3,7 @@ use std::io::{self, Write};
 
 pub const HELP: &str = "Crit shortcuts (same as Kitty's terminal/window actions)
   F12                    Toggle Crit / native Kitty shortcuts (persistent)
-  Ctrl+Shift+T            New tab: worktree, other project, or switch project
+  Ctrl+Shift+T            New tab: any folder (no Git required), worktree, or project
   Ctrl+Shift+Q            Close worktree tab; retain checkout
   Ctrl+Tab / Ctrl+Shift+Right  Next tab (wraps into the next open project)
   Ctrl+Shift+Tab / Left   Previous tab
@@ -21,8 +21,13 @@ pub const HELP: &str = "Crit shortcuts (same as Kitty's terminal/window actions)
 
 The agent keeps running when Ctrl+D selects a shell. In a shell, Ctrl+D remains
 normal EOF; native shortcut mode always forwards Ctrl+D to the focused terminal.
-Clipboard and font shortcuts remain native Kitty actions. Ctrl+C, Ctrl+Z,
-Tab, Escape, and ordinary typing go to the focused terminal.
+Drag terminal text to select and copy it; Ctrl+Shift+C copies the selection again.
+Ctrl+Shift+V pastes through Kitty; Shift+Insert pastes its primary selection.
+Middle-click pastes the local desktop clipboard. Over SSH, use native terminal paste.
+Ctrl+drag selects even in mouse-aware apps; ordinary clicks still reach those apps.
+Click a URL or an underlined labelled link to open it with the desktop URL handler.
+Font shortcuts remain native Kitty actions. Ctrl+C, Ctrl+Z, Tab, Escape, and
+ordinary typing go to the focused terminal.
 Typing or pasting returns a scrolled terminal to its live output.
 Wheel scrolls history unless the app captures it; Shift+wheel scrolls Crit history.
 Click or drag the right-edge scrollbar; its bottom returns to live output.

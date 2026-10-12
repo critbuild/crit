@@ -1,4 +1,5 @@
 mod app;
+mod clipboard;
 mod compose;
 mod event;
 mod integration;
@@ -6,6 +7,7 @@ mod intent;
 mod keys;
 mod kitty;
 mod restore;
+mod selection;
 mod terminal;
 mod ui;
 mod updates;
@@ -27,10 +29,10 @@ USAGE
   crit keys
 
 Crit restores your saved workspace on startup. With no saved workspace, choose
-New terminal or a Git project. F1 opens Ask Crit. Ctrl+D in an agent opens its
+New terminal or any folder. F1 opens Ask Crit. Ctrl+D in an agent opens its
 workspace shell without stopping it;
 Ctrl+D in a shell keeps normal EOF behavior, and native mode passes it through.
-Ctrl+Shift+T opens a new tab: a worktree here, another project folder, or an
+Ctrl+Shift+T opens a new tab: any folder (no Git required), a worktree, or an
 open project. Ctrl+Shift+, or . splits: name a branch and its worktree opens in
 the second pane. Ctrl+Shift+Enter opens a session. F12 persistently toggles
 Crit/native Kitty shortcuts. Run `crit setup kitty` once to enable the
@@ -60,8 +62,9 @@ APPEARANCE
   color when its remote-control socket is available.
   Crit removes Kitty padding/margins only in its own terminal and restores
   configured spacing on exit. Other terminals are unaffected.
-  A thin, soft-white divider spans the full terminal width below workspace/
-  session headers. Its row is excluded from the embedded terminal's size.
+  A muted, low-contrast divider spans the full terminal width below workspace/
+  session headers. Stroke thickness is terminal-rendered; its row is excluded
+  from the embedded terminal's size.
   No bottom row is reserved when there is no notice.
   Window shape, rounded corners, borders, shadows, and desktop gaps stay under
   your normal compositor configuration; Crit installs no desktop overrides.
@@ -74,6 +77,17 @@ APPEARANCE
   Click or drag it to review history or return to live output at the bottom.
   Mouse-aware apps receive the wheel normally; Shift+wheel scrolls Crit's
   history instead. Typing or pasting returns to live output.
+
+COPY, PASTE, AND LINKS
+  Drag terminal text to select it and copy to the clipboard and primary selection.
+  Ctrl+Shift+C copies again. Ctrl+drag overrides a child application's mouse capture.
+  Ctrl+Shift+V uses Kitty's clipboard paste; Shift+Insert uses primary selection.
+  Middle-click and forwarded Ctrl+Shift+V use wl-paste, xclip, or xsel locally.
+  Over SSH, native terminal paste works without those local clipboard tools.
+  Click plain URLs or underlined OSC 8 links to open the exact target via xdg-open.
+  Agent OSC 52 clipboard writes are forwarded; unsolicited clipboard reads are not.
+  Run crit setup kitty after upgrading to install the updated clipboard mappings;
+  reload Kitty configuration with Ctrl+Shift+F5. Other Kitty windows are unaffected.
 
 UPDATES
   Each interactive startup runs omp update and opencode upgrade before
@@ -88,8 +102,10 @@ PROJECTS
   Run crit from any folder, including a Git checkout, to choose New terminal
   or a project. New terminal starts your shell in the launch folder; it needs
   no Git repository and does not create one. It is the first, selected row.
-  Explicit --repo or --agent opens that Git project directly when possible;
-  --agent shell retains direct shell startup in the selected checkout.
+  Explicit --repo or --agent can open any existing folder directly, with the
+  requested agent or shell. No Git initialization is required, including for research.
+  Crit passes --allow-home to OMP so a home-folder workspace stays in home,
+  rather than being automatically relocated to /tmp.
   The picker finds Git projects near the launch folder and under your home.
   Use Up/Down and Enter; no manual cd needed.
   Typing or pasting filters project names and paths, ignoring case.
@@ -100,14 +116,14 @@ PROJECTS
   or paste a project path instead. Escape exits without opening a project.
   Stale Git markers do not hide valid projects beneath them.
   Ask \"open a project\" to browse Git folders, subfolders, or worktrees.
-  Absolute, ~/, ./ and ../ paths open directly. Other relative folders open
-  when no detected project matches; paths use the displayed base folder.
-  A folder outside any Git repository opens as a terminal-only tab named
-  after the folder. Opening a Git folder opens only its checkout, not every
-  branch/worktree.
+  Absolute paths, ~, and paths containing / open directly. Other relative folders
+  open when no detected project matches; paths use the displayed base folder.
+  A folder outside Git opens as a workspace named after the folder and can run
+  OMP, OpenCode, or shells. New tabs default to Open folder; enter ~ for home.
+  Opening a Git folder opens only its checkout, not every branch/worktree.
   Ask to open an existing worktree or switch to a named project.
   Already open projects and shell/agent sessions stay alive when switching.
-  A terminal-only workspace can open Git projects later through F1 / F2.
+  An ordinary folder workspace can open Git projects later through F1 / F2.
   Worktree and Docker actions require opening a Git project first.
   New worktrees use the focused checkout's current HEAD, not another project.
   Esc cancels pending project opens and worktree listings; late results

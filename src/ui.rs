@@ -22,6 +22,7 @@ const FG: Color = Color::Rgb(224, 228, 232);
 const BG: Color = Color::Reset;
 const MUTED: Color = Color::Rgb(154, 165, 180);
 const BORDER: Color = Color::Rgb(51, 62, 77);
+const HEADER_DIVIDER: Color = Color::Rgb(112, 114, 116);
 const SURFACE: Color = Color::Rgb(32, 44, 56);
 const ACCENT: Color = Color::Rgb(144, 191, 255);
 const GREEN: Color = Color::Rgb(165, 214, 179);
@@ -103,6 +104,13 @@ pub fn resize_sessions(app: &mut App, size: Size) -> Result<()> {
         let rect = body(*area);
         let workspace = &mut app.project.workspaces[index];
         if let Some(session) = workspace.sessions.get_mut(workspace.selected) {
+            if app
+                .selection
+                .as_ref()
+                .is_some_and(|selection| selection.session == session.id && selection.body != rect)
+            {
+                app.selection = None;
+            }
             session.resize(rect.height, rect.width)?;
         }
     }
@@ -161,6 +169,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             pane_body,
             focused,
             app.modal.is_none(),
+            app.selection.as_ref(),
         );
         app.panes.push(Pane {
             workspace: index,
@@ -170,7 +179,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         if area.height >= HEADER_ROWS && (pane == 0 || app.project.layout == LayoutMode::Horizontal)
         {
             // Span both side-by-side panes, including their shared separator.
-            line_horizontal(frame.buffer_mut(), bounds.x, area.y + 1, bounds.width, FG);
+            line_horizontal(
+                frame.buffer_mut(),
+                bounds.x,
+                area.y + 1,
+                bounds.width,
+                HEADER_DIVIDER,
+            );
         }
     }
     if let Some(notice) = &app.notice {
@@ -290,6 +305,7 @@ fn draw_workspace(
     body: Rect,
     focused: bool,
     show_cursor: bool,
+    selection: Option<&crate::selection::Selection>,
 ) -> Option<Scrollbar> {
     if area.height < 2 || area.width < 3 {
         return None;
@@ -357,11 +373,16 @@ fn draw_workspace(
         let mut parser = session.parser.lock();
         // Clear while holding the parser lock: output after this frame must wake us.
         session.dirty.store(false, Ordering::Release);
+        let selection =
+            selection.filter(|selection| selection.session == session.id && selection.body == body);
         let scrollbar = scrollbar(parser.screen_mut(), body);
         let screen = parser.screen();
         for row in 0..body.height {
             for col in 0..body.width {
-                let Some(cell) = screen.cell(row, col) else {
+                let Some(cell) = selection.map_or_else(
+                    || screen.cell(row, col),
+                    |selection| selection.cell(row, col),
+                ) else {
                     continue;
                 };
                 let target = &mut frame.buffer_mut()[(body.x + col, body.y + row)];
@@ -392,10 +413,24 @@ fn draw_workspace(
                 if cell.inverse() {
                     style = style.add_modifier(Modifier::REVERSED);
                 }
+                if cell.hyperlink().is_some() {
+                    style = style.add_modifier(Modifier::UNDERLINED);
+                }
+                if selection.is_some_and(|selection| selection.selected(row, col)) {
+                    style = style
+                        .fg(SURFACE)
+                        .bg(ACCENT)
+                        .remove_modifier(Modifier::REVERSED);
+                }
                 target.set_style(style);
             }
         }
-        if focused && show_cursor && !screen.hide_cursor() && screen.scrollback() == 0 {
+        if focused
+            && show_cursor
+            && selection.is_none()
+            && !screen.hide_cursor()
+            && screen.scrollback() == 0
+        {
             let (row, col) = screen.cursor_position();
             if row < body.height && col < body.width {
                 frame.set_cursor_position((body.x + col, body.y + row));

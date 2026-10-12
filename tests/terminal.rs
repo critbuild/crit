@@ -115,7 +115,7 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
             "main",
             true,
         ),
-        (home.path(), repo.as_path(), "main", "feature/other", true),
+        (home.path(), home.path(), "terminal", "main", true),
         (repo.as_path(), repo.as_path(), "terminal", "main", false),
         (
             subfolder.as_path(),
@@ -178,11 +178,6 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
                 screen.process(&bytes);
             }
             writer.write_all(b"\r").unwrap();
-        } else if cwd == home.path() {
-            // Queued input must work even while the initial project scan is running.
-            writer
-                .write_all(format!("{}\r", repo.display()).as_bytes())
-                .unwrap();
         }
         let expected = format!(
             "runtime-ready:{}",

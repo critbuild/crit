@@ -3,7 +3,7 @@
  * Fig. 01, the Parallel switchboard: an interactive, illustrative Crit workspace.
  * The window borrows the TUI's own vocabulary and palette: numbered tabs with
  * state marks and a `› label` workspace header with `[kind n · state]` sessions.
- * A soft-white rule separates the header from terminal content. Every pane,
+ * A muted, low-contrast rule separates the header from terminal content. Every pane,
  * session chip and transcript is rendered here, so Astro's scoped styles apply
  * and the figure reads correctly without JavaScript; the script only flips
  * attributes and announces each change in the status line.
@@ -237,6 +237,7 @@ const clientLanes = lanes.map(({ id, branch, sessions }) => ({
     --sb-out: #c3cad3;
     --sb-muted: #9aa5b4;
     --sb-border: #333e4d;
+    --sb-header-divider: #707274;
     --sb-accent: #90bfff;
     --sb-green: #a5d6b3;
     --sb-amber: #e8bc80;
@@ -361,7 +362,7 @@ const clientLanes = lanes.map(({ id, branch, sessions }) => ({
   .sb-pane[data-slot='secondary'] { order: 2; }
   .sb[data-layout='vertical'] .sb-pane[data-slot='secondary'] { border-left: 1px solid var(--sb-border); }
   .sb[data-layout='horizontal'] .sb-pane[data-slot='secondary'] { border-top: 1px solid var(--sb-border); }
-  .sb-head { display: flex; flex-wrap: wrap; padding: 6px; margin-bottom: 6px; border-bottom: 1px solid var(--sb-fg); color: var(--sb-muted); white-space: pre; }
+  .sb-head { display: flex; flex-wrap: wrap; padding: 6px; margin-bottom: 6px; border-bottom: 1px solid var(--sb-header-divider); color: var(--sb-muted); white-space: pre; }
   .sb-label { padding: 0 1ch; color: var(--sb-fg); }
   .sb-pane[data-focused] .sb-label { color: var(--sb-accent); }
   .sb-pane[data-focused] .sb-label::before { content: '› '; }
