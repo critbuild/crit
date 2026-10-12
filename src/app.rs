@@ -267,13 +267,19 @@ pub const COMMANDS: &[(&str, IntentCommand)] = &[
     ("Exit Crit", IntentCommand::Quit),
 ];
 
+#[derive(Clone, Copy)]
+pub enum NewTabAction {
+    Home,
+    Command(IntentCommand),
+}
+
 pub enum Modal {
     Intent(IntentDialog),
     Commands {
         selected: usize,
     },
     NewTab {
-        choices: Vec<(String, IntentCommand)>,
+        choices: Vec<(String, NewTabAction)>,
         selected: usize,
     },
     OpenProject(ProjectPicker),
@@ -372,6 +378,39 @@ impl Scrollbar {
     }
 }
 
+#[derive(Clone, Copy)]
+pub struct SplitDivider {
+    pub track: Rect,
+    pub handle: Rect,
+    pub available_width: u16,
+}
+
+impl SplitDivider {
+    const MIN_PANE_WIDTH: u16 = 28;
+
+    pub fn left_width(available_width: u16, ratio: u16) -> u16 {
+        let scale = u32::from(restore::SPLIT_RATIO_SCALE);
+        let width = (u32::from(available_width) * u32::from(ratio.min(restore::SPLIT_RATIO_SCALE))
+            + scale / 2)
+            / scale;
+        let minimum = Self::MIN_PANE_WIDTH.min(available_width / 2);
+        (width as u16).clamp(minimum, available_width - minimum)
+    }
+
+    fn ratio_at(self, column: u16, grab: u16) -> u16 {
+        let minimum = Self::MIN_PANE_WIDTH.min(self.available_width / 2);
+        // Grab offset is relative to the handle's left edge, before the pane boundary.
+        let width = (u32::from(column) + u32::from(self.track.x - self.handle.x))
+            .saturating_sub(u32::from(grab))
+            .clamp(
+                u32::from(minimum),
+                u32::from(self.available_width - minimum),
+            );
+        ((width * u32::from(restore::SPLIT_RATIO_SCALE) + u32::from(self.available_width) / 2)
+            / u32::from(self.available_width.max(1))) as u16
+    }
+}
+
 /// A clickable cell in the tab bar: a project name (`workspace: None`) or one
 /// of its worktrees. `project: None` is the current project; `Some(i)` indexes
 /// `App::saved_projects`.
@@ -389,6 +428,7 @@ pub struct Project {
     pub secondary: Option<usize>,
     pub focus_secondary: bool,
     pub layout: LayoutMode,
+    pub split_ratio: u16,
     /// Opening sequence; the tab bar lists projects in this order regardless
     /// of which one is current. `App::saved_projects` stays sorted by it.
     pub order: u64,
@@ -422,6 +462,7 @@ impl Project {
             secondary: None,
             focus_secondary: false,
             layout: LayoutMode::Full,
+            split_ratio: restore::default_split_ratio(),
             order: 0,
         })
     }
@@ -448,6 +489,7 @@ impl Project {
             secondary: None,
             focus_secondary: false,
             layout: LayoutMode::Full,
+            split_ratio: restore::default_split_ratio(),
             order: 0,
         })
     }
@@ -502,6 +544,8 @@ pub struct App {
     pub notice: Option<String>,
     pub panes: Vec<Pane>,
     scroll_drag: Option<(u64, u16)>,
+    pub split_divider: Option<SplitDivider>,
+    pub split_drag: Option<u16>,
     pub selection: Option<Selection>,
     pub tab_hits: Vec<TabHit>,
     pub interaction_visible: bool,
@@ -601,9 +645,17 @@ impl App {
         // Hit targets belong to the last frame, not the newly selected topology.
         self.panes.clear();
         self.scroll_drag = None;
+        self.split_divider = None;
+        self.split_drag = None;
         self.selection = None;
         self.tab_hits.clear();
         self.state_dirty = true;
+    }
+
+    pub fn finish_split_drag(&mut self) {
+        if self.split_drag.take().is_some() {
+            self.state_dirty = true;
+        }
     }
 
     fn open_link(&self, uri: String) -> Result<()> {
@@ -683,6 +735,7 @@ impl App {
                         LayoutMode::Vertical => restore::SavedLayout::Vertical,
                         LayoutMode::Horizontal => restore::SavedLayout::Horizontal,
                     },
+                    split_ratio: project.split_ratio,
                 }
             })
             .collect();
@@ -968,26 +1021,27 @@ impl App {
         }
         Ok(())
     }
-    fn new_tab_choices(&self) -> Vec<(String, IntentCommand)> {
-        let mut choices = Vec::with_capacity(4);
+    fn new_tab_choices(&self) -> Vec<(String, NewTabAction)> {
+        let mut choices = Vec::with_capacity(5);
+        choices.push(("Home (~)".to_owned(), NewTabAction::Home));
         choices.push((
             "Open folder — no Git required".to_owned(),
-            IntentCommand::OpenProject,
+            NewTabAction::Command(IntentCommand::OpenProject),
         ));
         if self.project.repository.is_some() {
             choices.push((
                 format!("New branch / worktree in {}", self.project.name),
-                IntentCommand::NewWorktree,
+                NewTabAction::Command(IntentCommand::NewWorktree),
             ));
             choices.push((
                 format!("Open existing worktree of {}", self.project.name),
-                IntentCommand::OpenWorktree,
+                NewTabAction::Command(IntentCommand::OpenWorktree),
             ));
         }
         if !self.saved_projects.is_empty() {
             choices.push((
                 format!("Switch to an open project ({})", self.saved_projects.len()),
-                IntentCommand::SwitchProject,
+                NewTabAction::Command(IntentCommand::SwitchProject),
             ));
         }
         choices
@@ -1130,6 +1184,23 @@ impl App {
         }
     }
 
+    fn open_path(&mut self, path: PathBuf, agent: Option<AgentKind>) -> Result<()> {
+        let request = self.new_request();
+        self.jobs
+            .try_send(Job::OpenProject {
+                request,
+                path,
+                agent,
+            })
+            .context("command queue is busy")?;
+        self.modal = Some(Modal::Loading {
+            request,
+            message: "Opening project...",
+            retry: None,
+        });
+        Ok(())
+    }
+
     fn execute_intent(&mut self, plan: Plan, targets: &[IntentTarget]) -> Result<()> {
         match plan {
             Plan::Clarify { .. } => anyhow::bail!("A clarification cannot execute an action"),
@@ -1155,19 +1226,7 @@ impl App {
                     .iter()
                     .find(|candidate| candidate.id == target)
                     .context("The interpreter selected an unknown project or worktree")?;
-                let request = self.new_request();
-                self.jobs
-                    .try_send(Job::OpenProject {
-                        request,
-                        path: target.path.clone(),
-                        agent,
-                    })
-                    .context("command queue is busy")?;
-                self.modal = Some(Modal::Loading {
-                    request,
-                    message: "Opening project...",
-                    retry: None,
-                });
+                self.open_path(target.path.clone(), agent)?;
             }
             Plan::Session { agent } => self.spawn(self.focused_index(), agent.as_str(), None)?,
             Plan::Command { command } => self.run_command(command)?,
@@ -1395,8 +1454,14 @@ impl App {
                 Modal::NewTab { choices, selected } => {
                     navigate(key, selected, choices.len());
                     if key.code == KeyCode::Enter {
-                        if let Some(&(_, command)) = choices.get(*selected) {
-                            self.run_command(command)?;
+                        if let Some(&(_, action)) = choices.get(*selected) {
+                            match action {
+                                NewTabAction::Home => {
+                                    let home = project_path("~", &self.focused().tree.path)?;
+                                    self.open_path(home, None)?;
+                                }
+                                NewTabAction::Command(command) => self.run_command(command)?,
+                            }
                         }
                         retain = false;
                     }
@@ -1601,6 +1666,7 @@ impl App {
         match event {
             Event::Input(crossterm::event::Event::Key(key)) => {
                 self.scroll_drag = None;
+                self.finish_split_drag();
                 if key.kind == KeyEventKind::Release {
                     return Ok(false);
                 }
@@ -1653,6 +1719,7 @@ impl App {
             }
             Event::Input(crossterm::event::Event::Paste(text)) => {
                 self.selection = None;
+                self.finish_split_drag();
                 match &mut self.modal {
                     Some(Modal::Intent(dialog)) if !dialog.pending && !dialog.submitted => {
                         paste_input(&mut dialog.input, &text, 4096);
@@ -1668,6 +1735,53 @@ impl App {
                 }
             }
             Event::Input(crossterm::event::Event::Mouse(mouse)) if self.modal.is_none() => {
+                if let Some(grab) = self.split_drag {
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::Drag(MouseButton::Left)
+                            | MouseEventKind::Up(MouseButton::Left)
+                    ) {
+                        if let Some(divider) = self.split_divider {
+                            let ratio = divider.ratio_at(mouse.column, grab);
+                            if SplitDivider::left_width(divider.available_width, ratio)
+                                != SplitDivider::left_width(
+                                    divider.available_width,
+                                    self.project.split_ratio,
+                                )
+                            {
+                                self.project.split_ratio = ratio;
+                            }
+                        }
+                        if matches!(mouse.kind, MouseEventKind::Up(_)) {
+                            self.finish_split_drag();
+                        }
+                        return Ok(true);
+                    }
+                    if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                        self.finish_split_drag();
+                    }
+                }
+                if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+                    && let Some(divider) = self.split_divider
+                    && Rect::new(
+                        divider.handle.x,
+                        divider.track.y,
+                        divider.handle.width,
+                        divider.track.height,
+                    )
+                    .contains((mouse.column, mouse.row).into())
+                    && (mouse.column != divider.handle.x
+                        || mouse.row == divider.handle.y
+                        || self
+                            .panes
+                            .first()
+                            .is_some_and(|pane| pane.scrollbar.is_none()))
+                {
+                    self.selection = None;
+                    self.scroll_drag = None;
+                    self.split_drag = Some(mouse.column - divider.handle.x);
+                    return Ok(true);
+                }
                 if self
                     .selection
                     .as_ref()
@@ -1797,6 +1911,8 @@ impl App {
                 self.interaction_visible = cols >= 30 && rows >= 10;
                 self.panes.clear();
                 self.scroll_drag = None;
+                self.finish_split_drag();
+                self.split_divider = None;
                 self.selection = None;
                 self.tab_hits.clear();
             }
@@ -2562,6 +2678,7 @@ fn restore_projects(
             restore::SavedLayout::Vertical => LayoutMode::Vertical,
             restore::SavedLayout::Horizontal => LayoutMode::Horizontal,
         };
+        project.split_ratio = saved.split_ratio;
         project.order = order as u64;
         projects.push(project);
     }
@@ -2711,6 +2828,8 @@ pub fn run(
     }
     let active = project.active;
     let mut app = App {
+        split_divider: None,
+        split_drag: None,
         project,
         saved_projects,
         native_keys,
@@ -2805,6 +2924,123 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_grip_drag_resizes_both_panes_without_changing_focus() {
+        // Either pane-edge arrow must grab without a one-column jump.
+        for grab in 0..2 {
+            let (mut app, _queued, _events) = interaction_app();
+            app.project.layout = LayoutMode::Vertical;
+            app.project.secondary = Some(1);
+            app.project.focus_secondary = true;
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+            terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+            let handle = app.split_divider.unwrap().handle;
+            let mouse = |kind, column, row| {
+                Event::Input(crossterm::event::Event::Mouse(
+                    crossterm::event::MouseEvent {
+                        kind,
+                        column,
+                        row,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                ))
+            };
+            let initial_ratio = app.project.split_ratio;
+            app.handle(mouse(
+                MouseEventKind::Down(MouseButton::Left),
+                handle.x + grab,
+                handle.y,
+            ))
+            .unwrap();
+            app.handle(mouse(
+                MouseEventKind::Drag(MouseButton::Left),
+                handle.x + grab,
+                handle.y,
+            ))
+            .unwrap();
+            assert_eq!(app.project.split_ratio, initial_ratio);
+            app.handle(mouse(MouseEventKind::Drag(MouseButton::Left), 78 + grab, 0))
+                .unwrap();
+            terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+            assert_eq!(app.split_divider.unwrap().track.x, 79);
+            assert_eq!(app.panes[0].body.width, 77);
+            assert_eq!(app.panes[1].body.width, 39);
+            assert!(app.project.focus_secondary);
+            assert!(app.selection.is_none());
+
+            // Capture continues outside the grip, but neither pane can collapse.
+            app.handle(mouse(MouseEventKind::Drag(MouseButton::Left), 0, 0))
+                .unwrap();
+            terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+            assert_eq!(app.panes[0].body.width, 26);
+            app.handle(mouse(
+                MouseEventKind::Up(MouseButton::Left),
+                u16::MAX,
+                u16::MAX,
+            ))
+            .unwrap();
+            terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+            assert_eq!(app.panes[1].body.width, 26);
+            assert!(app.split_drag.is_none());
+            let released = app.project.split_ratio;
+            app.handle(mouse(MouseEventKind::Drag(MouseButton::Left), 0, 0))
+                .unwrap();
+            assert_eq!(app.project.split_ratio, released);
+        }
+    }
+
+    #[test]
+    fn split_drag_cannot_survive_resize_or_closing_a_pane() {
+        let (mut app, _queued, _events) = interaction_app();
+        app.project.layout = LayoutMode::Vertical;
+        app.project.secondary = Some(1);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let mouse = |kind, column, row| {
+            Event::Input(crossterm::event::Event::Mouse(
+                crossterm::event::MouseEvent {
+                    kind,
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ))
+        };
+        let handle = app.split_divider.unwrap().handle;
+        app.handle(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            handle.x,
+            handle.y,
+        ))
+        .unwrap();
+        app.handle(Event::Input(crossterm::event::Event::Resize(40, 10)))
+            .unwrap();
+        let ratio = app.project.split_ratio;
+        app.handle(mouse(MouseEventKind::Drag(MouseButton::Left), 0, 0))
+            .unwrap();
+        assert_eq!(app.project.split_ratio, ratio);
+        assert!(app.split_drag.is_none());
+        let mut small = Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
+        small.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        assert!(app.split_divider.is_none());
+        assert_eq!(app.panes.len(), 1);
+
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let handle = app.split_divider.unwrap().handle;
+        app.handle(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            handle.x,
+            handle.y,
+        ))
+        .unwrap();
+        app.close_workspace();
+        app.handle(mouse(MouseEventKind::Drag(MouseButton::Left), 0, 0))
+            .unwrap();
+        assert_eq!(app.project.split_ratio, ratio);
+        assert!(app.split_divider.is_none());
+        assert!(app.split_drag.is_none());
+    }
 
     #[test]
     fn completed_local_preparation_releases_source_even_when_docker_fails() {
@@ -2971,6 +3207,8 @@ mod tests {
         let (jobs, queued) = mpsc::sync_channel(1);
         let root = PathBuf::from("/interaction-fixture");
         let app = App {
+            split_divider: None,
+            split_drag: None,
             project: Project {
                 repository: Some(worktree::Repository {
                     root: root.clone(),
@@ -2995,6 +3233,7 @@ mod tests {
                 focus_secondary: false,
                 layout: LayoutMode::Full,
                 order: 0,
+                split_ratio: restore::default_split_ratio(),
             },
             saved_projects: Vec::new(),
             native_keys: false,
@@ -3509,6 +3748,8 @@ mod tests {
         let (tx, _events) = mpsc::sync_channel(8);
         let (jobs, _queued) = mpsc::sync_channel(8);
         let mut app = App {
+            split_divider: None,
+            split_drag: None,
             project: Project::terminal(parent.path()).unwrap(),
             saved_projects: Vec::new(),
             native_keys: false,
@@ -3546,6 +3787,8 @@ mod tests {
         let (tx, _events) = mpsc::sync_channel(8);
         let (jobs, queued) = mpsc::sync_channel(8);
         let mut app = App {
+            split_divider: None,
+            split_drag: None,
             project: Project::terminal(directory.path()).unwrap(),
             saved_projects: Vec::new(),
             native_keys: false,
@@ -3586,13 +3829,6 @@ mod tests {
             );
         }
         assert!(app.split(LayoutMode::Vertical).is_err());
-        app.action(Action::NewTab).unwrap();
-        assert!(matches!(
-            &app.modal,
-            Some(Modal::NewTab { choices, selected: 0 })
-                if choices.iter().map(|(_, command)| *command).eq([IntentCommand::OpenProject])
-        ));
-        app.modal = None;
         assert!(app.env(0, EnvironmentOp::Status).is_err());
         assert!(
             app.execute_intent(
@@ -3644,6 +3880,8 @@ mod tests {
             })
         };
         let mut app = App {
+            split_divider: None,
+            split_drag: None,
             project: Project {
                 repository: Some(worktree::Repository {
                     root: root.clone(),
@@ -3656,6 +3894,7 @@ mod tests {
                 focus_secondary: false,
                 layout: LayoutMode::Full,
                 order: 0,
+                split_ratio: restore::default_split_ratio(),
             },
             saved_projects: Vec::new(),
             native_keys: false,
@@ -3760,15 +3999,10 @@ mod tests {
             focus_secondary: false,
             layout: LayoutMode::Full,
             order: 1,
+            split_ratio: restore::default_split_ratio(),
         });
         app.action(Action::NewTab).unwrap();
-        let Some(Modal::NewTab { choices, .. }) = &app.modal else {
-            panic!("expected new tab chooser");
-        };
-        assert_eq!(choices.last().unwrap().1, IntentCommand::SwitchProject);
-        for _ in 0..3 {
-            app.modal_key(press(KeyCode::Down)).unwrap();
-        }
+        app.modal_key(press(KeyCode::End)).unwrap();
         app.modal_key(press(KeyCode::Enter)).unwrap();
         assert!(matches!(
             app.modal,
@@ -3801,8 +4035,11 @@ mod tests {
             focus_secondary: false,
             layout: LayoutMode::Full,
             order,
+            split_ratio: restore::default_split_ratio(),
         };
         let mut app = App {
+            split_divider: None,
+            split_drag: None,
             project: project("alpha", 0, &["main", "dev"]),
             saved_projects: vec![project("beta", 1, &["main"])],
             native_keys: false,
@@ -3910,6 +4147,8 @@ mod tests {
         let (jobs, queued) = mpsc::sync_channel(8);
         let root = PathBuf::from("/intent-fixture");
         let mut app = App {
+            split_divider: None,
+            split_drag: None,
             project: Project {
                 repository: Some(worktree::Repository {
                     root: root.clone(),
@@ -3934,6 +4173,7 @@ mod tests {
                 focus_secondary: false,
                 layout: LayoutMode::Full,
                 order: 0,
+                split_ratio: restore::default_split_ratio(),
             },
             saved_projects: Vec::new(),
             native_keys: false,

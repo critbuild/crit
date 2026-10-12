@@ -1,7 +1,7 @@
 use crate::{
     app::{
         App, COMMANDS, Confirm, IntentDialog, LayoutMode, Modal, Pane, ProjectPicker, Scrollbar,
-        TabHit, Workspace, project_slots,
+        SplitDivider, TabHit, Workspace, project_slots,
     },
     integration::AgentState,
     updates::{State as UpdateState, TOOLS as UPDATE_TOOLS},
@@ -33,10 +33,15 @@ fn areas(app: &App, size: Size) -> ([Rect; 2], usize) {
     content.height = content
         .height
         .saturating_sub(notice_height(app.notice.as_deref(), size));
-    pane_areas(app.project.layout, app.project.secondary.is_some(), content)
+    pane_areas(
+        app.project.layout,
+        app.project.secondary.is_some(),
+        app.project.split_ratio,
+        content,
+    )
 }
 
-fn pane_areas(layout: LayoutMode, split: bool, size: Size) -> ([Rect; 2], usize) {
+fn pane_areas(layout: LayoutMode, split: bool, split_ratio: u16, size: Size) -> ([Rect; 2], usize) {
     // Only visible notices reserve bottom rows; areas() subtracts their height.
     let main = Rect::new(0, 1, size.width, size.height.saturating_sub(1));
     if !split || layout == LayoutMode::Full || size.width < 60 || size.height < 16 {
@@ -44,16 +49,11 @@ fn pane_areas(layout: LayoutMode, split: bool, size: Size) -> ([Rect; 2], usize)
     }
     match layout {
         LayoutMode::Vertical => {
-            let width = main.width.saturating_sub(1) / 2;
+            let width = SplitDivider::left_width(main.width, split_ratio);
             (
                 [
                     Rect::new(main.x, main.y, width, main.height),
-                    Rect::new(
-                        main.x + width + 1,
-                        main.y,
-                        main.width - width - 1,
-                        main.height,
-                    ),
+                    Rect::new(main.x + width, main.y, main.width - width, main.height),
                 ],
                 2,
             )
@@ -91,6 +91,33 @@ fn body(area: Rect) -> Rect {
     )
 }
 
+fn split_divider(layout: LayoutMode, panes: [Rect; 2], count: usize) -> Option<SplitDivider> {
+    if layout != LayoutMode::Vertical || count != 2 {
+        return None;
+    }
+    let content = body(panes[0]);
+    if content.height == 0 {
+        return None;
+    }
+    let track = Rect::new(panes[0].right(), content.y, 1, content.height);
+    Some(SplitDivider {
+        track,
+        // Reuse adjacent pane margins instead of reserving a middle gutter.
+        handle: Rect::new(track.x - MARGIN, track.y + track.height / 2, 2 * MARGIN, 1),
+        available_width: panes[0].width + panes[1].width,
+    })
+}
+
+fn draw_split_handle(buffer: &mut Buffer, divider: SplitDivider, dragging: bool) {
+    let color = if dragging { ACCENT } else { HEADER_DIVIDER };
+    buffer[(divider.handle.x, divider.handle.y)]
+        .set_symbol("⟨")
+        .set_fg(color);
+    buffer[(divider.handle.right() - 1, divider.handle.y)]
+        .set_symbol("⟩")
+        .set_fg(color);
+}
+
 pub fn resize_sessions(app: &mut App, size: Size) -> Result<()> {
     let (areas, count) = areas(app, size);
     for (pane, area) in areas.iter().enumerate().take(count) {
@@ -118,6 +145,7 @@ pub fn resize_sessions(app: &mut App, size: Size) -> Result<()> {
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    app.split_divider = None;
     let bounds = frame.area();
     app.interaction_visible = bounds.width >= 30 && bounds.height >= 10;
     frame
@@ -126,6 +154,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.tab_hits.clear();
     app.panes.clear();
     if bounds.width < 30 || bounds.height < 10 {
+        app.finish_split_drag();
         frame.render_widget(
             Paragraph::new("crit — enlarge terminal to at least 30×10. F12 toggles Kitty keys.")
                 .wrap(Wrap { trim: false }),
@@ -136,21 +165,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let width = draw_key_mode(frame, app.native_keys, true);
     draw_tabs(frame, app, bounds.width.saturating_sub(width));
     let (regions, count) = areas(app, Size::new(bounds.width, bounds.height));
-    if count == 2 {
-        if app.project.layout == LayoutMode::Vertical {
-            let x = regions[0].right();
-            for y in regions[0].top()..regions[0].bottom() {
-                frame.buffer_mut()[(x, y)].set_symbol("│").set_fg(BORDER);
-            }
-        } else {
-            line_horizontal(
-                frame.buffer_mut(),
-                0,
-                regions[0].bottom(),
-                bounds.width,
-                BORDER,
-            );
-        }
+    app.split_divider = split_divider(app.project.layout, regions, count);
+    if app.split_divider.is_none() {
+        app.finish_split_drag();
+    }
+    if count == 2 && app.project.layout == LayoutMode::Horizontal {
+        line_horizontal(
+            frame.buffer_mut(),
+            0,
+            regions[0].bottom(),
+            bounds.width,
+            BORDER,
+        );
     }
     for (pane, area) in regions.iter().copied().enumerate().take(count) {
         let index = if count == 1 {
@@ -187,6 +213,24 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 HEADER_DIVIDER,
             );
         }
+    }
+    if let Some(divider) = app.split_divider {
+        // The right header's leading space belongs to the shared pane boundary.
+        frame.buffer_mut()[(regions[1].x, regions[1].y)]
+            .set_symbol("│")
+            .set_fg(BORDER);
+        for y in divider.track.y..divider.track.bottom() {
+            // Keep the left pane's scroll thumb and track when history exists.
+            if app.panes[0].scrollbar.is_none() {
+                frame.buffer_mut()[(divider.handle.x, y)]
+                    .set_symbol("│")
+                    .set_fg(HEADER_DIVIDER);
+            }
+            frame.buffer_mut()[(divider.handle.right() - 1, y)]
+                .set_symbol("│")
+                .set_fg(HEADER_DIVIDER);
+        }
+        draw_split_handle(frame.buffer_mut(), divider, app.split_drag.is_some());
     }
     if let Some(notice) = &app.notice {
         let height = notice_height(Some(notice), Size::new(bounds.width, bounds.height));
@@ -1180,7 +1224,8 @@ mod tests {
                 LayoutMode::Vertical,
                 LayoutMode::Horizontal,
             ] {
-                let (panes, count) = pane_areas(layout, true, size);
+                let (panes, count) =
+                    pane_areas(layout, true, crate::restore::default_split_ratio(), size);
                 for pane in panes.into_iter().take(count) {
                     let content = body(pane);
                     assert!(content.right() <= size.width);
@@ -1188,6 +1233,123 @@ mod tests {
                     assert!(content.bottom() <= size.height);
                 }
                 assert_eq!(body(panes[count - 1]).bottom(), size.height);
+            }
+        }
+    }
+
+    #[test]
+    fn vertical_ratios_fill_width_without_moving_content_into_the_divider() {
+        let scale = crate::restore::SPLIT_RATIO_SCALE;
+        for width in [60, 61, 80, 121, 240] {
+            let size = Size::new(width, 24);
+            for ratio in [0, 1, scale / 4, scale / 2, 3 * scale / 4, scale, u16::MAX] {
+                let (panes, count) = pane_areas(LayoutMode::Vertical, true, ratio, size);
+                let divider = split_divider(LayoutMode::Vertical, panes, count).unwrap();
+                let [left, right] = panes.map(body);
+                assert_eq!(count, 2);
+                assert_eq!(panes[0].x, 0);
+                assert_eq!(panes[0].width + panes[1].width, size.width);
+                assert!(panes.iter().all(|pane| pane.width >= 28));
+                assert_eq!(panes[0].right(), panes[1].x);
+                assert_eq!(panes[1].right(), size.width);
+                assert_eq!(left.y, right.y);
+                assert_eq!(left.height, right.height);
+                assert_eq!(left.bottom(), size.height);
+                assert_eq!(divider.available_width, size.width);
+                assert_eq!(
+                    divider.track,
+                    Rect::new(panes[0].right(), left.y, 1, left.height)
+                );
+                assert_eq!(left.right() + MARGIN, divider.track.x);
+                assert_eq!(divider.track.x, panes[1].x);
+                assert_eq!(divider.handle.right(), right.x);
+                assert_eq!(right.right() + MARGIN, size.width);
+                assert_eq!(divider.handle.x, left.right());
+                assert_eq!(divider.handle.height, 1);
+                let above = divider.handle.y - divider.track.y;
+                let below = divider.track.bottom() - divider.handle.bottom();
+                assert!(above.abs_diff(below) <= 1);
+                if ratio == 0 {
+                    assert_eq!(panes[0].width, 28);
+                } else if ratio >= scale {
+                    assert_eq!(panes[1].width, 28);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resizing_preserves_unclamped_split_proportions_and_body_alignment() {
+        let scale = u32::from(crate::restore::SPLIT_RATIO_SCALE);
+        for ratio in [2_500, 4_000, 6_500, 7_500] {
+            for size in [
+                Size::new(160, 24),
+                Size::new(240, 48),
+                Size::new(120, 16),
+                Size::new(181, 25),
+                Size::new(160, 24),
+            ] {
+                let (panes, count) = pane_areas(LayoutMode::Vertical, true, ratio, size);
+                let divider = split_divider(LayoutMode::Vertical, panes, count).unwrap();
+                let desired = u32::from(size.width) * u32::from(ratio);
+                let actual = u32::from(panes[0].width) * scale;
+                assert!(actual.abs_diff(desired) <= scale / 2);
+                for pane in panes {
+                    let content = body(pane);
+                    assert_eq!(content.width + 2 * MARGIN, pane.width);
+                    assert_eq!(content.y, pane.y + HEADER_ROWS);
+                    assert_eq!(content.bottom(), size.height);
+                    assert_eq!(divider.track.y, content.y);
+                    assert_eq!(divider.track.height, content.height);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn divider_stays_hidden_and_ratios_do_not_change_other_layouts() {
+        for size in [
+            Size::new(30, 10),
+            Size::new(59, 24),
+            Size::new(80, 15),
+            Size::new(80, 24),
+        ] {
+            for layout in [
+                LayoutMode::Full,
+                LayoutMode::Horizontal,
+                LayoutMode::Vertical,
+            ] {
+                for split in [false, true] {
+                    if layout == LayoutMode::Vertical
+                        && split
+                        && size.width >= 60
+                        && size.height >= 16
+                    {
+                        continue;
+                    }
+                    let baseline =
+                        pane_areas(layout, split, crate::restore::default_split_ratio(), size);
+                    for ratio in [0, 2_500, 7_500, u16::MAX] {
+                        let (panes, count) = pane_areas(layout, split, ratio, size);
+                        assert_eq!((panes, count), baseline);
+                        assert!(split_divider(layout, panes, count).is_none());
+                        if count == 1 {
+                            assert_eq!(
+                                panes,
+                                [
+                                    Rect::new(0, 1, size.width, size.height - 1),
+                                    Rect::default()
+                                ]
+                            );
+                        } else {
+                            assert_eq!(count, 2);
+                            assert_eq!(panes[0].width, size.width);
+                            assert_eq!(panes[1].width, size.width);
+                            assert_eq!(panes[0].bottom() + 1, panes[1].y);
+                            assert_eq!(panes[1].bottom(), size.height);
+                        }
+                    }
+                }
             }
         }
     }
@@ -1301,7 +1463,12 @@ mod tests {
             let height = notice_height(Some(&notice), size);
             let mut content = size;
             content.height -= height;
-            let (panes, count) = pane_areas(LayoutMode::Horizontal, true, content);
+            let (panes, count) = pane_areas(
+                LayoutMode::Horizontal,
+                true,
+                crate::restore::default_split_ratio(),
+                content,
+            );
             for pane in panes.into_iter().take(count) {
                 assert!(body(pane).bottom() <= size.height - height);
             }

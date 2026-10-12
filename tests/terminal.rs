@@ -223,6 +223,45 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
             "opening a terminal must not create Git metadata",
         );
         if direct_start && cwd == repo {
+            // The default new-tab action opens home without a path prompt.
+            let in_home = |contents: &str| {
+                contents
+                    .lines()
+                    .nth(1)
+                    .is_some_and(|header| header.trim_start().starts_with("› terminal"))
+            };
+            let in_repo = |contents: &str| {
+                contents
+                    .lines()
+                    .nth(1)
+                    .is_some_and(|header| header.trim_start().starts_with("› main"))
+            };
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[116;6u\r", in_home);
+            let home_marker = format!(
+                "home-ready:{}",
+                home.path().canonicalize().unwrap().display()
+            );
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                b"HOME_TAB_TOKEN=kept; printf 'home-%s:%s\\n' ready \"$PWD\"\r",
+                |contents| contents.contains(&home_marker),
+            );
+            assert!(!home.path().join(".git").exists());
+
+            // Reopening home selects the existing session instead of losing its state.
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[9;6u", in_repo);
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[116;6u\r", in_home);
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                b"printf 'home-resumed:%s\\n' \"$HOME_TAB_TOKEN\"\r",
+                |contents| contents.contains("home-resumed:kept"),
+            );
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[9;6u", in_repo);
+
             drive_until(
                 &mut writer,
                 &rx,

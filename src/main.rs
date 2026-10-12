@@ -32,11 +32,11 @@ Crit restores your saved workspace on startup. With no saved workspace, choose
 New terminal or any folder. F1 opens Ask Crit. Ctrl+D in an agent opens its
 workspace shell without stopping it;
 Ctrl+D in a shell keeps normal EOF behavior, and native mode passes it through.
-Ctrl+Shift+T opens a new tab: any folder (no Git required), a worktree, or an
-open project. Ctrl+Shift+, or . splits: name a branch and its worktree opens in
-the second pane. Ctrl+Shift+Enter opens a session. F12 persistently toggles
-Crit/native Kitty shortcuts. Run `crit setup kitty` once to enable the
-window-scoped mappings.
+Ctrl+Shift+T then Enter opens your home folder. The menu also offers other
+folders, worktrees, and open projects. Ctrl+Shift+, or . splits: name a branch
+and its worktree opens in the second pane. Ctrl+Shift+Enter opens a session.
+F12 persistently toggles Crit/native Kitty shortcuts. Run `crit setup kitty` once
+to enable the window-scoped mappings.
 
 ASK CRIT
   F1 opens a natural-language launcher using anthropic/claude-haiku-5-5,
@@ -77,6 +77,10 @@ APPEARANCE
   Click or drag it to review history or return to live output at the bottom.
   Mouse-aware apps receive the wheel normally; Shift+wheel scrolls Crit's
   history instead. Typing or pasting returns to live output.
+  Side-by-side panes use adjacent edge rails, with ⟨ on the left and ⟩ on
+  the right, and no blank column between them. Drag either arrow without changing focus.
+  Each pane keeps a usable minimum width; the proportion follows window resizing
+  and is saved per project. Narrow windows show one pane until both fit again.
 
 COPY, PASTE, AND LINKS
   Drag terminal text to select it and copy to the clipboard and primary selection.
@@ -119,7 +123,8 @@ PROJECTS
   Absolute paths, ~, and paths containing / open directly. Other relative folders
   open when no detected project matches; paths use the displayed base folder.
   A folder outside Git opens as a workspace named after the folder and can run
-  OMP, OpenCode, or shells. New tabs default to Open folder; enter ~ for home.
+  OMP, OpenCode, or shells. Home (~) is first and preselected in the new-tab menu.
+  Press Enter to open it without typing; an already-open home session is reused.
   Opening a Git folder opens only its checkout, not every branch/worktree.
   Ask to open an existing worktree or switch to a named project.
   Already open projects and shell/agent sessions stay alive when switching.

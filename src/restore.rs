@@ -9,6 +9,12 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsE
 use std::path::{Path, PathBuf};
 
 pub const VERSION: u32 = 1;
+pub const SPLIT_RATIO_SCALE: u16 = 10_000;
+
+pub fn default_split_ratio() -> u16 {
+    5_000
+}
+
 const MAX_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
 const SNAPSHOT_FILE: &str = "workspace.json";
 
@@ -29,6 +35,8 @@ pub struct SavedProject {
     pub secondary: Option<usize>,
     pub focus_secondary: bool,
     pub layout: SavedLayout,
+    #[serde(default = "default_split_ratio")]
+    pub split_ratio: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +74,9 @@ impl Snapshot {
         valid_selection(self.active_project, self.projects.len())
             .context("invalid active project index")?;
         for (project_index, project) in self.projects.iter().enumerate() {
+            if project.split_ratio > SPLIT_RATIO_SCALE {
+                bail!("project {project_index} has an out-of-range split ratio");
+            }
             if project.workspaces.is_empty() {
                 bail!("project {project_index} has no workspaces");
             }
@@ -377,6 +388,7 @@ mod tests {
                     secondary: Some(1),
                     focus_secondary: true,
                     layout: SavedLayout::Vertical,
+                    split_ratio: default_split_ratio(),
                 },
                 SavedProject {
                     workspaces: vec![SavedWorkspace {
@@ -389,6 +401,7 @@ mod tests {
                     secondary: None,
                     focus_secondary: false,
                     layout: SavedLayout::Full,
+                    split_ratio: default_split_ratio(),
                 },
             ],
             active_project: 1,
@@ -414,6 +427,44 @@ mod tests {
         };
         reopened.save(&empty).unwrap();
         assert_eq!(reopened.load().unwrap(), Some(empty));
+    }
+
+    #[test]
+    fn legacy_snapshots_load_with_equal_split_ratios() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_in(directory.path()).unwrap();
+        let expected = snapshot();
+        let mut legacy = serde_json::to_value(&expected).unwrap();
+        for project in legacy["projects"].as_array_mut().unwrap() {
+            project.as_object_mut().unwrap().remove("split_ratio");
+        }
+        fs::write(
+            directory.path().join(SNAPSHOT_FILE),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        let loaded = store.load().unwrap().unwrap();
+        assert!(
+            loaded
+                .projects
+                .iter()
+                .all(|project| project.split_ratio == 5_000)
+        );
+        assert_eq!(loaded, expected);
+    }
+
+    #[test]
+    fn split_ratios_roundtrip_including_runtime_clamped_endpoints() {
+        let directory = tempfile::tempdir().unwrap();
+        for ratio in [3_750, 0, SPLIT_RATIO_SCALE] {
+            let store = Store::open_in(directory.path()).unwrap();
+            let mut expected = snapshot();
+            expected.projects[0].split_ratio = ratio;
+            store.save(&expected).unwrap();
+            drop(store);
+            let reopened = Store::open_in(directory.path()).unwrap();
+            assert_eq!(reopened.load().unwrap(), Some(expected));
+        }
     }
 
     #[test]
@@ -497,7 +548,7 @@ mod tests {
     }
 
     #[test]
-    fn invalid_indices_layout_paths_and_sessions_are_rejected_without_overwriting() {
+    fn invalid_indices_layout_ratios_paths_and_sessions_are_rejected_without_overwriting() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open_in(directory.path()).unwrap();
         let path = directory.path().join(SNAPSHOT_FILE);
@@ -515,6 +566,7 @@ mod tests {
             |s| s.projects[0].secondary = None,
             |s| s.projects[0].layout = SavedLayout::Full,
             |s| s.projects[1].focus_secondary = true,
+            |s| s.projects[0].split_ratio = SPLIT_RATIO_SCALE + 1,
             |s| s.projects[0].workspaces[0].selected = 3,
             |s| s.projects[1].workspaces[0].selected = 1,
             |s| s.projects[0].workspaces[0].path = "relative".into(),

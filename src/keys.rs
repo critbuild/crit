@@ -3,7 +3,7 @@ use std::io::{self, Write};
 
 pub const HELP: &str = "Crit shortcuts (same as Kitty's terminal/window actions)
   F12                    Toggle Crit / native Kitty shortcuts (persistent)
-  Ctrl+Shift+T            New tab: any folder (no Git required), worktree, or project
+  Ctrl+Shift+T            New tab: Home selected; Enter opens it without typing
   Ctrl+Shift+Q            Close worktree tab; retain checkout
   Ctrl+Tab / Ctrl+Shift+Right  Next tab (wraps into the next open project)
   Ctrl+Shift+Tab / Left   Previous tab
@@ -31,6 +31,8 @@ ordinary typing go to the focused terminal.
 Typing or pasting returns a scrolled terminal to its live output.
 Wheel scrolls history unless the app captures it; Shift+wheel scrolls Crit history.
 Click or drag the right-edge scrollbar; its bottom returns to live output.
+Drag either pane-edge arrow (⟨ / ⟩) or the divider to resize side-by-side panes.
+Split widths keep their proportion on window resize and restore with the project.
 Esc cancels a pending project open or worktree listing without switching tabs.
 Below 30x10, UI input pauses except Esc and F12; enlarge the terminal to resume.
 F12 switches routing, not a one-shot prefix. Setup: crit setup kitty
