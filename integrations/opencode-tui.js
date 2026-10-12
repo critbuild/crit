@@ -1,7 +1,7 @@
 // Adapted from Herdr src/integration/assets/opencode/herdr-tui-session.js
 // (Apache-2.0), specifically its full-TUI lifecycle implementation.
 // Crit changes: current OpenCode TUI API only, Solid route subscriptions instead
-// of polling, launch-scoped transport, explicit Unknown, no session persistence.
+// of polling, launch-scoped transport, explicit Unknown and exact chat identity.
 import { createEffect, createRoot, on, untrack } from "solid-js";
 import { createReporter } from "./reporter.js";
 
@@ -12,6 +12,9 @@ async function tui(api) {
   if (!reporter) return;
   let disposed = false;
   let context;
+  const initial = process.env.CRIT_RESUME_ID;
+  let observedSelection = false;
+  let selectedBoundary = initial;
 
   function routeID() {
     const route = api.route.current;
@@ -85,7 +88,8 @@ async function tui(api) {
     if (!current(ctx) || !ctx.selected) return;
     const selected = ctx.selected;
     const [value, message] = state(ctx);
-    void reporter.report(value, message, () => current(ctx) && ctx.selected === selected && root(ctx, ctx.route) === selected);
+    void reporter.report(value, message,
+      () => current(ctx) && ctx.selected === selected && root(ctx, ctx.route) === selected, selected);
   }
   function reconcile(ctx) {
     if (!current(ctx)) return;
@@ -99,7 +103,10 @@ async function tui(api) {
       if (selected !== ctx.selected) {
         ctx.boundary = selected;
         ctx.selected = selected;
+        selectedBoundary = selected;
       }
+      // Identity does not depend on all descendant lifecycle lookups succeeding.
+      report(ctx);
       await Promise.all([...owners(ctx)].map((id) => resolveRoot(ctx, id)));
       if (current(ctx)) report(ctx);
     })().catch(() => {}).finally(() => {
@@ -137,10 +144,11 @@ async function tui(api) {
         ctx.statuses.delete(id);
         ctx.errors.delete(id);
         clearRequests(ctx, (r) => r.sessionID === id);
-        if (ctx.selected === id) {
+        if (ctx.selected === id || ctx.boundary === id || (!ctx.selected && ctx.route === id)) {
           ctx.controller.abort();
           context = undefined;
-          void reporter.report("unknown");
+          selectedBoundary = undefined;
+          void reporter.report("unknown", undefined, () => !disposed && context === undefined, null);
         }
         break;
       case "session.status":
@@ -220,11 +228,19 @@ async function tui(api) {
     if (disposed) return;
     const id = routeID();
     if (!reset && id === context?.route) return;
-    const boundary = context?.selected;
+    const boundary = selectedBoundary;
     context?.controller.abort();
     context = undefined;
+    if (typeof id !== "string" || !id) {
+      if (observedSelection || !initial) selectedBoundary = undefined;
+      // Startup can briefly be Home before --session's route is installed.
+      // Once a chat was observed, Home is an authoritative new-chat selection.
+      void reporter.report("unknown", undefined,
+        () => !disposed && routeID() === id, observedSelection || !initial ? null : undefined);
+      return;
+    }
+    observedSelection = true;
     void reporter.report("unknown");
-    if (typeof id !== "string" || !id) return;
     const ctx = {
       route: id, boundary, controller: new AbortController(), sessions: new Map(), lookups: new Map(),
       statuses: new Map(), blockers: new Map(), errors: new Map(), deleted: new Set(),
@@ -242,6 +258,12 @@ async function tui(api) {
     if (type === "message.part.updated" && !terminalTool(event.properties?.part)) return;
     syncSelection();
     const ctx = context;
+    if (!ctx && type === "session.deleted" && selectedBoundary &&
+        (event.properties?.sessionID ?? event.properties?.info?.id) === selectedBoundary) {
+      selectedBoundary = undefined;
+      observedSelection = true;
+      void reporter.report("unknown", undefined, () => !disposed && !context, null);
+    }
     if (!ctx) return;
     if (ctx.loading || !ctx.hydrated) {
       // Bound reconnect-time deltas; restart a snapshot rather than grow forever.

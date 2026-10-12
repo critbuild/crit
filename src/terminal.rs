@@ -25,6 +25,7 @@ pub struct Session {
     pub kind: String,
     pub state: AgentState,
     pub message: Option<String>,
+    pub resume: Option<String>,
     pub parser: Arc<Mutex<Parser>>,
     pub dirty: Arc<AtomicBool>,
     pub alive: Arc<AtomicBool>,
@@ -39,6 +40,7 @@ impl Session {
     pub fn spawn(
         id: u64,
         kind: &str,
+        resume: Option<&str>,
         cwd: &Path,
         socket: &Path,
         tx: SyncSender<Event>,
@@ -55,7 +57,7 @@ impl Session {
                 Vec::new(),
             )
         } else {
-            integration::command(kind, id, socket)?
+            integration::command(kind, id, socket, resume)?
         };
         let rows = rows.max(1);
         let cols = cols.max(1);
@@ -157,6 +159,7 @@ impl Session {
                 AgentState::Unknown
             },
             message: None,
+            resume: resume.map(str::to_owned),
             parser,
             dirty,
             alive,
@@ -171,13 +174,16 @@ impl Session {
     pub fn resize(&mut self, rows: u16, cols: u16) -> Result<()> {
         let size = (rows.max(1), cols.max(1));
         if self.size != size {
+            // SIGWINCH can trigger an immediate repaint. Do not let the reader
+            // process it against the old grid while the kernel has the new size.
+            let mut parser = self.parser.lock();
             self.master.resize(PtySize {
                 rows: size.0,
                 cols: size.1,
                 pixel_width: 0,
                 pixel_height: 0,
             })?;
-            self.parser.lock().screen_mut().set_size(size.0, size.1);
+            parser.screen_mut().set_size(size.0, size.1);
             self.size = size;
             self.dirty.store(true, Ordering::Release);
         }
@@ -193,7 +199,10 @@ impl Session {
             parser.screen_mut().set_scrollback(0);
             (
                 parser.screen().application_cursor(),
-                parser.callbacks().keyboard_flags() != 0,
+                parser
+                    .callbacks()
+                    .keyboard_flags(parser.screen().alternate_screen())
+                    != 0,
             )
         };
         let mut writer = self.writer.lock();
@@ -203,12 +212,19 @@ impl Session {
     }
 
     pub fn paste(&self, text: &str) -> Result<()> {
-        let bracketed = self.parser.lock().screen().bracketed_paste();
+        if !self.alive.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let bracketed = {
+            let mut parser = self.parser.lock();
+            parser.screen_mut().set_scrollback(0);
+            parser.screen().bracketed_paste()
+        };
         let mut writer = self.writer.lock();
         if bracketed {
             writer.write_all(b"\x1b[200~")?;
         }
-        // Strip bracketed-paste terminators so pasted text cannot escape the paste boundary.
+        // Strip escape bytes so pasted text cannot escape the paste boundary.
         let mut remainder = text;
         while let Some(index) = remainder.find('\u{1b}') {
             writer.write_all(remainder[..index].as_bytes())?;
@@ -222,9 +238,19 @@ impl Session {
         Ok(())
     }
 
+    pub fn scroll_to(&self, offset: usize) {
+        self.parser.lock().screen_mut().set_scrollback(offset);
+    }
+
     pub fn mouse(&self, event: MouseEvent, column: u16, row: u16) -> Result<()> {
         let mut parser = self.parser.lock();
-        if parser.screen().mouse_protocol_mode() == vt100::MouseProtocolMode::None {
+        if parser.screen().mouse_protocol_mode() == vt100::MouseProtocolMode::None
+            || (event.modifiers.contains(KeyModifiers::SHIFT)
+                && matches!(
+                    event.kind,
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                ))
+        {
             let current = parser.screen().scrollback();
             match event.kind {
                 MouseEventKind::ScrollUp => parser
@@ -237,57 +263,90 @@ impl Session {
             }
             return Ok(());
         }
-        let (button, suffix) = match event.kind {
-            MouseEventKind::Down(button) => (
-                match button {
-                    MouseButton::Left => 0,
-                    MouseButton::Middle => 1,
-                    MouseButton::Right => 2,
-                },
-                'M',
-            ),
-            MouseEventKind::Up(button) => (
-                match button {
-                    MouseButton::Left => 0,
-                    MouseButton::Middle => 1,
-                    MouseButton::Right => 2,
-                },
-                'm',
-            ),
-            MouseEventKind::Drag(button) => (
-                32 + match button {
-                    MouseButton::Left => 0,
-                    MouseButton::Middle => 1,
-                    MouseButton::Right => 2,
-                },
-                'M',
-            ),
-            MouseEventKind::Moved => return Ok(()),
-            MouseEventKind::ScrollUp => (64, 'M'),
-            MouseEventKind::ScrollDown => (65, 'M'),
-            _ => return Ok(()),
-        };
-        let button = button
-            + 4 * u16::from(event.modifiers.contains(KeyModifiers::SHIFT))
-            + 8 * u16::from(event.modifiers.contains(KeyModifiers::ALT))
-            + 16 * u16::from(event.modifiers.contains(KeyModifiers::CONTROL));
+        let mode = parser.screen().mouse_protocol_mode();
         let encoding = parser.screen().mouse_protocol_encoding();
         drop(parser);
-        let mut writer = self.writer.lock();
-        if encoding == vt100::MouseProtocolEncoding::Sgr {
-            write!(writer, "\x1b[<{button};{};{}{suffix}", column + 1, row + 1)?;
-        } else if column < 223 && row < 223 {
-            writer.write_all(&[
-                27,
-                b'[',
-                b'M',
-                if suffix == 'm' { 35 } else { button as u8 + 32 },
-                column as u8 + 33,
-                row as u8 + 33,
-            ])?;
+        if !self.alive.load(Ordering::Acquire) {
+            return Ok(());
         }
+        let mut writer = self.writer.lock();
+        write_mouse(&mut *writer, event, column, row, mode, encoding)?;
         writer.flush()?;
         Ok(())
+    }
+}
+
+fn write_mouse(
+    writer: &mut impl Write,
+    event: MouseEvent,
+    column: u16,
+    row: u16,
+    mode: vt100::MouseProtocolMode,
+    encoding: vt100::MouseProtocolEncoding,
+) -> std::io::Result<()> {
+    use vt100::{MouseProtocolEncoding as Encoding, MouseProtocolMode as Mode};
+    let button_number = |button| match button {
+        MouseButton::Left => 0,
+        MouseButton::Middle => 1,
+        MouseButton::Right => 2,
+    };
+    if mode == Mode::None {
+        return Ok(());
+    }
+    let (button, released) = match event.kind {
+        MouseEventKind::Down(button) => (button_number(button), false),
+        MouseEventKind::Up(button) if mode != Mode::Press => (button_number(button), true),
+        MouseEventKind::Drag(button) if matches!(mode, Mode::ButtonMotion | Mode::AnyMotion) => {
+            (32 + button_number(button), false)
+        }
+        MouseEventKind::Moved if mode == Mode::AnyMotion => (35, false),
+        MouseEventKind::ScrollUp => (64, false),
+        MouseEventKind::ScrollDown => (65, false),
+        MouseEventKind::ScrollLeft => (66, false),
+        MouseEventKind::ScrollRight => (67, false),
+        _ => return Ok(()),
+    };
+    let modifiers = if mode == Mode::Press {
+        0
+    } else {
+        4 * u16::from(event.modifiers.contains(KeyModifiers::SHIFT))
+            + 8 * u16::from(event.modifiers.contains(KeyModifiers::ALT))
+            + 16 * u16::from(event.modifiers.contains(KeyModifiers::CONTROL))
+    };
+    if encoding == Encoding::Sgr {
+        let button = button + modifiers;
+        let suffix = if released { 'm' } else { 'M' };
+        return write!(
+            writer,
+            "\x1b[<{button};{};{}{suffix}",
+            u32::from(column) + 1,
+            u32::from(row) + 1
+        );
+    }
+    let button = if released { 3 } else { button } + modifiers + 32;
+    match encoding {
+        Encoding::Default if column < 223 && row < 223 => writer.write_all(&[
+            27,
+            b'[',
+            b'M',
+            button as u8,
+            column as u8 + 33,
+            row as u8 + 33,
+        ]),
+        Encoding::Utf8 if column < 2015 && row < 2015 => {
+            writer.write_all(b"\x1b[M")?;
+            for value in [button, column + 33, row + 33] {
+                let mut bytes = [0; 4];
+                writer.write_all(
+                    char::from_u32(u32::from(value))
+                        .unwrap()
+                        .encode_utf8(&mut bytes)
+                        .as_bytes(),
+                )?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
@@ -315,20 +374,47 @@ impl Drop for Session {
 
 pub struct Responses {
     writer: Writer,
-    keyboard: [u16; 16],
-    keyboard_depth: usize,
+    keyboard: [KeyboardModes; 2],
 }
 
 impl Responses {
     fn new(writer: Writer) -> Self {
         Self {
             writer,
-            keyboard: [0; 16],
-            keyboard_depth: 0,
+            keyboard: [KeyboardModes::default(); 2],
         }
     }
-    fn keyboard_flags(&self) -> u16 {
-        self.keyboard[self.keyboard_depth]
+    fn keyboard_flags(&self, alternate_screen: bool) -> u16 {
+        self.keyboard[usize::from(alternate_screen)].flags
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct KeyboardModes {
+    flags: u16,
+    stack: [u16; 16],
+    depth: usize,
+}
+
+impl KeyboardModes {
+    fn push(&mut self, flags: u16) {
+        if self.depth == self.stack.len() {
+            self.stack.copy_within(1.., 0);
+            self.depth -= 1;
+        }
+        self.stack[self.depth] = self.flags;
+        self.depth += 1;
+        self.flags = flags;
+    }
+
+    fn pop(&mut self, count: usize) {
+        if count > self.depth {
+            self.depth = 0;
+            self.flags = 0;
+        } else {
+            self.depth -= count;
+            self.flags = self.stack[self.depth];
+        }
     }
 }
 
@@ -342,6 +428,7 @@ impl vt100::Callbacks for Responses {
         c: char,
     ) {
         let p = params.first().and_then(|p| p.first()).copied().unwrap_or(0);
+        let keyboard = &mut self.keyboard[usize::from(screen.alternate_screen())];
         let mut writer = self.writer.lock();
         let result = match (first, second, c) {
             (None, None, 'n') if p == 6 => {
@@ -352,24 +439,20 @@ impl vt100::Callbacks for Responses {
             (None, None, 'c') => writer.write_all(b"\x1b[?62;22c"),
             (Some(b'>'), None, 'c') => writer.write_all(b"\x1b[>0;100;0c"),
             (Some(b'>'), None, 'q') => writer.write_all(b"\x1bP>|crit 0.1\x1b\\"),
-            (Some(b'?'), None, 'u') => write!(writer, "\x1b[?{}u", self.keyboard_flags()),
+            (Some(b'?'), None, 'u') => write!(writer, "\x1b[?{}u", keyboard.flags),
             (Some(b'>'), None, 'u') => {
-                if self.keyboard_depth < self.keyboard.len() - 1 {
-                    self.keyboard_depth += 1;
-                }
-                self.keyboard[self.keyboard_depth] = p & 1;
+                keyboard.push(p & 1);
                 Ok(())
             }
             (Some(b'<'), None, 'u') => {
-                self.keyboard_depth = self.keyboard_depth.saturating_sub(usize::from(p.max(1)));
+                keyboard.pop(usize::from(p.max(1)));
                 Ok(())
             }
             (Some(b'='), None, 'u') => {
                 let mode = params.get(1).and_then(|p| p.first()).copied().unwrap_or(1);
-                let old = self.keyboard[self.keyboard_depth];
-                self.keyboard[self.keyboard_depth] = match mode {
-                    2 => old | (p & 1),
-                    3 => old & !(p & 1),
+                keyboard.flags = match mode {
+                    2 => keyboard.flags | (p & 1),
+                    3 => keyboard.flags & !(p & 1),
                     _ => p & 1,
                 };
                 Ok(())
@@ -423,5 +506,191 @@ impl vt100::Callbacks for Responses {
             let _ = writer.write_all(b"\x1b]10;rgb:e0e0/e4e4/e8e8\x1b\\");
         }
         let _ = writer.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn response_parser() -> (Parser, Capture) {
+        let capture = Capture::default();
+        let writer: Writer = Arc::new(Mutex::new(Box::new(capture.clone())));
+        (
+            Parser::new_with_callbacks(24, 80, 32, Responses::new(writer)),
+            capture,
+        )
+    }
+
+    #[test]
+    fn keyboard_protocol_stacks_follow_main_and_alternate_screens() {
+        let (mut parser, capture) = response_parser();
+        parser.process(
+            b"\x1b[=1u\x1b[?u\
+              \x1b[?1049h\x1b[?u\x1b[>1u\x1b[?u\
+              \x1b[?1049l\x1b[?u\x1b[<u\x1b[?u\
+              \x1b[?1049h\x1b[?u\x1b[<u\x1b[?u",
+        );
+        assert_eq!(
+            capture.0.lock().as_slice(),
+            b"\x1b[?1u\x1b[?0u\x1b[?1u\x1b[?1u\x1b[?0u\x1b[?1u\x1b[?0u"
+        );
+    }
+
+    #[test]
+    fn keyboard_stack_overflow_evicts_oldest_saved_mode() {
+        let (mut parser, capture) = response_parser();
+        parser.process(b"\x1b[=1u\x1b[>0u");
+        for _ in 0..16 {
+            parser.process(b"\x1b[>1u");
+        }
+        parser.process(b"\x1b[<16u\x1b[?u");
+        assert_eq!(capture.0.lock().as_slice(), b"\x1b[?0u");
+    }
+
+    #[test]
+    fn keyboard_stack_underflow_resets_flags() {
+        let (mut parser, capture) = response_parser();
+        parser.process(b"\x1b[=1u\x1b[<u\x1b[?u");
+        assert_eq!(capture.0.lock().as_slice(), b"\x1b[?0u");
+    }
+
+    #[test]
+    fn mouse_tracking_modes_filter_releases_and_motion() {
+        for (mode, expected) in [
+            (9, "\x1b[<0;11;21M"),
+            (1000, "\x1b[<4;11;21M\x1b[<4;11;21m"),
+            (1002, "\x1b[<4;11;21M\x1b[<4;11;21m\x1b[<36;11;21M"),
+            (
+                1003,
+                "\x1b[<4;11;21M\x1b[<4;11;21m\x1b[<36;11;21M\x1b[<39;11;21M",
+            ),
+        ] {
+            let (mut parser, _) = response_parser();
+            parser.process(format!("\x1b[?{mode}h\x1b[?1006h").as_bytes());
+            let mut bytes = Vec::new();
+            for kind in [
+                MouseEventKind::Down(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+                MouseEventKind::Drag(MouseButton::Left),
+                MouseEventKind::Moved,
+            ] {
+                write_mouse(
+                    &mut bytes,
+                    MouseEvent {
+                        kind,
+                        column: 10,
+                        row: 20,
+                        modifiers: KeyModifiers::SHIFT,
+                    },
+                    10,
+                    20,
+                    parser.screen().mouse_protocol_mode(),
+                    parser.screen().mouse_protocol_encoding(),
+                )
+                .unwrap();
+            }
+            assert_eq!(bytes, expected.as_bytes(), "tracking mode {mode}");
+        }
+    }
+
+    #[test]
+    fn utf8_mouse_coordinates_and_legacy_release_modifiers_are_preserved() {
+        let (mut parser, _) = response_parser();
+        parser.process(b"\x1b[?1000h\x1b[?1005h");
+        let event = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 300,
+            row: 120,
+            modifiers: KeyModifiers::CONTROL,
+        };
+        let mut bytes = Vec::new();
+        write_mouse(
+            &mut bytes,
+            event,
+            300,
+            120,
+            parser.screen().mouse_protocol_mode(),
+            parser.screen().mouse_protocol_encoding(),
+        )
+        .unwrap();
+        assert_eq!(bytes, "\x1b[M3\u{14d}\u{99}".as_bytes());
+        parser.process(b"\x1b[?1005l");
+        bytes.clear();
+        write_mouse(
+            &mut bytes,
+            event,
+            10,
+            20,
+            parser.screen().mouse_protocol_mode(),
+            parser.screen().mouse_protocol_encoding(),
+        )
+        .unwrap();
+        assert_eq!(bytes, b"\x1b[M3+5");
+    }
+
+    #[test]
+    fn horizontal_wheel_events_reach_mouse_applications() {
+        let mut bytes = Vec::new();
+        for kind in [MouseEventKind::ScrollLeft, MouseEventKind::ScrollRight] {
+            write_mouse(
+                &mut bytes,
+                MouseEvent {
+                    kind,
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                },
+                0,
+                0,
+                vt100::MouseProtocolMode::PressRelease,
+                vt100::MouseProtocolEncoding::Sgr,
+            )
+            .unwrap();
+        }
+        assert_eq!(bytes, b"\x1b[<66;1;1M\x1b[<67;1;1M");
+    }
+
+    #[test]
+    fn paste_returns_scrollback_to_live_terminal() {
+        let directory = tempfile::tempdir().unwrap();
+        let (tx, _rx) = std::sync::mpsc::sync_channel(32);
+        let session = Session::spawn(
+            1,
+            "shell",
+            None,
+            directory.path(),
+            &directory.path().join("unused.sock"),
+            tx,
+            3,
+            20,
+            Some((
+                "/bin/sh".into(),
+                vec!["-c".into(), "IFS= read -r line".into()],
+            )),
+        )
+        .unwrap();
+        {
+            let mut parser = session.parser.lock();
+            parser.process(b"one\r\ntwo\r\nthree\r\nfour\r\n");
+            parser.screen_mut().set_scrollback(2);
+            assert!(parser.screen().scrollback() > 0);
+        }
+        session.paste("pasted text").unwrap();
+        assert_eq!(session.parser.lock().screen().scrollback(), 0);
     }
 }

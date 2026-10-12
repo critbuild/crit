@@ -1,6 +1,7 @@
 use crate::{
     app::{
-        App, COMMANDS, Confirm, IntentDialog, LayoutMode, Modal, Pane, ProjectPicker, Workspace,
+        App, COMMANDS, Confirm, IntentDialog, LayoutMode, Modal, Pane, ProjectPicker, Scrollbar,
+        TabHit, Workspace, project_slots,
     },
     integration::AgentState,
     updates::{State as UpdateState, TOOLS as UPDATE_TOOLS},
@@ -27,15 +28,20 @@ const GREEN: Color = Color::Rgb(165, 214, 179);
 const AMBER: Color = Color::Rgb(232, 188, 128);
 
 fn areas(app: &App, size: Size) -> ([Rect; 2], usize) {
+    let mut content = size;
+    content.height = content
+        .height
+        .saturating_sub(notice_height(app.notice.as_deref(), size));
+    pane_areas(app.project.layout, app.project.secondary.is_some(), content)
+}
+
+fn pane_areas(layout: LayoutMode, split: bool, size: Size) -> ([Rect; 2], usize) {
+    // Only visible notices reserve bottom rows; areas() subtracts their height.
     let main = Rect::new(0, 1, size.width, size.height.saturating_sub(1));
-    if app.project.secondary.is_none()
-        || app.project.layout == LayoutMode::Full
-        || size.width < 60
-        || size.height < 16
-    {
+    if !split || layout == LayoutMode::Full || size.width < 60 || size.height < 16 {
         return ([main, Rect::default()], 1);
     }
-    match app.project.layout {
+    match layout {
         LayoutMode::Vertical => {
             let width = main.width.saturating_sub(1) / 2;
             (
@@ -69,12 +75,18 @@ fn areas(app: &App, size: Size) -> ([Rect; 2], usize) {
         LayoutMode::Full => ([main, Rect::default()], 1),
     }
 }
+/// Columns kept clear on each side of terminal content and the notice row.
+/// Crit zeroes Kitty's own padding in its window, so this is the only gap
+/// between text and the window edge; the tab bar still runs edge to edge.
+const MARGIN: u16 = 1;
+// One workspace header row, followed by a thin horizontal divider.
+const HEADER_ROWS: u16 = 2;
 fn body(area: Rect) -> Rect {
     Rect::new(
-        area.x,
-        area.y + 1,
-        area.width,
-        area.height.saturating_sub(2),
+        area.x + MARGIN,
+        area.y + area.height.min(HEADER_ROWS),
+        area.width.saturating_sub(2 * MARGIN),
+        area.height.saturating_sub(HEADER_ROWS),
     )
 }
 
@@ -99,6 +111,7 @@ pub fn resize_sessions(app: &mut App, size: Size) -> Result<()> {
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let bounds = frame.area();
+    app.interaction_visible = bounds.width >= 30 && bounds.height >= 10;
     frame
         .buffer_mut()
         .set_style(bounds, Style::default().fg(FG).bg(BG));
@@ -113,19 +126,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         return;
     }
     let width = draw_key_mode(frame, app.native_keys, true);
-    let project_width = (app.project.name.width() + 2)
-        .min(22)
-        .min(bounds.width.saturating_sub(width) as usize / 3) as u16;
-    frame.render_widget(
-        Paragraph::new(format!(" {} ", app.project.name)).style(Style::default().fg(FG).bold()),
-        Rect::new(0, 0, project_width, 1),
-    );
-    draw_tabs(
-        frame,
-        app,
-        bounds.width.saturating_sub(width),
-        project_width,
-    );
+    draw_tabs(frame, app, bounds.width.saturating_sub(width));
     let (regions, count) = areas(app, Size::new(bounds.width, bounds.height));
     if count == 2 {
         if app.project.layout == LayoutMode::Vertical {
@@ -134,7 +135,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 frame.buffer_mut()[(x, y)].set_symbol("│").set_fg(BORDER);
             }
         } else {
-            line_horizontal(frame.buffer_mut(), 0, regions[0].bottom(), bounds.width);
+            line_horizontal(
+                frame.buffer_mut(),
+                0,
+                regions[0].bottom(),
+                bounds.width,
+                BORDER,
+            );
         }
     }
     for (pane, area) in regions.iter().copied().enumerate().take(count) {
@@ -147,24 +154,36 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         };
         let focused = app.focused_index() == index;
         let pane_body = body(area);
-        draw_workspace(
+        let scrollbar = draw_workspace(
             frame,
             &app.project.workspaces[index],
             area,
             pane_body,
             focused,
             app.modal.is_none(),
-            app.project.repository.is_some(),
         );
         app.panes.push(Pane {
             workspace: index,
             body: pane_body,
+            scrollbar,
         });
+        if area.height >= HEADER_ROWS && (pane == 0 || app.project.layout == LayoutMode::Horizontal)
+        {
+            // Span both side-by-side panes, including their shared separator.
+            line_horizontal(frame.buffer_mut(), bounds.x, area.y + 1, bounds.width, FG);
+        }
     }
     if let Some(notice) = &app.notice {
-        frame.render_widget(
-            Paragraph::new(notice.as_str()).style(Style::default().fg(AMBER).bg(BG)),
-            Rect::new(0, bounds.height - 1, bounds.width, 1),
+        let height = notice_height(Some(notice), Size::new(bounds.width, bounds.height));
+        draw_notice(
+            frame,
+            notice,
+            Rect::new(
+                MARGIN,
+                bounds.height - height,
+                bounds.width.saturating_sub(2 * MARGIN),
+                height,
+            ),
         );
     }
     if let Some(modal) = &app.modal {
@@ -172,49 +191,96 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 }
 
-fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16, offset: u16) {
+/// Every open project contributes a name cell and one cell per worktree, in
+/// opening order, so other projects stay visible and clickable. Cells are
+/// staged in `tab_hits` (capacity reused across frames) and trimmed to the
+/// visible window around the focused tab.
+fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) {
     let focused = app.focused_index();
-    let width_of = |index: usize| -> u16 {
-        (app.project.workspaces[index].label().width() + 8).min(34) as u16
-    };
-    let mut start = focused;
-    let mut used = width_of(focused);
-    while start > 0 && used + width_of(start - 1) < width.saturating_sub(offset + 4) {
-        start -= 1;
-        used += width_of(start);
+    let App {
+        project,
+        saved_projects,
+        tab_hits,
+        ..
+    } = app;
+    let mut focused_cell = 0;
+    for (slot, open) in project_slots(project, saved_projects) {
+        let separator = u16::from(!tab_hits.is_empty());
+        tab_hits.push(TabHit {
+            area: Rect::new(0, 0, (open.name.width() as u16 + 2).min(22) + separator, 1),
+            project: slot,
+            workspace: None,
+        });
+        for (index, workspace) in open.workspaces.iter().enumerate() {
+            if slot.is_none() && index == focused {
+                focused_cell = tab_hits.len();
+            }
+            tab_hits.push(TabHit {
+                area: Rect::new(0, 0, (workspace.label().width() as u16 + 8).min(34), 1),
+                project: slot,
+                workspace: Some(index),
+            });
+        }
     }
-    let mut x = offset;
+    let mut start = focused_cell;
+    let mut used = tab_hits[start].area.width;
+    while start > 0 && used + tab_hits[start - 1].area.width < width.saturating_sub(4) {
+        start -= 1;
+        used += tab_hits[start].area.width;
+    }
+    let mut x = 0;
     if start > 0 {
         frame.render_widget(
             Paragraph::new("‹").style(Style::default().fg(MUTED)),
-            Rect::new(x, 0, 1, 1),
+            Rect::new(0, 0, 1, 1),
         );
-        x += 2;
+        x = 2;
     }
-    for index in start..app.project.workspaces.len() {
-        let tab_width = width_of(index).min(width.saturating_sub(x));
-        if tab_width < 5 {
+    let mut end = start;
+    for (cell, hit) in tab_hits.iter_mut().enumerate().skip(start) {
+        let cell_width = hit.area.width.min(width.saturating_sub(x));
+        if cell_width < hit.area.width.min(5) {
             break;
         }
-        let workspace = &app.project.workspaces[index];
-        let (mark, color) = state_style(workspace.state());
-        let selected = index == focused;
-        let style = Style::default()
-            .fg(if selected { ACCENT } else { MUTED })
-            .bg(BG);
-        let label = Line::from(vec![
-            Span::raw(format!(" {} ", index + 1)),
-            Span::raw(workspace.label()),
-            Span::styled(format!(" {mark} "), Style::default().fg(color)),
-        ]);
-        let rect = Rect::new(x, 0, tab_width, 1);
-        frame.render_widget(Paragraph::new(label).style(style), rect);
-        app.tab_hits.push((rect, index));
-        x += tab_width;
+        hit.area = Rect::new(x, 0, cell_width, 1);
+        let current = hit.project.is_none();
+        let open = hit.project.map_or(&*project, |slot| &saved_projects[slot]);
+        let (line, style) = match hit.workspace {
+            None => (
+                Line::from(vec![
+                    Span::styled(if cell > 0 { "│" } else { "" }, Style::default().fg(BORDER)),
+                    Span::styled(
+                        format!(" {} ", open.name),
+                        Style::default().fg(if current { FG } else { MUTED }).bold(),
+                    ),
+                ]),
+                Style::default().bg(BG),
+            ),
+            Some(index) => {
+                let workspace = &open.workspaces[index];
+                let (mark, color) = state_style(workspace.state());
+                let selected = current && index == focused;
+                (
+                    Line::from(vec![
+                        Span::raw(format!(" {} ", index + 1)),
+                        Span::raw(workspace.label()),
+                        Span::styled(format!(" {mark} "), Style::default().fg(color)),
+                    ]),
+                    Style::default()
+                        .fg(if selected { ACCENT } else { MUTED })
+                        .bg(BG),
+                )
+            }
+        };
+        frame.render_widget(Paragraph::new(line).style(style), hit.area);
+        x += cell_width;
+        end = cell + 1;
         if x >= width.saturating_sub(2) {
             break;
         }
     }
+    tab_hits.truncate(end);
+    tab_hits.drain(..start);
 }
 
 fn draw_workspace(
@@ -224,17 +290,21 @@ fn draw_workspace(
     body: Rect,
     focused: bool,
     show_cursor: bool,
-    is_git: bool,
-) {
-    if area.height < 3 || area.width < 3 {
-        return;
+) -> Option<Scrollbar> {
+    if area.height < 2 || area.width < 3 {
+        return None;
     }
-    let mut header = vec![Span::styled(
+    let exited = workspace
+        .sessions
+        .get(workspace.selected)
+        .filter(|session| session.state == AgentState::Exited);
+    let mut header = Vec::new();
+    let label = Span::styled(
         format!(" {}{} ", if focused { "› " } else { "" }, workspace.label()),
         Style::default()
             .fg(if focused { ACCENT } else { FG })
             .bold(),
-    )];
+    );
     for (index, session) in workspace.sessions.iter().enumerate() {
         let (_, color) = state_style(session.state);
         let active = index == workspace.selected;
@@ -250,14 +320,44 @@ fn draw_workspace(
             Style::default().fg(if active { color } else { MUTED }),
         ));
     }
+    let selected_width = header.get(workspace.selected).map_or(0, Span::width);
+    let label_width = label
+        .width()
+        .min(usize::from(area.width).saturating_sub(selected_width)) as u16;
+    let session_width = area.width - label_width;
+    let mut start = workspace.selected.min(header.len());
+    let mut visible_width = selected_width;
+    while start > 0 && visible_width + header[start - 1].width() <= usize::from(session_width) {
+        start -= 1;
+        visible_width += header[start].width();
+    }
+    let scroll = header[..start]
+        .iter()
+        .map(Span::width)
+        .sum::<usize>()
+        .min(u16::MAX as usize) as u16;
+    if let Some(session) = exited {
+        header.push(Span::styled(
+            format!(
+                " Exited ({}) · F1 restart ",
+                session.message.as_deref().unwrap_or("finished")
+            ),
+            Style::default().fg(AMBER),
+        ));
+    }
     frame.render_widget(
-        Paragraph::new(Line::from(header)),
-        Rect::new(area.x, area.y, area.width, 1),
+        Paragraph::new(Line::from(label)),
+        Rect::new(area.x, area.y, label_width, 1),
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(header)).scroll((0, scroll)),
+        Rect::new(area.x + label_width, area.y, session_width, 1),
     );
     if let Some(session) = workspace.sessions.get(workspace.selected) {
-        let parser = session.parser.lock();
+        let mut parser = session.parser.lock();
         // Clear while holding the parser lock: output after this frame must wake us.
         session.dirty.store(false, Ordering::Release);
+        let scrollbar = scrollbar(parser.screen_mut(), body);
         let screen = parser.screen();
         for row in 0..body.height {
             for col in 0..body.width {
@@ -301,16 +401,15 @@ fn draw_workspace(
                 frame.set_cursor_position((body.x + col, body.y + row));
             }
         }
-        if session.state == AgentState::Exited && body.height > 0 {
-            frame.render_widget(
-                Paragraph::new(format!(
-                    "Session exited ({}). F1 → ask to start another.",
-                    session.message.as_deref().unwrap_or("finished")
-                ))
-                .style(Style::default().fg(AMBER).bg(SURFACE)),
-                Rect::new(body.x, body.bottom() - 1, body.width, 1),
-            );
+        if let Some(bar) = scrollbar {
+            for y in bar.track.y..bar.track.bottom() {
+                let thumb = y >= bar.thumb.y && y < bar.thumb.bottom();
+                frame.buffer_mut()[(bar.track.x, y)]
+                    .set_symbol(if thumb { "┃" } else { "│" })
+                    .set_fg(if thumb { MUTED } else { BORDER });
+            }
         }
+        return scrollbar;
     } else {
         frame.render_widget(
             Paragraph::new("No session open. F1 → ask to start OMP, OpenCode, or a shell.")
@@ -319,47 +418,29 @@ fn draw_workspace(
             body,
         );
     }
-    let mut environment = Vec::new();
-    if !is_git {
-        environment.push(Span::styled(
-            format!(
-                " terminal only · {} · F1 / F2 open project ",
-                workspace.tree.path.display()
-            ),
-            Style::default().fg(MUTED),
-        ));
-    } else if workspace.pending {
-        environment.push(Span::styled(
-            " environment: updating... ",
-            Style::default().fg(AMBER),
-        ));
-    } else if let Some(env) = &workspace.environment {
-        if env.services.is_empty() {
-            environment.push(Span::styled(" stack stopped ", Style::default().fg(MUTED)));
-        }
-        for service in &env.services {
-            let healthy = service.state == "running" && service.health != "unhealthy";
-            environment.push(Span::styled(
-                format!(" {} {}", if healthy { "+" } else { "!" }, service.name),
-                Style::default().fg(if healthy { GREEN } else { AMBER }),
-            ));
-            for port in &service.ports {
-                environment.push(Span::styled(
-                    format!(" :{}", port.host),
-                    Style::default().fg(ACCENT),
-                ));
-            }
-        }
-    } else {
-        environment.push(Span::styled(
-            " environment: not checked ",
-            Style::default().fg(MUTED),
-        ));
+    None
+}
+
+fn scrollbar(screen: &mut vt100::Screen, body: Rect) -> Option<Scrollbar> {
+    if body.is_empty() || screen.alternate_screen() {
+        return None;
     }
-    frame.render_widget(
-        Paragraph::new(Line::from(environment)).style(Style::default().bg(BG)),
-        Rect::new(area.x, area.bottom() - 1, area.width, 1),
-    );
+    let offset = screen.scrollback();
+    screen.set_scrollback(usize::MAX);
+    let max_offset = screen.scrollback();
+    screen.set_scrollback(offset);
+    if max_offset == 0 {
+        return None;
+    }
+    let visible = usize::from(body.height);
+    let height = (visible * visible / (visible + max_offset)).max(1) as u16;
+    let travel = body.height - height;
+    let top = ((max_offset - offset) * usize::from(travel) / max_offset) as u16;
+    Some(Scrollbar {
+        track: Rect::new(body.right(), body.y, 1, body.height),
+        thumb: Rect::new(body.right(), body.y + top, 1, height),
+        max_offset,
+    })
 }
 
 fn state_style(state: AgentState) -> (&'static str, Color) {
@@ -387,9 +468,9 @@ fn vt_color(color: vt100::Color, default: Color) -> Color {
         vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
     }
 }
-fn line_horizontal(buffer: &mut Buffer, x: u16, y: u16, width: u16) {
+fn line_horizontal(buffer: &mut Buffer, x: u16, y: u16, width: u16, color: Color) {
     for column in x..x + width {
-        buffer[(column, y)].set_symbol("─").set_fg(BORDER);
+        buffer[(column, y)].set_symbol("─").set_fg(color);
     }
 }
 
@@ -529,9 +610,9 @@ pub fn draw_project_chooser(
     frame
         .buffer_mut()
         .set_style(bounds, Style::default().fg(FG).bg(BG));
-    if bounds.width < 30 || bounds.height < 14 {
+    if bounds.width < 30 || bounds.height < 10 {
         frame.render_widget(
-            Paragraph::new("crit — enlarge terminal to at least 30×14. Esc quits.")
+            Paragraph::new("crit — enlarge terminal to at least 30×10. Esc quits.")
                 .wrap(Wrap { trim: false }),
             bounds,
         );
@@ -542,43 +623,52 @@ pub fn draw_project_chooser(
         Paragraph::new(" crit · start").style(Style::default().fg(FG).bold()),
         Rect::new(0, 0, bounds.width.saturating_sub(mode_width), 1),
     );
-    let inner = modal_area(frame, " new terminal / open project ", 22);
+    let height = notice_height(Some(notice), Size::new(bounds.width, bounds.height));
+    let available = Rect::new(bounds.x, bounds.y, bounds.width, bounds.height - height);
+    let inner = modal_area_in(frame, available, " new terminal / open project ", 22);
     project_folder(frame, inner, picker);
-    frame.render_widget(
-        Paragraph::new(notice).style(Style::default().fg(AMBER).bg(BG)),
-        Rect::new(0, bounds.height - 1, bounds.width, 1),
+    draw_notice(
+        frame,
+        notice,
+        Rect::new(
+            MARGIN,
+            bounds.height - height,
+            bounds.width.saturating_sub(2 * MARGIN),
+            height,
+        ),
     );
 }
 
 fn project_folder(frame: &mut Frame, inner: Rect, picker: &ProjectPicker) {
-    if inner.height < 8 || inner.width < 3 {
+    if inner.height < 4 || inner.width < 3 {
         frame.render_widget(
             Paragraph::new("Enlarge the terminal to choose a project."),
             inner,
         );
         return;
     }
-    frame.render_widget(
-        Paragraph::new(if picker.terminal_path.is_some() {
-            "New terminal, or filter projects / enter a Git folder:"
-        } else {
-            "Type to filter projects, or enter a Git folder path:"
-        }),
-        Rect::new(inner.x, inner.y, inner.width, 1),
-    );
-    let cursor = (picker.input.width() + 2).min(u16::MAX as usize) as u16;
-    let scroll = cursor.saturating_sub(inner.width - 1);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw("› "),
-            Span::raw(picker.input.as_str()),
-        ]))
-        .scroll((0, scroll)),
-        Rect::new(inner.x, inner.y + 2, inner.width, 1),
-    );
-    if !picker.pending {
-        frame.set_cursor_position((inner.x + cursor - scroll, inner.y + 2));
+    let compact = inner.height < 8;
+    if !compact {
+        frame.render_widget(
+            Paragraph::new(if picker.terminal_path.is_some() {
+                "New terminal, or filter projects / enter any folder:"
+            } else {
+                "Type to filter projects, or enter any folder path:"
+            }),
+            Rect::new(inner.x, inner.y, inner.width, 1),
+        );
     }
+    input_line(
+        frame,
+        Rect::new(
+            inner.x,
+            inner.y + if compact { 0 } else { 2 },
+            inner.width,
+            1,
+        ),
+        &picker.input,
+        !picker.pending,
+    );
     let status = if picker.pending {
         "Opening project..."
     } else if picker.searching {
@@ -594,11 +684,21 @@ fn project_folder(frame: &mut Frame, inner: Rect, picker: &ProjectPicker) {
     };
     frame.render_widget(
         Paragraph::new(status).style(Style::default().fg(MUTED)),
-        Rect::new(inner.x, inner.y + 4, inner.width, 1),
+        Rect::new(
+            inner.x,
+            inner.y + if compact { 1 } else { 4 },
+            inner.width,
+            1,
+        ),
     );
     choice_list(
         frame,
-        Rect::new(inner.x, inner.y + 5, inner.width, inner.height - 8),
+        Rect::new(
+            inner.x,
+            inner.y + if compact { 2 } else { 5 },
+            inner.width,
+            inner.height - if compact { 3 } else { 8 },
+        ),
         picker
             .terminal_path
             .as_ref()
@@ -615,18 +715,29 @@ fn project_folder(frame: &mut Frame, inner: Rect, picker: &ProjectPicker) {
         picker.selected,
     );
     frame.render_widget(
-        Paragraph::new("↑/↓ select · Enter open · Esc cancel · Ctrl+U clear")
-            .style(Style::default().fg(MUTED)),
-        Rect::new(inner.x, inner.bottom() - 2, inner.width, 1),
-    );
-    frame.render_widget(
-        Paragraph::new(format!(
-            "Paths: absolute, ~/ or relative to {}",
-            picker.base.display()
-        ))
+        Paragraph::new(if compact {
+            "↑↓ choose · Enter · Esc"
+        } else {
+            "↑/↓ select · Enter open · Esc cancel · Ctrl+U clear"
+        })
         .style(Style::default().fg(MUTED)),
-        Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+        Rect::new(
+            inner.x,
+            inner.bottom() - if compact { 1 } else { 2 },
+            inner.width,
+            1,
+        ),
     );
+    if !compact {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Paths: absolute, ~/ or relative to {}",
+                picker.base.display()
+            ))
+            .style(Style::default().fg(MUTED)),
+            Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+        );
+    }
 }
 
 fn intent_dialog(frame: &mut Frame, inner: Rect, dialog: &IntentDialog) {
@@ -660,19 +771,12 @@ fn intent_dialog(frame: &mut Frame, inner: Rect, dialog: &IntentDialog) {
             .wrap(Wrap { trim: false }),
         Rect::new(inner.x, inner.y + 4, inner.width, 4),
     );
-    let cursor = (dialog.input.width() + 2).min(u16::MAX as usize) as u16;
-    let scroll = cursor.saturating_sub(inner.width - 1);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw("› "),
-            Span::raw(dialog.input.as_str()),
-        ]))
-        .scroll((0, scroll)),
+    input_line(
+        frame,
         Rect::new(inner.x, inner.y + 9, inner.width, 1),
+        &dialog.input,
+        !dialog.pending,
     );
-    if !dialog.pending {
-        frame.set_cursor_position((inner.x + cursor - scroll, inner.y + 9));
-    }
     let status = if let Some(error) = &dialog.error {
         error.as_str()
     } else if dialog.loading {
@@ -695,13 +799,17 @@ fn intent_dialog(frame: &mut Frame, inner: Rect, dialog: &IntentDialog) {
     );
 }
 
-fn modal_area(frame: &mut Frame, title: &'static str, desired_height: u16) -> Rect {
-    let bounds = frame.area();
+fn modal_area_in(
+    frame: &mut Frame,
+    bounds: Rect,
+    title: &'static str,
+    desired_height: u16,
+) -> Rect {
     let width = bounds.width.saturating_sub(4).min(76);
     let height = bounds.height.saturating_sub(2).min(desired_height);
     let area = Rect::new(
-        (bounds.width - width) / 2,
-        (bounds.height - height) / 2,
+        bounds.x + (bounds.width - width) / 2,
+        bounds.y + (bounds.height - height) / 2,
         width,
         height,
     );
@@ -720,26 +828,43 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
     let (title, desired_height) = match modal {
         Modal::Intent(_) => (" ask Crit ", 22),
         Modal::Commands { .. } => (" manual controls ", 24),
+        Modal::NewTab { choices, .. } => (" new tab ", choices.len() as u16 + 4),
         Modal::OpenProject(_) => (" open project ", 22),
+        Modal::Loading { .. } => (" opening ", 7),
         Modal::SwitchProject { .. } => (
             " switch project ",
             (app.saved_projects.len() as u16 + 4).min(20),
         ),
-        Modal::NewWorktree { .. } => (" new worktree tab ", 8),
+        Modal::NewWorktree { split: None, .. } => (" new worktree tab ", 12),
+        Modal::NewWorktree { .. } => (" new worktree in split ", 12),
         Modal::NewSession { .. } => (" new session ", 8),
         Modal::OpenWorktree { trees, .. } => {
             (" open existing worktree ", (trees.len() as u16 + 4).min(20))
         }
         Modal::Split { .. } => (
             " choose second worktree ",
-            (app.project.workspaces.len() as u16 + 4).min(20),
+            (app.project.workspaces.len() as u16 + 5).min(20),
         ),
         Modal::Preview { urls, .. } => (" open endpoint ", (urls.len() as u16 + 4).min(20)),
         Modal::Confirm(_) => (" confirm ", 9),
     };
-    let inner = modal_area(frame, title, desired_height);
+    let mut available = frame.area();
+    if app.notice.is_some() {
+        available.height = available.height.saturating_sub(notice_height(
+            app.notice.as_deref(),
+            Size::new(available.width, available.height),
+        ));
+    }
+    let inner = modal_area_in(frame, available, title, desired_height);
     match modal {
         Modal::Intent(dialog) => intent_dialog(frame, inner, dialog),
+        Modal::Loading { message, .. } => {
+            frame.render_widget(Paragraph::new(*message).wrap(Wrap { trim: false }), inner);
+            frame.render_widget(
+                Paragraph::new("Esc cancel").style(Style::default().fg(MUTED)),
+                Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+            );
+        }
         Modal::Commands { selected } => {
             choice_list(
                 frame,
@@ -758,6 +883,12 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
                 Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
             );
         }
+        Modal::NewTab { choices, selected } => choice_list(
+            frame,
+            inner,
+            choices.iter().map(|(label, _)| label.clone()),
+            *selected,
+        ),
         Modal::OpenProject(picker) => project_folder(frame, inner, picker),
         Modal::SwitchProject { selected } => choice_list(
             frame,
@@ -776,16 +907,37 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
             }),
             *selected,
         ),
-        Modal::NewWorktree { input } => {
-            let text = format!(
-                "Branch name (existing or new):\n\n› {input}\n\nEnter creates checkout + starts its Compose stack.\nEsc cancels. Base: {}",
-                app.focused().tree.branch
+        Modal::NewWorktree { input, split } => {
+            let outcome = match split {
+                Some(LayoutMode::Vertical) => "opens it side by side with",
+                Some(_) => "opens it below",
+                None => "opens it in a new tab next to",
+            };
+            frame.render_widget(
+                Paragraph::new("Branch name (existing or new):"),
+                Rect::new(inner.x, inner.y, inner.width, 1),
             );
-            frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), inner);
-            let x = inner.x + 2 + input.width() as u16;
-            if x < inner.right() && inner.height > 2 {
-                frame.set_cursor_position((x, inner.y + 2));
+            if inner.height > 2 {
+                input_line(
+                    frame,
+                    Rect::new(inner.x, inner.y + 2, inner.width, 1),
+                    input,
+                    true,
+                );
             }
+            if inner.height > 5 {
+                frame.render_widget(
+                    Paragraph::new(format!(
+                        "Enter creates the checkout from {base}, starts its Compose stack, and {outcome} {base}.",
+                        base = app.focused().tree.branch,
+                    )).wrap(Wrap { trim: false }),
+                    Rect::new(inner.x, inner.y + 4, inner.width, inner.height - 5),
+                );
+            }
+            frame.render_widget(
+                Paragraph::new("Enter create · Esc cancel").style(Style::default().fg(MUTED)),
+                Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+            );
         }
         Modal::NewSession { selected } => choice_list(
             frame,
@@ -804,17 +956,19 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
         Modal::Split { selected, .. } => choice_list(
             frame,
             inner,
-            app.project.workspaces.iter().map(|workspace| {
-                format!(
-                    "{}{}",
-                    workspace.tree.branch,
-                    if workspace.tree.id == app.focused().tree.id {
-                        " (current)"
-                    } else {
-                        ""
-                    }
-                )
-            }),
+            std::iter::once("New branch / worktree…".to_owned()).chain(
+                app.project.workspaces.iter().map(|workspace| {
+                    format!(
+                        "{}{}",
+                        workspace.tree.branch,
+                        if workspace.tree.id == app.focused().tree.id {
+                            " (current)"
+                        } else {
+                            ""
+                        }
+                    )
+                }),
+            ),
             *selected,
         ),
         Modal::Preview { urls, selected } => choice_list(
@@ -826,30 +980,138 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
         Modal::Confirm(confirm) => {
             let message = match confirm {
                 Confirm::Quit => {
-                    "Exit Crit and terminate its agent/shell sessions?\n\nDocker environments keep running; checkouts remain."
+                    "Exit Crit; stop sessions?\nSaved chats reopen.\nDocker/checkouts stay."
                 }
                 Confirm::CloseWorktree if app.project.repository.is_none() => {
-                    "Close this terminal tab and terminate its sessions?\n\nOther open projects and sessions remain."
+                    "Close tab; end its sessions?\nOther projects and sessions remain."
                 }
                 Confirm::CloseWorktree => {
-                    "Close this tab and terminate its sessions?\n\nCheckout, branch, and Docker environment remain."
+                    "Close tab; end its sessions?\nCheckout, branch and Docker remain."
                 }
                 Confirm::CloseSession => {
-                    "Terminate the focused agent/shell session?\n\nOther sessions and Docker services remain."
+                    "End the focused session?\nOther sessions and Docker remain."
                 }
                 Confirm::StopEnvironment => {
-                    "Stop this worktree's Docker environment?\n\nOther worktrees are unaffected. Volumes remain."
+                    "Stop this worktree's Docker?\nOther worktrees unaffected.\nVolumes remain."
                 }
                 Confirm::RemoveWorktree => {
-                    "Remove this worktree's checkout?\n\nDirty/main/locked checkouts are refused.\nStop its Docker environment first. Branch remains."
+                    "Delete this checkout?\nDirty/main/locked refused.\nStop Docker first.\nBranch remains."
                 }
             };
-            frame.render_widget(
-                Paragraph::new(format!("{message}\n\ny confirm · n / Esc cancel"))
-                    .wrap(Wrap { trim: false }),
-                inner,
-            );
+            draw_confirmation(frame, inner, message);
         }
+    }
+}
+
+fn input_line(frame: &mut Frame, area: Rect, input: &str, show_cursor: bool) {
+    if area.is_empty() {
+        return;
+    }
+    let line = Line::from(vec![Span::raw("› "), Span::raw(input)]);
+    let cursor = line.width().min(u16::MAX as usize) as u16;
+    let minimum_scroll = cursor.saturating_sub(area.width - 1);
+    let mut scroll = 0_u16;
+    // Ratatui retains a whole wide grapheme when an offset cuts through it.
+    // Align the viewport to its end so the cursor cannot cover the last glyph.
+    for grapheme in line.styled_graphemes(Style::default()) {
+        if scroll >= minimum_scroll {
+            break;
+        }
+        scroll = scroll.saturating_add(grapheme.symbol.width() as u16);
+    }
+    frame.render_widget(Paragraph::new(line).scroll((0, scroll)), area);
+    if show_cursor {
+        frame.set_cursor_position((area.x + cursor - scroll, area.y));
+    }
+}
+
+fn draw_confirmation(frame: &mut Frame, inner: Rect, message: &str) {
+    if inner.is_empty() {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(message).wrap(Wrap { trim: false }),
+        Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(1),
+        ),
+    );
+    frame.render_widget(
+        Paragraph::new("y confirm · Esc/n cancel").style(Style::default().fg(AMBER)),
+        Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+    );
+}
+
+// Character-wrap notices without dropping text or depending on paragraph's
+// private word-wrap measurement. Slices borrow the existing message.
+fn notice_chunks<'a>(text: &'a str, width: u16, mut emit: impl FnMut(&'a str)) {
+    if width == 0 {
+        return;
+    }
+    for line in text.trim_end_matches('\n').split('\n') {
+        let mut start = 0;
+        let mut columns = 0;
+        for (offset, ch) in line.char_indices() {
+            let next = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+            if columns + next > width && offset > start {
+                emit(&line[start..offset]);
+                start = offset;
+                columns = 0;
+            }
+            columns += next;
+        }
+        emit(&line[start..]);
+    }
+}
+
+fn notice_height(notice: Option<&str>, size: Size) -> u16 {
+    let Some(notice) = notice else { return 0 };
+    let mut lines = 0usize;
+    notice_chunks(notice, size.width.saturating_sub(2 * MARGIN), |_| {
+        lines += 1
+    });
+    // Leave room for a usable modal and input even at the minimum size.
+    (lines.min(u16::MAX as usize) as u16)
+        .min((size.height / 3).min(size.height.saturating_sub(8)).max(1))
+        .max(1)
+}
+
+fn draw_notice(frame: &mut Frame, notice: &str, area: Rect) {
+    if area.is_empty() {
+        return;
+    }
+    let mut lines = Vec::new();
+    notice_chunks(notice, area.width, |line| lines.push(Line::raw(line)));
+    let overflow = lines.len() > area.height as usize;
+    if overflow && area.height == 1 {
+        frame.render_widget(
+            Paragraph::new(lines.pop().unwrap()).style(Style::default().fg(AMBER)),
+            Rect::new(area.x + 1, area.y, area.width.saturating_sub(1), 1),
+        );
+        frame.buffer_mut()[(area.x, area.y)]
+            .set_symbol("↑")
+            .set_fg(AMBER);
+        return;
+    }
+    let visible = area.height.saturating_sub(u16::from(overflow));
+    let scroll = lines
+        .len()
+        .saturating_sub(visible as usize)
+        .min(u16::MAX as usize) as u16;
+    let content = Rect::new(area.x, area.y + u16::from(overflow), area.width, visible);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((scroll, 0))
+            .style(Style::default().fg(AMBER).bg(BG)),
+        content,
+    );
+    if overflow {
+        frame.render_widget(
+            Paragraph::new("↑ earlier notice text").style(Style::default().fg(AMBER)),
+            Rect::new(area.x, area.y, area.width, 1),
+        );
     }
 }
 fn choice_list(
@@ -863,4 +1125,168 @@ fn choice_list(
         .highlight_symbol("› ");
     let mut state = ListState::default().with_selected(Some(selected));
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+
+    #[test]
+    fn pane_bodies_fill_available_height_without_covering_headers() {
+        for size in [
+            Size::new(30, 10),
+            Size::new(59, 24),
+            Size::new(80, 24),
+            Size::new(240, 80),
+        ] {
+            for layout in [
+                LayoutMode::Full,
+                LayoutMode::Vertical,
+                LayoutMode::Horizontal,
+            ] {
+                let (panes, count) = pane_areas(layout, true, size);
+                for pane in panes.into_iter().take(count) {
+                    let content = body(pane);
+                    assert!(content.right() <= size.width);
+                    assert!(content.y > pane.y);
+                    assert!(content.bottom() <= size.height);
+                }
+                assert_eq!(body(panes[count - 1]).bottom(), size.height);
+            }
+        }
+    }
+
+    #[test]
+    fn scrollbar_measurement_preserves_history_view_and_hides_on_alternate_screen() {
+        let mut parser = vt100::Parser::new(8, 30, 32);
+        let body = Rect::new(1, 2, 30, 8);
+        assert!(scrollbar(parser.screen_mut(), body).is_none());
+        for row in 0..70 {
+            parser.process(format!("line-{row}\r\n").as_bytes());
+        }
+        parser.screen_mut().set_scrollback(15);
+        let contents = parser.screen().contents();
+        let bar = scrollbar(parser.screen_mut(), body).unwrap();
+        assert_eq!(bar.max_offset, 32);
+        assert_eq!(parser.screen().scrollback(), 15);
+        assert_eq!(parser.screen().contents(), contents);
+        assert!(bar.thumb.y > bar.track.y);
+        assert!(bar.thumb.bottom() < bar.track.bottom());
+        parser.process(b"\x1b[?1049h");
+        assert!(scrollbar(parser.screen_mut(), body).is_none());
+    }
+
+    #[test]
+    fn long_unicode_input_scrolls_with_cursor_inside_input_row() {
+        let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
+        let area = Rect::new(3, 4, 24, 1);
+        for input in ["short".to_owned(), "界e\u{301}".repeat(100)] {
+            terminal
+                .draw(|frame| input_line(frame, area, &input, true))
+                .unwrap();
+            let cursor = terminal.get_cursor_position().unwrap();
+            assert_eq!(cursor.y, area.y);
+            assert!(cursor.x >= area.x && cursor.x < area.right());
+            if input.width() >= area.width as usize {
+                assert_eq!(
+                    terminal.backend().buffer()[(cursor.x - 1, cursor.y)].symbol(),
+                    "e\u{301}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn confirmation_controls_survive_long_wrapped_message() {
+        let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                let bounds = frame.area();
+                let inner = modal_area_in(frame, bounds, " confirm ", 9);
+                draw_confirmation(frame, inner, &"Long destructive consequences ".repeat(20));
+                let buffer = frame.buffer_mut();
+                assert_eq!(buffer[(inner.x, inner.bottom() - 1)].fg, AMBER);
+                assert_ne!(
+                    buffer[(inner.right() - 2, inner.bottom() - 1)].symbol(),
+                    " "
+                );
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn overflow_notice_shows_final_cause_and_overflow_marker() {
+        let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_notice(
+                    frame,
+                    "preparing\nchecking\nprogress\nFATAL\n",
+                    Rect::new(1, 8, 28, 2),
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 8)].symbol(), "↑");
+        assert_eq!(buffer[(1, 9)].symbol(), "F");
+        assert_eq!(buffer[(5, 9)].symbol(), "L");
+    }
+
+    #[test]
+    fn notice_chunks_preserve_unicode_and_newline_boundaries() {
+        let mut chunks = Vec::new();
+        notice_chunks("界界e\u{301}\nlast", 4, |chunk| chunks.push(chunk));
+        assert_eq!(chunks, ["界界", "e\u{301}", "last"]);
+        assert!(chunks.iter().all(|chunk| chunk.width() <= 4));
+    }
+
+    #[test]
+    fn list_keeps_selected_item_visible_after_overflow() {
+        let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
+        terminal
+            .draw(|frame| {
+                choice_list(
+                    frame,
+                    Rect::new(2, 2, 24, 3),
+                    (0..30).map(|index| format!("item {index}")),
+                    29,
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!((2..5).any(|row| buffer[(2, row)].symbol() == "›"));
+        assert!((2..5).any(|row| buffer[(4, row)].fg == ACCENT));
+    }
+
+    #[test]
+    fn multiline_notice_geometry_leaves_modal_input_and_output_separate() {
+        for size in [Size::new(30, 10), Size::new(80, 24), Size::new(240, 80)] {
+            let notice = "progress\n".repeat(100);
+            let height = notice_height(Some(&notice), size);
+            let mut content = size;
+            content.height -= height;
+            let (panes, count) = pane_areas(LayoutMode::Horizontal, true, content);
+            for pane in panes.into_iter().take(count) {
+                assert!(body(pane).bottom() <= size.height - height);
+            }
+            let mut terminal = Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let available = Rect::new(0, 0, size.width, size.height - height);
+                    let inner = modal_area_in(frame, available, " input ", 12);
+                    assert!(inner.height >= 4);
+                    input_line(
+                        frame,
+                        Rect::new(inner.x, inner.y + 2, inner.width, 1),
+                        "界".repeat(100).as_str(),
+                        true,
+                    );
+                    assert!(inner.bottom() < size.height - height);
+                })
+                .unwrap();
+            let cursor = terminal.get_cursor_position().unwrap();
+            assert!(cursor.y < size.height - height);
+        }
+    }
 }

@@ -3,10 +3,10 @@ use std::io::{self, Write};
 
 pub const HELP: &str = "Crit shortcuts (same as Kitty's terminal/window actions)
   F12                    Toggle Crit / native Kitty shortcuts (persistent)
-  Ctrl+Shift+T            New worktree tab
+  Ctrl+Shift+T            New tab: worktree, other project, or switch project
   Ctrl+Shift+Q            Close worktree tab; retain checkout
-  Ctrl+Tab / Ctrl+Shift+Right  Next worktree
-  Ctrl+Shift+Tab / Left   Previous worktree
+  Ctrl+Tab / Ctrl+Shift+Right  Next tab (wraps into the next open project)
+  Ctrl+Shift+Tab / Left   Previous tab
   Ctrl+Shift+Enter        New OMP / OpenCode / shell session
   Ctrl+D                 From OMP / OpenCode, select or open a shell here
   Ctrl+Shift+W            Close focused session
@@ -23,7 +23,14 @@ The agent keeps running when Ctrl+D selects a shell. In a shell, Ctrl+D remains
 normal EOF; native shortcut mode always forwards Ctrl+D to the focused terminal.
 Clipboard and font shortcuts remain native Kitty actions. Ctrl+C, Ctrl+Z,
 Tab, Escape, and ordinary typing go to the focused terminal.
+Typing or pasting returns a scrolled terminal to its live output.
+Wheel scrolls history unless the app captures it; Shift+wheel scrolls Crit history.
+Click or drag the right-edge scrollbar; its bottom returns to live output.
+Esc cancels a pending project open or worktree listing without switching tabs.
+Below 30x10, UI input pauses except Esc and F12; enlarge the terminal to resume.
 F12 switches routing, not a one-shot prefix. Setup: crit setup kitty
+F10 stops live processes; the next launch restores saved workspaces and agent chats.
+Closed tabs/sessions stay closed. Use crit --fresh to start a new saved workspace.
 In Ask Crit: Enter sends, Esc cancels inference, Ctrl+U clears the input.
 Answer follow-up questions in the same box; ordinary terminal input is unchanged.
 ";
@@ -33,7 +40,7 @@ pub enum Action {
     ToggleNative,
     Launcher,
     Quit,
-    NewWorktree,
+    NewTab,
     CloseWorktree,
     NewSession,
     CloseSession,
@@ -67,7 +74,7 @@ pub fn action(key: KeyEvent) -> Option<Action> {
         Left if ctrl && shift => Some(PreviousWorktree),
         Enter if ctrl && shift => Some(NewSession),
         Char(c) if ctrl && shift => match c.to_ascii_lowercase() {
-            't' => Some(NewWorktree),
+            't' => Some(NewTab),
             'q' => Some(CloseWorktree),
             'w' => Some(CloseSession),
             '[' | '{' => Some(PreviousSession),
@@ -95,7 +102,9 @@ pub fn write_key(
         + u8::from(modifiers.contains(KeyModifiers::SHIFT))
         + 2 * u8::from(modifiers.contains(KeyModifiers::ALT))
         + 4 * u8::from(modifiers.contains(KeyModifiers::CONTROL))
-        + 8 * u8::from(modifiers.contains(KeyModifiers::SUPER));
+        + 8 * u8::from(modifiers.contains(KeyModifiers::SUPER))
+        + 16 * u8::from(modifiers.contains(KeyModifiers::HYPER))
+        + 32 * u8::from(modifiers.contains(KeyModifiers::META));
     let printable =
         matches!(key.code, Char(_)) && modifiers.difference(KeyModifiers::SHIFT).is_empty();
     if kitty_keyboard && !printable && (modifier_number > 1 || key.code == Esc) {
@@ -116,24 +125,26 @@ pub fn write_key(
         }
     }
     if modifiers.contains(KeyModifiers::ALT)
-        && matches!(key.code, Char(_) | Enter | Backspace | Tab | Esc)
+        && matches!(key.code, Char(_) | Enter | Backspace | Tab | BackTab | Esc)
     {
         writer.write_all(b"\x1b")?;
     }
     match key.code {
         Char(c) => {
             if modifiers.contains(KeyModifiers::CONTROL) {
-                let c = c.to_ascii_lowercase();
-                let byte = match c {
-                    'a'..='z' => c as u8 - b'a' + 1,
+                let byte = match c.to_ascii_lowercase() {
+                    letter @ 'a'..='z' => letter as u8 - b'a' + 1,
                     '@' | ' ' | '2' => 0,
                     '[' | '3' => 27,
                     '\\' | '4' => 28,
                     ']' | '5' => 29,
-                    '^' | '6' => 30,
-                    '_' | '7' => 31,
+                    '^' | '~' | '6' => 30,
+                    '_' | '/' | '7' => 31,
                     '?' | '8' => 127,
-                    _ => return Ok(()),
+                    _ => {
+                        let mut bytes = [0; 4];
+                        return writer.write_all(c.encode_utf8(&mut bytes).as_bytes());
+                    }
                 };
                 writer.write_all(&[byte])
             } else {
@@ -142,6 +153,7 @@ pub fn write_key(
             }
         }
         Enter => writer.write_all(b"\r"),
+        Backspace if modifiers.contains(KeyModifiers::CONTROL) => writer.write_all(b"\x08"),
         Backspace => writer.write_all(b"\x7f"),
         Tab if !modifiers.contains(KeyModifiers::SHIFT) => writer.write_all(b"\t"),
         Tab | BackTab => writer.write_all(b"\x1b[Z"),
@@ -157,7 +169,7 @@ pub fn write_key(
             };
             if modifier_number > 1 {
                 write!(writer, "\x1b[1;{modifier_number}{suffix}")
-            } else if application_cursor {
+            } else if application_cursor && !kitty_keyboard {
                 write!(writer, "\x1bO{suffix}")
             } else {
                 write!(writer, "\x1b[{suffix}")
@@ -184,10 +196,19 @@ pub fn write_key(
                 write!(writer, "\x1b[{number}~")
             }
         }
+        F(3) if kitty_keyboard => {
+            if modifier_number > 1 {
+                write!(writer, "\x1b[13;{modifier_number}~")
+            } else {
+                writer.write_all(b"\x1b[13~")
+            }
+        }
         F(number @ 1..=4) => {
             let suffix = char::from(b'P' + number - 1);
             if modifier_number > 1 {
                 write!(writer, "\x1b[1;{modifier_number}{suffix}")
+            } else if kitty_keyboard {
+                write!(writer, "\x1b[{suffix}")
             } else {
                 write!(writer, "\x1bO{suffix}")
             }
@@ -210,7 +231,7 @@ mod tests {
                 KeyCode::Char('T'),
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT
             )),
-            Some(Action::NewWorktree)
+            Some(Action::NewTab)
         );
     }
     #[test]
@@ -291,5 +312,90 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bytes, b"\x1b[97;6u");
+    }
+    #[test]
+    fn legacy_control_keys_preserve_unmapped_text_and_backspace() {
+        let mut bytes = Vec::new();
+        for (code, modifiers) in [
+            (KeyCode::Char('1'), KeyModifiers::CONTROL),
+            (KeyCode::Char('界'), KeyModifiers::CONTROL),
+            (
+                KeyCode::Char('Ä'),
+                KeyModifiers::ALT | KeyModifiers::CONTROL,
+            ),
+            (KeyCode::Backspace, KeyModifiers::CONTROL),
+            (
+                KeyCode::Backspace,
+                KeyModifiers::ALT | KeyModifiers::CONTROL,
+            ),
+            (
+                KeyCode::Char('C'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            (KeyCode::BackTab, KeyModifiers::ALT | KeyModifiers::SHIFT),
+            (KeyCode::Char('/'), KeyModifiers::CONTROL),
+            (KeyCode::Char('~'), KeyModifiers::CONTROL),
+        ] {
+            write_key(&mut bytes, KeyEvent::new(code, modifiers), false, false).unwrap();
+        }
+        assert_eq!(
+            bytes,
+            "1界\x1bÄ\x08\x1b\x08\x03\x1b\x1b[Z\x1f\x1e".as_bytes()
+        );
+    }
+
+    #[test]
+    fn disambiguated_function_keys_never_use_ss3_or_cursor_reports() {
+        for (code, expected) in [
+            (KeyCode::Up, "\x1b[A"),
+            (KeyCode::Home, "\x1b[H"),
+            (KeyCode::F(1), "\x1b[P"),
+            (KeyCode::F(2), "\x1b[Q"),
+            (KeyCode::F(3), "\x1b[13~"),
+            (KeyCode::F(4), "\x1b[S"),
+        ] {
+            let mut bytes = Vec::new();
+            write_key(
+                &mut bytes,
+                KeyEvent::new(code, KeyModifiers::NONE),
+                true,
+                true,
+            )
+            .unwrap();
+            assert_eq!(bytes, expected.as_bytes());
+        }
+        let mut bytes = Vec::new();
+        write_key(
+            &mut bytes,
+            KeyEvent::new(KeyCode::F(3), KeyModifiers::CONTROL),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(bytes, b"\x1b[13;5~");
+        bytes.clear();
+        write_key(
+            &mut bytes,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            true,
+            false,
+        )
+        .unwrap();
+        assert_eq!(bytes, b"\x1bOA");
+    }
+
+    #[test]
+    fn disambiguated_hyper_and_meta_do_not_turn_into_plain_text() {
+        let mut bytes = Vec::new();
+        for modifiers in [KeyModifiers::HYPER, KeyModifiers::META] {
+            write_key(
+                &mut bytes,
+                KeyEvent::new(KeyCode::Char('界'), modifiers),
+                false,
+                true,
+            )
+            .unwrap();
+        }
+        assert_eq!(bytes, b"\x1b[30028;17u\x1b[30028;33u");
     }
 }

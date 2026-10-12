@@ -80,23 +80,39 @@ fn canonical_path(path: &Path) -> Result<PathBuf> {
 }
 
 pub fn discover(path: &Path) -> Result<Repository> {
+    discover_optional(path)?
+        .with_context(|| format!("{} is not inside a Git repository", path.display()))
+}
+
+/// `Ok(None)` when `path` is outside every Git repository; any other Git
+/// failure (unreadable, dubious ownership, bare repository) is an error.
+pub fn discover_optional(path: &Path) -> Result<Option<Repository>> {
     let cwd = if path.is_file() {
         path.parent().unwrap_or(path)
     } else {
         path
     };
-    let root = checked(
-        git(cwd).args(["rev-parse", "--show-toplevel"]),
-        "discover Git worktree",
-    )?;
-    let root = fs::canonicalize(output_path(&root.stdout)).context("resolve repository root")?;
+    let output = git(cwd)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .context("could not run discover Git worktree")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stderr = stderr.trim_end();
+        ensure!(
+            stderr.contains("not a git repository"),
+            "discover Git worktree: {stderr}"
+        );
+        return Ok(None);
+    }
+    let root = fs::canonicalize(output_path(&output.stdout)).context("resolve repository root")?;
     let common = checked(
         git(&root).args(["rev-parse", "--path-format=absolute", "--git-common-dir"]),
         "discover Git common directory",
     )?;
     let common_dir =
         fs::canonicalize(output_path(&common.stdout)).context("resolve Git common directory")?;
-    Ok(Repository { root, common_dir })
+    Ok(Some(Repository { root, common_dir }))
 }
 
 // A one-shot, bounded search keeps the launcher responsive without indexing
@@ -210,6 +226,28 @@ fn parse_list(bytes: &[u8]) -> Result<Vec<Worktree>> {
         trees.push(tree);
     }
     Ok(trees)
+}
+
+/// Only ignored, untracked files are eligible for local configuration copying.
+/// Checking the index separately prevents copying a tracked file deleted locally.
+pub(crate) fn ignored_local_file(root: &Path, relative: &Path) -> Result<bool> {
+    let tracked = checked(
+        git(root).args(["ls-files", "-z", "--"]).arg(relative),
+        "inspect local configuration tracking",
+    )?;
+    if !tracked.stdout.is_empty() {
+        return Ok(false);
+    }
+    let ignored = git(root)
+        .args(["check-ignore", "--quiet", "--"])
+        .arg(relative)
+        .status()
+        .context("inspect local configuration ignore rule")?;
+    ensure!(
+        ignored.success() || ignored.code() == Some(1),
+        "could not inspect local configuration ignore rule"
+    );
+    Ok(ignored.success())
 }
 
 fn branch_slug(branch: &str) -> String {
@@ -387,6 +425,26 @@ mod tests {
         .unwrap();
         let repository = discover(&root).unwrap();
         (directory, repository)
+    }
+
+    #[test]
+    fn ignored_local_configuration_excludes_tracked_and_unignored_files() {
+        let (_directory, repository) = repository();
+        fs::write(repository.root.join(".gitignore"), "**/env/*.env*\n").unwrap();
+        fs::create_dir(repository.root.join("env")).unwrap();
+        let relative = Path::new("env/keycloak.env");
+        fs::write(repository.root.join(relative), "fixture").unwrap();
+        assert!(ignored_local_file(&repository.root, relative).unwrap());
+        assert!(!ignored_local_file(&repository.root, Path::new("env/database.db")).unwrap());
+        checked(
+            git(&repository.root)
+                .args(["add", "--force", "--"])
+                .arg(relative),
+            "track ignored configuration",
+        )
+        .unwrap();
+        fs::remove_file(repository.root.join(relative)).unwrap();
+        assert!(!ignored_local_file(&repository.root, relative).unwrap());
     }
 
     #[test]

@@ -1,0 +1,42 @@
+:root {
+  font-family: 'Inter Variable', sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --font-sans: 'Inter Variable', sans-serif;
+  --font-display: 'Space Grotesk Variable', sans-serif;
+  --font-serif: 'Instrument Serif', Georgia, serif;
+  --font-mono: 'IBM Plex Mono', monospace;
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+html { scroll-behavior: smooth; scroll-padding-top: 32px; }
+body { margin: 0; min-width: 320px; }
+button, input { font: inherit; }
+button, a { -webkit-tap-highlight-color: transparent; }
+a { color: inherit; }
+button { cursor: pointer; }
+img, svg { max-width: 100%; }
+img { display: block; }
+button:disabled { cursor: default; }
+[hidden] { display: none !important; }
+:focus-visible { outline: 3px solid currentColor; outline-offset: 5px; }
+::selection { background: #c3f66c; color: #182111; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.skip-link { position: fixed; z-index: 100; left: 16px; top: -100px; padding: 14px 20px; background: #fff; color: #111; border: 2px solid #111; border-radius: 6px; }
+.skip-link:focus { top: 16px; }
+
+.review-dock { position: fixed; z-index: 50; left: 50%; bottom: 18px; transform: translateX(-50%); display: flex; align-items: center; gap: 5px; padding: 6px; border: 1px solid #ffffff2b; border-radius: 100px; background: #20211fef; color: #f5f5ee; box-shadow: 0 4px 24px #0003; backdrop-filter: blur(16px); }
+.review-dock a { display: flex; align-items: center; justify-content: center; min-width: 40px; min-height: 36px; padding: 0 13px; border-radius: 100px; text-decoration: none; font-family: var(--font-mono); font-size: 11px; line-height: 1; transition: background .15s ease; }
+.review-dock a:hover { background: #ffffff18; }
+.review-dock a[aria-current='page'] { background: #f4f4ea; color: #24251f; }
+.review-dock .review-home { gap: 7px; border-right: 1px solid #ffffff22; border-radius: 100px 0 0 100px; margin-right: 3px; padding-right: 16px; }
+.review-home svg { width: 13px; height: 13px; }
+@media (max-width: 520px) {
+  .review-dock { bottom: 12px; }
+  .review-dock a { padding-inline: 12px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}

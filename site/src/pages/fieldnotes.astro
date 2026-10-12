@@ -1,0 +1,1001 @@
+---
+import PreviewLayout from '../layouts/PreviewLayout.astro';
+import FieldnotesWorkspace from '../components/fieldnotes/FieldnotesWorkspace.astro';
+import type { Pane, Project } from '../components/fieldnotes/FieldnotesWorkspace.astro';
+import FieldnotesLauncher from '../components/fieldnotes/FieldnotesLauncher.astro';
+import FieldnotesBranchFigure from '../components/fieldnotes/FieldnotesBranchFigure.astro';
+
+const nav = [
+  { href: '#notes', label: 'Rooms' },
+  { href: '#ask', label: 'Ask Crit' },
+  { href: '#shell', label: 'The shell' },
+  { href: '#compose', label: 'Stacks' },
+  { href: '#guide', label: 'Field guide' },
+  { href: '#install', label: 'Install' },
+];
+
+const loginPath = 'omp · ~/dev/.crit-worktrees/…/feat-login-fixes-4c1d';
+const ciPath = 'shell · ~/dev/.crit-worktrees/…/fix-flaky-ci-9b2e';
+
+const heroProjects: Project[] = [
+  {
+    name: 'crit',
+    current: true,
+    tabs: [
+      { label: 'main', state: 'idle' },
+      { label: 'feat/login-fixes', state: 'working', selected: true, callout: 1 },
+      { label: 'fix/flaky-ci', state: 'input' },
+    ],
+  },
+  { name: 'portfolio', tabs: [{ label: 'main', state: 'idle' }] },
+];
+const heroPanes: Pane[] = [
+  {
+    label: 'feat/login-fixes',
+    focused: true,
+    sessions: [
+      { kind: 'omp', state: 'working', active: true, callout: 2 },
+      { kind: 'shell', state: 'idle' },
+    ],
+    lines: [
+      { kind: 'label', text: loginPath },
+      { kind: 'agent', text: 'reading src/auth/session.rs' },
+      { kind: 'agent', text: 'the refresh check compares seconds with milliseconds' },
+      { kind: 'agent', text: 'editing src/auth/session.rs' },
+      { kind: 'dim', text: '2 files changed · running cargo test auth::' },
+    ],
+  },
+  {
+    label: 'fix/flaky-ci',
+    sessions: [
+      { kind: 'omp', state: 'idle' },
+      { kind: 'shell', state: 'idle', active: true },
+    ],
+    lines: [
+      { kind: 'label', text: ciPath },
+      { kind: 'cmd', text: 'crit env status', callout: 3 },
+      { kind: 'out', text: 'web   running   127.0.0.1:41873 → 3000' },
+      { kind: 'out', text: 'api   running   127.0.0.1:41874 → 8000' },
+      { kind: 'cursor', text: '' },
+    ],
+  },
+];
+
+const critProject = (selected: string, extra: Project['tabs'] = []): Project => ({
+  name: 'crit',
+  current: true,
+  tabs: [
+    { label: 'main', state: 'idle', selected: selected === 'main' },
+    { label: 'feat/login-fixes', state: 'working', selected: selected === 'feat/login-fixes' },
+    ...extra,
+  ],
+});
+const loginPane = (sessions: Pane['sessions'], lines: Pane['lines']): Pane => ({
+  label: 'feat/login-fixes',
+  focused: true,
+  sessions,
+  lines,
+});
+const ompLines: Pane['lines'] = [
+  { kind: 'label', text: loginPath },
+  { kind: 'agent', text: 'reading src/auth/session.rs' },
+  { kind: 'agent', text: 'the refresh check compares seconds with milliseconds' },
+  { kind: 'agent', text: 'editing src/auth/session.rs' },
+];
+
+interface Request {
+  id: string;
+  label: string;
+  input: string;
+  plan: string;
+  question?: string;
+  mode?: 'ask' | 'manual';
+  projects: Project[];
+  panes: Pane[];
+  note: string;
+}
+const requests: Request[] = [
+  {
+    id: 'branch',
+    label: 'a new branch in its own worktree',
+    input: 'Start a branch for login fixes in a separate worktree.',
+    plan: '{"action":"create_worktree","branch":"feat/login-fixes","base":null,"agent":null}',
+    projects: [critProject('feat/login-fixes')],
+    panes: [loginPane([{ kind: 'omp', state: 'working', active: true }], ompLines)],
+    note:
+      'A fresh checkout from the focused HEAD, in its own tab, with your default agent started. If crit.toml configures Compose, this worktree’s stack comes up as well, on its own loopback ports.',
+  },
+  {
+    id: 'project',
+    label: 'another project with OpenCode',
+    input: 'Open portfolio with OpenCode.',
+    plan: '{"action":"open","target":4,"agent":"opencode"}',
+    projects: [
+      {
+        name: 'crit',
+        tabs: [
+          { label: 'main', state: 'idle' },
+          { label: 'feat/login-fixes', state: 'working' },
+        ],
+      },
+      { name: 'portfolio', current: true, tabs: [{ label: 'main', state: 'working', selected: true }] },
+    ],
+    panes: [
+      {
+        label: 'main',
+        focused: true,
+        sessions: [{ kind: 'opencode', state: 'working', active: true }],
+        lines: [
+          { kind: 'label', text: 'opencode · ~/dev/portfolio' },
+          { kind: 'agent', text: 'reading package.json' },
+          { kind: 'agent', text: 'ready for a prompt' },
+        ],
+      },
+    ],
+    note:
+      '“portfolio” matched a known destination, so Crit opened that checkout, only that checkout, not every branch, with OpenCode. The crit tabs stay open and their sessions keep running until Crit exits.',
+  },
+  {
+    id: 'split',
+    label: 'two worktrees side by side',
+    input: 'Put the flaky CI fix beside this one.',
+    plan: '{"action":"command","command":"split_vertical"}',
+    projects: [critProject('feat/login-fixes', [{ label: 'fix/flaky-ci', state: 'idle' }])],
+    panes: [
+      loginPane([{ kind: 'omp', state: 'working', active: true }], [
+        { kind: 'label', text: loginPath },
+        { kind: 'agent', text: 'editing src/auth/session.rs' },
+      ]),
+      {
+        label: 'fix/flaky-ci',
+        sessions: [{ kind: 'shell', state: 'idle', active: true }],
+        lines: [
+          { kind: 'label', text: ciPath },
+          { kind: 'cmd', text: 'cargo test ci::retry' },
+          { kind: 'out', text: 'running 3 tests … ok' },
+          { kind: 'cursor', text: '' },
+        ],
+      },
+    ],
+    note:
+      'A split asks for a branch name, and that branch’s worktree opens in the second pane; Ctrl+Shift+, does the same by hand. Ctrl+Shift+L cycles full, vertical and horizontal layouts, and returning to full width keeps the focused worktree.',
+  },
+  {
+    id: 'logs',
+    label: 'this worktree’s Compose logs',
+    input: "Show this workspace's logs.",
+    plan: '{"action":"command","command":"environment_logs"}',
+    projects: [critProject('feat/login-fixes')],
+    panes: [
+      loginPane(
+        [
+          { kind: 'omp', state: 'working' },
+          { kind: 'logs', state: 'working', active: true },
+        ],
+        [
+          { kind: 'label', text: 'logs · compose project crit-7c1f3a9e…' },
+          { kind: 'cmd', text: 'docker compose logs --follow' },
+          { kind: 'out', text: 'web-1  | listening on http://0.0.0.0:3000' },
+          { kind: 'out', text: 'api-1  | ready on :8000' },
+          { kind: 'out', text: 'api-1  | GET /session 200 3ms' },
+        ],
+      ),
+    ],
+    note:
+      'Logs open as a session inside the focused worktree, scoped to that worktree’s own Compose project. Worktree and Docker actions need an open Git project first.',
+  },
+  {
+    id: 'vague',
+    label: 'a request too vague to act on',
+    input: 'Clean this up.',
+    question: 'Which workspace, and how: close its tab, stop its environment, or remove the worktree?',
+    plan: '{"action":"clarify","question":"Which workspace, and how: close its tab, stop its environment, or remove the worktree?"}',
+    projects: [critProject('feat/login-fixes')],
+    panes: [loginPane([{ kind: 'omp', state: 'working', active: true }], ompLines)],
+    note:
+      'Vague requests get one follow-up; answer in the same box. Nothing runs on a guess, and anything destructive, like removing a worktree, still asks for confirmation. Removal also refuses while the worktree holds uncommitted or untracked changes.',
+  },
+  {
+    id: 'manual',
+    label: 'the F2 list, no model involved',
+    input: '',
+    mode: 'manual',
+    plan: '',
+    projects: [critProject('feat/login-fixes')],
+    panes: [loginPane([{ kind: 'omp', state: 'working', active: true }], ompLines)],
+    note:
+      'Press F2 inside the launcher and the same actions appear as a plain list: Up, Down, Enter. Nothing is sent anywhere. The list is the whole vocabulary Ask Crit can choose from.',
+  },
+];
+const manualItems = [
+  'Open project folder',
+  'Open existing worktree',
+  'Switch project',
+  'New branch / worktree',
+  'New agent / shell session',
+  'Split side by side',
+  'Split top and bottom',
+  'Full width',
+  'Start isolated environment',
+  'Stop environment (retain data)',
+  'Environment logs',
+  'Open preview endpoint',
+  'Remove worktree (clean only)',
+];
+
+const shellPanes: Pane[] = [
+  {
+    label: 'feat/login-fixes',
+    focused: true,
+    sessions: [
+      { kind: 'omp', state: 'working' },
+      { kind: 'shell', state: 'idle', active: true },
+    ],
+    lines: [
+      { kind: 'label', text: 'shell · ~/dev/.crit-worktrees/…/feat-login-fixes-4c1d' },
+      { kind: 'cmd', text: 'git diff --stat' },
+      { kind: 'out', text: 'src/auth/session.rs    | 12 ++++----' },
+      { kind: 'out', text: 'src/auth/session_test.rs |  9 +++++' },
+      { kind: 'cursor', text: '' },
+    ],
+  },
+];
+
+const ledger = [
+  ['Inside OMP or OpenCode', 'Selects this worktree’s shell, or opens one. The agent keeps running.'],
+  ['Inside a shell', 'End of input, exactly as it has always been.'],
+  ['Native Kitty mode (F12)', 'Forwarded to the focused terminal, untouched.'],
+];
+
+const envCommands = [
+  ['crit env up', 'Start this worktree’s stack'],
+  ['crit env down', 'Stop it; volumes are retained'],
+  ['crit env status', 'Services, health and loopback ports'],
+  ['crit env logs', 'Follow the stack’s logs'],
+];
+
+const boundaries = [
+  ['Not a coding agent.', 'Crit launches OMP and OpenCode and keeps their sessions in order. It does not replace them, and Ask Crit never writes code.'],
+  ['Not an editor.', 'Your editor stays yours. Crit is the terminal around the work, not the place you type it.'],
+  ['Not a daemon.', 'Exiting stops agent and shell processes. The next launch restores saved projects, layouts and OMP/OpenCode chats; shells start fresh. Docker stacks are left as they are.'],
+  ['Not a sandbox.', 'Compose per worktree keeps ports, networks and named volumes apart for convenience. Configured bind mounts still share whatever they point at. Nothing here hardens anything.'],
+];
+
+const guide = [
+  {
+    q: 'Which tools does Crit launch?',
+    a: 'OMP, OpenCode and plain shells. Each interactive startup runs omp update and opencode upgrade before launching agents; if an update fails, Crit shows the diagnostic and continues with the installed version.',
+  },
+  {
+    q: 'What does Ask Crit send, and where?',
+    a: 'F1 goes through your authenticated OMP installation, currently with Haiku 5.5. Crit sends your request history plus project and worktree names and paths, never source files, with a 64 KiB cap on context plus conversation. No model runs while the launcher is idle, and each request has a 50-second local deadline. Prefer not to use a model at all? F2 lists the same actions.',
+  },
+  {
+    q: 'Can Ask Crit run shell commands?',
+    a: 'No. Only Crit’s own plans can execute: clarify, create a worktree, open a known destination, start a session, or one of the listed commands. Model-generated shell commands are rejected, and destructive actions still require confirmation.',
+  },
+  {
+    q: 'What happens when I close a tab?',
+    a: 'Ctrl+Shift+Q closes the worktree tab and keeps the checkout on disk. Removing a worktree is a separate, confirmed action, and it refuses while the worktree holds uncommitted or untracked changes.',
+  },
+  {
+    q: 'What happens when I exit Crit?',
+    a: 'Exiting stops Crit’s agent and shell processes, not Docker stacks. The next launch restores saved projects, worktrees, splits and the exact OMP/OpenCode chats, including background sessions. Shells reopen fresh; running processes and unsent input do not survive. Closed tabs stay closed. Use crit --fresh to start a new saved workspace.',
+  },
+  {
+    q: 'Do I need Kitty?',
+    a: 'Crit runs in your terminal. The Kitty integration is optional: crit setup kitty installs window-scoped mappings so Crit’s shortcuts and native Kitty shortcuts can coexist, and F12 toggles between them. Run crit --no-kitty to skip the integration.',
+  },
+  {
+    q: 'Where do worktrees live?',
+    a: 'Under a .crit-worktrees folder beside the repository, one directory per branch. Opening a Git folder opens only its checkout, never every branch at once.',
+  },
+];
+
+const steps = [
+  {
+    title: 'Build and install from your local checkout',
+    body: 'Crit is built from source with Cargo. Run this inside the Crit repository you have on disk; there is no one-line public download.',
+    command: 'cargo install --path .',
+  },
+  {
+    title: 'Open a terminal and start it',
+    body: 'Run it from any folder. Choose New terminal or a Git project, then press F1 and say what you want.',
+    command: 'crit',
+  },
+  {
+    title: 'Optional: the Kitty integration',
+    body: 'Installs Crit’s window-scoped key mappings. Reload Kitty’s configuration afterwards with Ctrl+Shift+F5.',
+    command: 'crit setup kitty',
+  },
+  {
+    title: 'When you want the whole sheet',
+    body: 'The shortcut list and the complete notes on projects, Ask Crit, Docker and lifecycle live in the binary itself.',
+    command: 'crit keys',
+  },
+];
+const prerequisites = [
+  ['Rust toolchain with Cargo, and Git', 'to build from source'],
+  ['OMP and/or OpenCode', 'when you use them; Ask Crit needs an authenticated OMP installation'],
+  ['Docker Compose', 'optional, only for per-worktree stacks'],
+  ['Kitty', 'optional, only for the shortcut integration'],
+];
+---
+<PreviewLayout title="Fieldnotes" theme="fieldnotes" description="Crit gives every branch its own worktree, tab and agent, with a shell one keystroke away. Field notes on a worktree-first terminal for OMP, OpenCode and your shell.">
+  <div class="fn" id="top">
+    <header class="fn-masthead fn-wrap">
+      <a class="fn-brand" href="#top">
+        <span class="fn-brand-name">Crit</span>
+        <span class="fn-brand-tag">worktree-first terminal</span>
+      </a>
+      <nav class="fn-nav" aria-label="Page sections">
+        {nav.map((item) => <a href={item.href}>{item.label}</a>)}
+        <span class="fn-nav-license">Apache-2.0</span>
+      </nav>
+    </header>
+
+    <main id="main" class="fn-wrap">
+      <section class="fn-hero" aria-labelledby="hero-title">
+        <p class="fn-kicker"><span>№ 02 · Field notes</span><span>A terminal for OMP, OpenCode &amp; your shell</span></p>
+        <div class="fn-hero-main">
+          <h1 id="hero-title" class="fn-h1">A little room to <em>branch out.</em></h1>
+          <p class="fn-deck">Crit is a worktree-first terminal workspace. Each branch gets its own checkout, its own tab and its own agent session, and the shell stays one keystroke away. It is the room around the tools you already run, not another editor and not another agent.</p>
+          <div class="fn-cta">
+            <a class="fn-button" href="#install">Install from a checkout <span aria-hidden="true">↓</span></a>
+            <a class="fn-link" href="#notes">Read the field notes</a>
+          </div>
+        </div>
+        <aside class="fn-hero-margin" aria-label="In brief">
+          <ol class="fn-notes">
+            <li><b>a.</b><span>Every branch gets a Git worktree of its own, and every worktree a tab.</span></li>
+            <li><b>b.</b><span>Ctrl+D in an agent drops into that worktree’s shell. The agent keeps running.</span></li>
+            <li><b>c.</b><span>F1 asks in plain words through your authenticated OMP. F2 lists the same controls.</span></li>
+            <li><b>d.</b><span>Optional Docker Compose per worktree, with loopback ports allocated on the fly.</span></li>
+          </ol>
+        </aside>
+      </section>
+
+      <figure class="fn-plate">
+        <figcaption class="fn-plate-head"><span><b>Plate 1</b> · Illustrative workspace</span><span>drawn, not captured</span></figcaption>
+        <FieldnotesWorkspace
+          projects={heroProjects}
+          panes={heroPanes}
+          description="Illustrative Crit workspace: project crit with tabs main, feat/login-fixes and fix/flaky-ci, a second project portfolio, and two worktrees split side by side"
+        />
+        <ol class="fn-legend">
+          <li><span class="fn-legend-num">1</span><span>One tab per worktree, each a real checkout on disk. The mark is the session state: <code>*</code> working, <code>·</code> idle, <code>!</code> needs input.</span></li>
+          <li><span class="fn-legend-num">2</span><span>An agent and a shell share the worktree. <kbd>Ctrl+D</kbd> hops from the agent to the shell; the agent keeps working.</span></li>
+          <li><span class="fn-legend-num">3</span><span>Two worktrees side by side. With Compose configured, each stack has its own project and loopback ports.</span></li>
+        </ol>
+      </figure>
+
+      <section id="notes" class="fn-section" aria-labelledby="rooms-title">
+        <div class="fn-num"><span class="fn-num-big">01</span><span class="fn-num-label">Rooms</span></div>
+        <div class="fn-main">
+          <h2 id="rooms-title" class="fn-h2">A branch is a room, not a mode.</h2>
+          <p class="fn-lead">Most terminals treat a branch as a state you switch into: stash, check out, rebuild, remember where you were. Crit treats it as a place.</p>
+          <div class="fn-prose">
+            <p>Each branch gets a Git worktree of its own, a complete checkout on disk that shares one repository with the others. Each worktree gets a tab, and you can put two side by side when the work calls for it: run the fix in one while the agent keeps reading in the other.</p>
+            <p>Closing a tab never deletes its checkout. Removing a worktree is its own confirmed step, and it refuses while the worktree still holds uncommitted or untracked changes. Nothing is tidied away behind your back.</p>
+          </div>
+          <figure class="fn-fig">
+            <FieldnotesBranchFigure />
+            <figcaption><b>Fig. 1</b> · One branch, one worktree, one tab. New worktrees branch from the focused checkout’s HEAD unless you say otherwise.</figcaption>
+          </figure>
+        </div>
+        <aside class="fn-margin" aria-label="Shortcuts for rooms">
+          <p><kbd>Ctrl+Shift+T</kbd><br />New tab: a worktree here, another project folder, or an open project.</p>
+          <p><kbd>Ctrl+Shift+,</kbd> <kbd>Ctrl+Shift+.</kbd><br />Split side by side, or top and bottom. Name a branch; its worktree opens in the second pane.</p>
+          <p><kbd>Ctrl+Shift+Q</kbd><br />Close the worktree tab. The checkout stays.</p>
+          <p>Worktrees live under <code>.crit-worktrees/</code> beside the repository, one directory per branch.</p>
+        </aside>
+      </section>
+
+      <section id="ask" class="fn-section" aria-labelledby="ask-title">
+        <div class="fn-num"><span class="fn-num-big">02</span><span class="fn-num-label">Asking</span></div>
+        <div class="fn-main">
+          <h2 id="ask-title" class="fn-h2">Say it in <em>plain words.</em></h2>
+          <p class="fn-lead">Press F1 and describe what you want. Crit turns the sentence into one of its own actions: open a project, start a branch in a new worktree, show a workspace’s logs.</p>
+          <div class="fn-prose">
+            <p>The launcher runs through your authenticated OMP installation and is deliberately small: no tools, no extensions, no persistent session. It can only choose from Crit’s own plans, never a shell command the model made up, and anything destructive still asks you first. Prefer no model at all? F2 shows the same actions as a list.</p>
+          </div>
+
+          <div class="fn-demo" data-ask-demo>
+            <div class="fn-demo-head">
+              <span class="fn-tag">Interactive illustration</span>
+              <p class="fn-demo-status" data-demo-status aria-live="polite">Showing a new branch in its own worktree</p>
+            </div>
+            <div class="fn-demo-grid">
+              <div class="fn-requests" role="group" aria-label="Choose a request to illustrate">
+                {requests.map((request, index) => (
+                  <button type="button" class="fn-request" data-request={request.id} data-label={request.label} aria-pressed={index === 0 ? 'true' : 'false'}>
+                    <span class="fn-request-num">{String(index + 1).padStart(2, '0')}</span>
+                    <span class="fn-request-text">{request.mode === 'manual' ? 'Press F2 instead' : `“${request.input}”`}</span>
+                  </button>
+                ))}
+              </div>
+              <div class="fn-demo-stage">
+                {requests.map((request, index) => (
+                  <div class="fn-state" data-state={request.id} hidden={index !== 0}>
+                    <FieldnotesLauncher
+                      mode={request.mode ?? 'ask'}
+                      input={request.input}
+                      question={request.question}
+                      status={request.question ? 'Enter to answer · destructive actions still require confirmation.' : undefined}
+                      plan={request.plan || undefined}
+                      items={manualItems}
+                      selected={3}
+                    />
+                    <FieldnotesWorkspace
+                      projects={request.projects}
+                      panes={request.panes}
+                      description={`Illustrative workspace after: ${request.mode === 'manual' ? 'opening the manual controls' : request.input}`}
+                    />
+                    <p class="fn-state-note">{request.note}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+        <aside class="fn-margin" aria-label="Notes on Ask Crit">
+          <p>Crit sends your request history and project / worktree names and paths. Not source files.</p>
+          <p>No model runs while idle. Each request has a 50-second local deadline; context plus conversation is capped at 64 KiB.</p>
+          <p>Only five plan shapes can execute: clarify, create a worktree, open a known destination, start a session, or one listed command. Errors stay visible; nothing falls back to a guessed action.</p>
+          <p><kbd>Enter</kbd> send · <kbd>Esc</kbd> cancel · <kbd>Ctrl+U</kbd> clear · <kbd>F2</kbd> manual controls</p>
+        </aside>
+      </section>
+
+      <section id="shell" class="fn-section" aria-labelledby="shell-title">
+        <div class="fn-num"><span class="fn-num-big">03</span><span class="fn-num-label">The shell</span></div>
+        <div class="fn-main">
+          <h2 id="shell-title" class="fn-h2">The shell is never far.</h2>
+          <p class="fn-lead">Agents are good company until you need to run one command yourself. Crit keeps a shell in every worktree, one keystroke from the agent working there.</p>
+          <div class="fn-prose">
+            <p>Inside an OMP or OpenCode session, <kbd>Ctrl+D</kbd> selects that worktree’s shell, or opens one, and the agent keeps running exactly where you left it. Inside a shell, <kbd>Ctrl+D</kbd> stays what it has always been: end of input. Nothing is remapped out from under you.</p>
+          </div>
+          <dl class="fn-ledger" aria-label="What Ctrl+D does">
+            {ledger.map(([where, what]) => (
+              <div class="fn-ledger-row"><dt>{where}</dt><dd>{what}</dd></div>
+            ))}
+          </dl>
+          <figure class="fn-fig">
+            <FieldnotesWorkspace
+              projects={[critProject('feat/login-fixes')]}
+              panes={shellPanes}
+              description="Illustrative workspace after Ctrl+D: the shell session is selected while omp 1 is still working"
+            />
+            <figcaption><b>Fig. 2</b> · After <kbd>Ctrl+D</kbd>. The shell is selected; <code>omp 1 · working</code> carries on in the same worktree. Illustrative workspace.</figcaption>
+          </figure>
+        </div>
+        <aside class="fn-margin" aria-label="Session shortcuts">
+          <p><kbd>Ctrl+Shift+Enter</kbd><br />New OMP, OpenCode or shell session in this worktree.</p>
+          <p><kbd>Ctrl+Shift+[</kbd> <kbd>Ctrl+Shift+]</kbd><br />Previous / next session or split pane.</p>
+          <p><kbd>Ctrl+Shift+1…9</kbd> <kbd>Ctrl+Shift+0</kbd><br />Focus session 1 to 10.</p>
+          <p><kbd>F12</kbd><br />Toggle Crit shortcuts and native Kitty shortcuts. Persistent, not a one-shot prefix.</p>
+        </aside>
+      </section>
+
+      <section id="compose" class="fn-section" aria-labelledby="compose-title">
+        <div class="fn-num"><span class="fn-num-big">04</span><span class="fn-num-label">Stacks</span></div>
+        <div class="fn-main">
+          <h2 id="compose-title" class="fn-h2">Stacks that keep to <em>themselves.</em></h2>
+          <p class="fn-lead">If the repository ships a Compose file, Crit can bring up a stack per worktree, so two branches can each run a web and an api without arguing over port 8000.</p>
+          <div class="fn-prose">
+            <p>Each worktree gets its own Compose project, networks, named volumes and build image, and its published ports are rebound to loopback addresses allocated on the fly. New worktrees start their stack automatically when it is configured; ask for “the preview” and Crit opens that worktree’s URL.</p>
+            <p>One honest caveat. Bind mounts keep the paths you configured, so a shared absolute directory is still shared. Use worktree-relative paths or named volumes for data that should stay apart. External networks, external volumes and host networking are refused. This is isolation for convenience, not a security boundary.</p>
+          </div>
+          <div class="fn-twin">
+            <figure class="fn-fig">
+              <pre class="fn-code" tabindex="0"><code><span class="fn-code-comment"># crit.toml, optional, in the repository</span>
+[compose]
+files = ["compose.yaml"]
+
+[compose.links.web]
+API_URL = "api:8000"</code></pre>
+              <figcaption>Links inject that worktree’s <code>http://127.0.0.1:PORT</code> into <code>web</code>’s runtime environment after <code>api</code> starts. Use your app’s actual variable name; build-time URLs are configured in the app itself.</figcaption>
+            </figure>
+            <dl class="fn-ledger fn-ledger-mono" aria-label="crit env commands">
+              {envCommands.map(([command, meaning]) => (
+                <div class="fn-ledger-row"><dt><code>{command}</code></dt><dd>{meaning}</dd></div>
+              ))}
+            </dl>
+          </div>
+        </div>
+        <aside class="fn-margin" aria-label="Notes on stacks">
+          <p>Stopping a stack retains its volumes. Closing a tab never touches Docker.</p>
+          <p>Exiting stops agent and shell processes, not Docker stacks. Saved chats and workspace layout reopen next launch.</p>
+          <p>Compose projects are named <code>crit-&lt;worktree id&gt;</code>, derived from the checkout’s path, so stacks never collide across worktrees.</p>
+        </aside>
+      </section>
+
+      <section id="boundaries" class="fn-section" aria-labelledby="boundaries-title">
+        <div class="fn-num"><span class="fn-num-big">05</span><span class="fn-num-label">Boundaries</span></div>
+        <div class="fn-main">
+          <h2 id="boundaries-title" class="fn-h2">What Crit is <em>not.</em></h2>
+          <p class="fn-lead">A small tool is easier to trust when its edges are drawn clearly.</p>
+          <ul class="fn-boundaries">
+            {boundaries.map(([head, body]) => (
+              <li><span class="fn-boundary-head">{head}</span><span>{body}</span></li>
+            ))}
+          </ul>
+        </div>
+        <aside class="fn-margin" aria-label="Licence">
+          <p>Apache-2.0. Agent state hooks are launch-scoped, not global plugins.</p>
+          <p>The minimum interactive size is 30 columns by 10 rows. Below that, input pauses and only <kbd>Esc</kbd> and <kbd>F12</kbd> stay live.</p>
+        </aside>
+      </section>
+
+      <section id="guide" class="fn-section" aria-labelledby="guide-title">
+        <div class="fn-num"><span class="fn-num-big">06</span><span class="fn-num-label">Field guide</span></div>
+        <div class="fn-main">
+          <h2 id="guide-title" class="fn-h2">Questions from the margin.</h2>
+          <div class="fn-faq">
+            {guide.map((entry) => (
+              <details class="fn-faq-item">
+                <summary>{entry.q}</summary>
+                <p>{entry.a}</p>
+              </details>
+            ))}
+          </div>
+        </div>
+        <aside class="fn-margin" aria-label="More">
+          <p>Everything above is also printed by <code>crit --help</code> and <code>crit keys</code>.</p>
+        </aside>
+      </section>
+
+      <section id="install" class="fn-section fn-install" aria-labelledby="install-title">
+        <div class="fn-num"><span class="fn-num-big">07</span><span class="fn-num-label">Install</span></div>
+        <div class="fn-main">
+          <h2 id="install-title" class="fn-h2">From a local checkout, <em>in two lines.</em></h2>
+          <p class="fn-lead">Crit is built from source. Clone or copy the repository to your machine, then let Cargo do the rest.</p>
+          <ol class="fn-steps">
+            {steps.map((step, index) => (
+              <li class="fn-step">
+                <span class="fn-step-num">{String(index + 1).padStart(2, '0')}</span>
+                <div class="fn-step-body">
+                  <h3>{step.title}</h3>
+                  <p>{step.body}</p>
+                  <div class="fn-cmd">
+                    <code>{step.command}</code>
+                    <button type="button" class="fn-copy" data-copy={step.command} aria-label={`Copy ${step.command}`}>Copy</button>
+                  </div>
+                </div>
+              </li>
+            ))}
+          </ol>
+          <p class="fn-copy-status" data-copy-status role="status"></p>
+        </div>
+        <aside class="fn-margin" aria-label="You will need">
+          <p class="fn-margin-head">You will need</p>
+          {prerequisites.map(([what, why]) => (
+            <p><b>{what}</b><br />{why}</p>
+          ))}
+        </aside>
+      </section>
+    </main>
+
+    <footer class="fn-footer">
+      <div class="fn-wrap fn-footer-grid">
+        <div>
+          <p class="fn-footer-brand"><span class="fn-brand-name">Crit</span> <span class="fn-footer-tag">worktree-first terminals for OMP, OpenCode and your shell</span></p>
+          <p class="fn-footer-small">Apache-2.0 · built from a local checkout · Design study 02, Fieldnotes</p>
+        </div>
+        <nav class="fn-footer-nav" aria-label="Footer">
+          {nav.map((item) => <a href={item.href}>{item.label}</a>)}
+          <a href="#top">Back to top ↑</a>
+        </nav>
+        <p class="fn-footer-note">Workspaces on this page are drawn for illustration, not captured from a running session.</p>
+      </div>
+    </footer>
+  </div>
+</PreviewLayout>
+
+<style>
+  :global(body[data-concept='fieldnotes']) { background: #f2ede2; }
+  :global(body[data-concept='fieldnotes'] ::selection) { background: #f0cdb0; color: #1c1917; }
+
+  .fn {
+    --fn-paper: #f2ede2;
+    --fn-paper-2: #ebe3d3;
+    --fn-card: #faf7f0;
+    --fn-ink: #1c1917;
+    --fn-ink-2: #4b453d;
+    --fn-ink-3: #665e52;
+    --fn-rule: #d6cbb7;
+    --fn-rule-2: #c4b79f;
+    --fn-orange: #ad3f0f;
+    --fn-orange-2: #9a3a0f;
+    --fn-gutter: clamp(20px, 5vw, 72px);
+    --fn-max: 1320px;
+    background: var(--fn-paper);
+    color: var(--fn-ink);
+    font-family: var(--font-sans);
+    font-size: 16px;
+    line-height: 1.6;
+    min-height: 100vh;
+  }
+  .fn-wrap { width: min(100% - 2 * var(--fn-gutter), var(--fn-max)); margin-inline: auto; }
+  .fn code { font-family: var(--font-mono); font-size: .9em; }
+  .fn kbd {
+    display: inline-block;
+    padding: 1px 7px;
+    border: 1px solid var(--fn-rule-2);
+    border-bottom-width: 2px;
+    border-radius: 4px;
+    background: var(--fn-card);
+    color: var(--fn-ink);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.6;
+    white-space: nowrap;
+  }
+  .fn em { font-style: italic; color: var(--fn-orange); }
+
+  /* masthead */
+  .fn-masthead {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px 32px;
+    padding: 26px 0 18px;
+    border-bottom: 1px solid var(--fn-ink);
+  }
+  .fn-brand { display: inline-flex; align-items: baseline; gap: 14px; text-decoration: none; }
+  .fn-brand-name { font-family: var(--font-serif); font-size: 2rem; line-height: 1; letter-spacing: -0.01em; }
+  .fn-brand-tag { font-family: var(--font-mono); font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--fn-ink-3); }
+  .fn-nav { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 22px; font-family: var(--font-mono); font-size: 12px; letter-spacing: .04em; }
+  .fn-nav a { padding: 6px 0 2px; text-decoration: none; border-bottom: 1px solid transparent; }
+  .fn-nav a:hover { color: var(--fn-orange); border-bottom-color: var(--fn-orange); }
+  .fn-nav-license { color: var(--fn-ink-3); }
+
+  /* hero */
+  .fn-hero {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 17rem;
+    gap: 28px clamp(32px, 5vw, 80px);
+    padding: clamp(40px, 7vw, 104px) 0 clamp(36px, 5vw, 72px);
+  }
+  .fn-kicker {
+    grid-column: 1 / -1;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 24px;
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--fn-orange);
+  }
+  .fn-kicker span + span { color: var(--fn-ink-3); }
+  .fn-h1 {
+    margin: 0;
+    max-width: 12ch;
+    font-family: var(--font-serif);
+    font-weight: 400;
+    font-size: clamp(3.4rem, 1.4rem + 8.4vw, 9.5rem);
+    line-height: .92;
+    letter-spacing: -0.022em;
+    text-wrap: balance;
+  }
+  .fn-deck {
+    max-width: 36rem;
+    margin: 32px 0 0;
+    font-family: var(--font-serif);
+    font-size: clamp(1.35rem, 1.1rem + 1vw, 1.8rem);
+    line-height: 1.32;
+    color: var(--fn-ink-2);
+  }
+  .fn-cta { display: flex; flex-wrap: wrap; align-items: center; gap: 16px 28px; margin-top: 36px; }
+  .fn-button {
+    display: inline-flex;
+    align-items: center;
+    gap: 12px;
+    padding: 15px 22px;
+    border: 1px solid var(--fn-ink);
+    border-radius: 4px;
+    background: var(--fn-ink);
+    color: var(--fn-paper);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    letter-spacing: .02em;
+    text-decoration: none;
+    transition: background .15s ease, border-color .15s ease;
+  }
+  .fn-button:hover { background: var(--fn-orange); border-color: var(--fn-orange); }
+  .fn-link { padding-bottom: 2px; border-bottom: 1px solid var(--fn-rule-2); font-family: var(--font-mono); font-size: 13px; text-decoration: none; }
+  .fn-link:hover { color: var(--fn-orange); border-bottom-color: var(--fn-orange); }
+  .fn-hero-margin { align-self: end; padding-left: 24px; border-left: 1px solid var(--fn-rule-2); }
+  .fn-notes { display: grid; gap: 14px; margin: 0; padding: 0; list-style: none; font-family: var(--font-mono); font-size: 12px; line-height: 1.55; color: var(--fn-ink-2); }
+  .fn-notes li { display: grid; grid-template-columns: 1.6em 1fr; gap: 8px; }
+  .fn-notes b { font-weight: 400; color: var(--fn-orange); }
+
+  /* plates and figures */
+  .fn-plate { margin: 0; padding: 0 0 clamp(48px, 7vw, 96px); }
+  .fn-plate-head, .fn-fig figcaption {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 6px 16px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: .06em;
+    color: var(--fn-ink-3);
+  }
+  .fn-plate-head { margin-bottom: 14px; text-transform: uppercase; }
+  .fn-plate-head b, .fn-fig figcaption b { color: var(--fn-ink); }
+  .fn-legend {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px 32px;
+    margin: 28px 0 0;
+    padding: 0;
+    list-style: none;
+    font-size: 14px;
+    line-height: 1.5;
+    color: var(--fn-ink-2);
+  }
+  .fn-legend li { display: grid; grid-template-columns: 20px 1fr; gap: 10px; }
+  .fn-legend-num {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 19px;
+    height: 19px;
+    margin-top: 1px;
+    border-radius: 50%;
+    background: var(--fn-orange);
+    color: #fff8f0;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+  }
+  .fn-fig { margin: 36px 0 0; }
+  .fn-fig figcaption { margin-top: 14px; letter-spacing: .02em; line-height: 1.5; text-transform: none; }
+
+  /* sections */
+  .fn-section {
+    display: grid;
+    grid-template-columns: 7rem minmax(0, 1fr) 15rem;
+    gap: 24px clamp(28px, 4vw, 64px);
+    padding: clamp(44px, 6vw, 84px) 0;
+    border-top: 1px solid var(--fn-ink);
+  }
+  .fn-num { display: grid; align-content: start; gap: 6px; }
+  .fn-num-big { font-family: var(--font-serif); font-size: 3.25rem; line-height: .9; letter-spacing: -0.02em; }
+  .fn-num-label { font-family: var(--font-mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--fn-orange); }
+  .fn-main { min-width: 0; }
+  .fn-h2 {
+    margin: 0 0 22px;
+    font-family: var(--font-serif);
+    font-weight: 400;
+    font-size: clamp(2.3rem, 1.5rem + 2.6vw, 4rem);
+    line-height: .98;
+    letter-spacing: -0.018em;
+    text-wrap: balance;
+  }
+  .fn-lead { max-width: 38rem; margin: 0 0 18px; font-family: var(--font-serif); font-size: clamp(1.3rem, 1.1rem + .7vw, 1.55rem); line-height: 1.38; color: var(--fn-ink-2); }
+  .fn-prose p { max-width: 36rem; margin: 0 0 16px; line-height: 1.65; color: var(--fn-ink-2); }
+  .fn-margin { padding-left: 20px; border-left: 1px solid var(--fn-rule-2); font-family: var(--font-mono); font-size: 12px; line-height: 1.55; color: var(--fn-ink-2); }
+  .fn-margin p { margin: 0 0 16px; }
+  .fn-margin b { font-weight: 400; color: var(--fn-ink); }
+  .fn-margin-head { letter-spacing: .12em; text-transform: uppercase; color: var(--fn-orange); }
+
+  /* ask demo */
+  .fn-demo { margin-top: 36px; padding-top: 22px; border-top: 1px solid var(--fn-rule-2); }
+  .fn-demo-head { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 8px 24px; margin-bottom: 18px; }
+  .fn-tag { font-family: var(--font-mono); font-size: 11px; letter-spacing: .12em; text-transform: uppercase; color: var(--fn-orange); }
+  .fn-demo-status { margin: 0; font-family: var(--font-mono); font-size: 12px; color: var(--fn-ink-3); }
+  .fn-demo-grid { display: grid; grid-template-columns: minmax(220px, 290px) minmax(0, 1fr); gap: 24px 32px; align-items: start; }
+  .fn-requests { display: grid; gap: 8px; }
+  .fn-request {
+    display: grid;
+    grid-template-columns: 2em 1fr;
+    gap: 8px;
+    align-items: baseline;
+    padding: 12px 14px;
+    border: 1px solid var(--fn-rule-2);
+    border-radius: 4px;
+    background: transparent;
+    color: var(--fn-ink-2);
+    font-family: var(--font-serif);
+    font-size: 1.15rem;
+    line-height: 1.3;
+    text-align: left;
+    transition: border-color .15s ease, background .15s ease;
+  }
+  .fn-request:hover { border-color: var(--fn-ink); color: var(--fn-ink); }
+  .fn-request[aria-pressed='true'] {
+    border-color: var(--fn-ink);
+    background: var(--fn-card);
+    color: var(--fn-ink);
+    box-shadow: 4px 4px 0 -1px var(--fn-paper), 4px 4px 0 0 var(--fn-ink);
+  }
+  .fn-request-num { font-family: var(--font-mono); font-size: 11px; color: var(--fn-orange); }
+  .fn-request[aria-pressed='true'] .fn-request-text { font-style: italic; }
+  .fn-demo-stage { min-width: 0; }
+  .fn-state { display: grid; gap: 18px; }
+  .fn-state-note { margin: 0; padding-left: 16px; border-left: 2px solid var(--fn-orange); font-size: 14.5px; line-height: 1.55; color: var(--fn-ink-2); }
+
+  /* ledger */
+  .fn-ledger { margin: 28px 0 0; max-width: 40rem; border-top: 1px solid var(--fn-ink); }
+  .fn-ledger-row { display: grid; grid-template-columns: minmax(10rem, 14rem) 1fr; gap: 20px; padding: 12px 0; border-bottom: 1px solid var(--fn-rule); }
+  .fn-ledger dt { margin: 0; font-family: var(--font-mono); font-size: 12px; letter-spacing: .02em; color: var(--fn-ink); }
+  .fn-ledger dd { margin: 0; font-size: 15px; line-height: 1.5; color: var(--fn-ink-2); }
+  .fn-ledger-mono dt code { font-size: 12px; }
+  .fn-twin { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 24px 40px; align-items: start; }
+  .fn-twin .fn-fig { margin-top: 28px; }
+  .fn-twin .fn-ledger { margin-top: 28px; }
+  .fn-code {
+    margin: 0;
+    padding: 18px 20px;
+    overflow-x: auto;
+    border: 1px solid var(--fn-ink);
+    border-radius: 6px;
+    background: var(--fn-card);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--fn-ink);
+  }
+  .fn-code code { font-size: inherit; }
+  .fn-code-comment { color: var(--fn-ink-3); }
+
+  /* boundaries */
+  .fn-boundaries { display: grid; gap: 18px; max-width: 40rem; margin: 8px 0 0; padding: 0; list-style: none; }
+  .fn-boundaries li { display: grid; grid-template-columns: minmax(8rem, 11rem) 1fr; gap: 16px; padding-top: 14px; border-top: 1px solid var(--fn-rule); font-size: 15px; line-height: 1.55; color: var(--fn-ink-2); }
+  .fn-boundary-head { font-family: var(--font-serif); font-size: 1.35rem; line-height: 1.1; color: var(--fn-ink); }
+
+  /* field guide */
+  .fn-faq { max-width: 42rem; border-top: 1px solid var(--fn-ink); }
+  .fn-faq-item { border-bottom: 1px solid var(--fn-rule); }
+  .fn-faq-item summary {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 16px;
+    padding: 16px 0;
+    cursor: pointer;
+    list-style: none;
+    font-family: var(--font-serif);
+    font-size: 1.4rem;
+    line-height: 1.2;
+  }
+  .fn-faq-item summary::-webkit-details-marker { display: none; }
+  .fn-faq-item summary::after { content: '+'; flex: none; font-family: var(--font-mono); font-size: 16px; color: var(--fn-orange); }
+  .fn-faq-item[open] summary::after { content: '−'; }
+  .fn-faq-item summary:hover { color: var(--fn-orange); }
+  .fn-faq-item p { max-width: 36rem; margin: 0 0 18px; font-size: 15px; line-height: 1.6; color: var(--fn-ink-2); }
+
+  /* install */
+  .fn-steps { display: grid; gap: 22px; max-width: 42rem; margin: 8px 0 0; padding: 0; list-style: none; counter-reset: none; }
+  .fn-step { display: grid; grid-template-columns: 2.5rem 1fr; gap: 12px; padding-top: 18px; border-top: 1px solid var(--fn-rule); }
+  .fn-step-num { font-family: var(--font-mono); font-size: 12px; color: var(--fn-orange); padding-top: 6px; }
+  .fn-step-body { min-width: 0; }
+  .fn-step h3 { margin: 0 0 6px; font-family: var(--font-serif); font-weight: 400; font-size: 1.5rem; line-height: 1.15; }
+  .fn-step p { margin: 0 0 14px; font-size: 15px; line-height: 1.55; color: var(--fn-ink-2); max-width: 34rem; }
+  .fn-cmd {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px 16px;
+    padding: 10px 10px 10px 16px;
+    border: 1px solid var(--fn-ink);
+    border-radius: 6px;
+    background: var(--fn-card);
+  }
+  .fn-cmd code { font-size: 14px; }
+  .fn-cmd code::before { content: '$ '; color: var(--fn-orange); font-weight: 700; }
+  .fn-copy {
+    padding: 7px 12px;
+    border: 1px solid var(--fn-rule-2);
+    border-radius: 4px;
+    background: var(--fn-paper);
+    color: var(--fn-ink);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    letter-spacing: .04em;
+    min-width: 5.5rem;
+  }
+  .fn-copy:hover { border-color: var(--fn-ink); }
+  .fn-copy-status { min-height: 1.5em; margin: 16px 0 0; font-family: var(--font-mono); font-size: 12px; color: var(--fn-orange-2); }
+
+  /* footer */
+  .fn-footer { margin-top: clamp(32px, 6vw, 72px); padding: 36px 0 128px; border-top: 1px solid var(--fn-ink); background: var(--fn-paper-2); }
+  .fn-footer-grid { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 24px 48px; align-items: start; }
+  .fn-footer-brand { display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px; margin: 0 0 10px; }
+  .fn-footer-tag { font-family: var(--font-serif); font-size: 1.1rem; color: var(--fn-ink-2); }
+  .fn-footer-small, .fn-footer-note { margin: 0; font-family: var(--font-mono); font-size: 11.5px; letter-spacing: .04em; color: var(--fn-ink-3); }
+  .fn-footer-note { grid-column: 1 / -1; padding-top: 18px; border-top: 1px solid var(--fn-rule-2); }
+  .fn-footer-nav { display: grid; gap: 8px; font-family: var(--font-mono); font-size: 12px; text-align: right; }
+  .fn-footer-nav a { text-decoration: none; }
+  .fn-footer-nav a:hover { color: var(--fn-orange); }
+
+  @media (max-width: 1080px) {
+    .fn-section { grid-template-columns: 5rem minmax(0, 1fr); }
+    .fn-margin { grid-column: 2; padding-left: 0; padding-top: 18px; border-left: 0; border-top: 1px solid var(--fn-rule-2); }
+    .fn-hero { grid-template-columns: minmax(0, 1fr) 15rem; }
+    .fn-twin { grid-template-columns: minmax(0, 1fr); }
+  }
+  @media (max-width: 840px) {
+    .fn-hero { grid-template-columns: 1fr; }
+    .fn-hero-margin { padding-left: 0; padding-top: 18px; border-left: 0; border-top: 1px solid var(--fn-rule-2); }
+    .fn-demo-grid { grid-template-columns: 1fr; }
+    .fn-requests { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+    .fn-footer-grid { grid-template-columns: 1fr; }
+    .fn-footer-nav { text-align: left; grid-template-columns: repeat(auto-fit, minmax(7rem, max-content)); gap: 8px 24px; }
+  }
+  @media (max-width: 640px) {
+    .fn { font-size: 15px; }
+    .fn-section { grid-template-columns: 1fr; gap: 18px; }
+    .fn-num { grid-template-columns: auto 1fr; align-items: baseline; gap: 12px; }
+    .fn-num-big { font-size: 2.4rem; }
+    .fn-margin { grid-column: 1; }
+    .fn-masthead { padding-top: 20px; }
+    .fn-brand-name { font-size: 1.7rem; }
+    .fn-h1 { max-width: none; }
+    .fn-deck { margin-top: 24px; }
+    .fn-button { width: 100%; justify-content: space-between; }
+    .fn-ledger-row { grid-template-columns: 1fr; gap: 4px; }
+    .fn-boundaries li { grid-template-columns: 1fr; gap: 6px; }
+    .fn-step { grid-template-columns: 1fr; gap: 4px; }
+    .fn-step-num { padding-top: 0; }
+    .fn-cmd code { overflow-wrap: anywhere; }
+    .fn-request { font-size: 1.05rem; }
+    .fn-faq-item summary { font-size: 1.25rem; }
+  }
+</style>
+
+<script>
+  const demo = document.querySelector<HTMLElement>('[data-ask-demo]');
+  if (demo) {
+    const buttons = Array.from(demo.querySelectorAll<HTMLButtonElement>('button[data-request]'));
+    const states = Array.from(demo.querySelectorAll<HTMLElement>('[data-state]'));
+    const status = demo.querySelector<HTMLElement>('[data-demo-status]');
+    const select = (id: string | undefined) => {
+      let label = '';
+      for (const button of buttons) {
+        const pressed = button.dataset.request === id;
+        button.setAttribute('aria-pressed', String(pressed));
+        if (pressed) label = button.dataset.label ?? '';
+      }
+      for (const state of states) state.hidden = state.dataset.state !== id;
+      if (status) status.textContent = `Showing ${label}`;
+    };
+    buttons.forEach((button, index) => {
+      button.addEventListener('click', () => select(button.dataset.request));
+      button.addEventListener('keydown', (event) => {
+        const forward = event.key === 'ArrowDown' || event.key === 'ArrowRight';
+        const backward = event.key === 'ArrowUp' || event.key === 'ArrowLeft';
+        if (!forward && !backward) return;
+        event.preventDefault();
+        const next = buttons[(index + (forward ? 1 : -1) + buttons.length) % buttons.length];
+        next.focus();
+        select(next.dataset.request);
+      });
+    });
+  }
+
+  const copyStatus = document.querySelector<HTMLElement>('[data-copy-status]');
+  for (const button of document.querySelectorAll<HTMLButtonElement>('button[data-copy]')) {
+    const idle = button.textContent;
+    let reset = 0;
+    button.addEventListener('click', async () => {
+      const text = button.dataset.copy ?? '';
+      try {
+        if (!navigator.clipboard || !window.isSecureContext) throw new Error('clipboard unavailable');
+        await navigator.clipboard.writeText(text);
+        button.textContent = 'Copied';
+        if (copyStatus) copyStatus.textContent = `Copied “${text}” to the clipboard.`;
+      } catch {
+        button.textContent = 'Not copied';
+        if (copyStatus) copyStatus.textContent = `Couldn’t reach the clipboard here. Select “${text}” and copy it yourself.`;
+      }
+      window.clearTimeout(reset);
+      reset = window.setTimeout(() => { button.textContent = idle; }, 2400);
+    });
+  }
+</script>

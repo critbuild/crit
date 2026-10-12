@@ -1,0 +1,149 @@
+---
+import PreviewLayout from '../layouts/PreviewLayout.astro';
+
+const concepts = [
+  {
+    id: 'signal', number: '01', name: 'Signal', category: 'THE INSTRUMENT',
+    description: 'Dark, precise, product-forward. A workspace that looks as focused as it feels.',
+    tags: ['Technical', 'Restrained', 'Lime + charcoal'],
+    colors: ['#171c16', '#c3f66c', '#e7e9df'],
+  },
+  {
+    id: 'fieldnotes', number: '02', name: 'Fieldnotes', category: 'THE TOOLMAKER',
+    description: 'Warm, editorial, quietly confident. A little more room to think, and to branch out.',
+    tags: ['Editorial', 'Tactile', 'Paper + vermilion'],
+    colors: ['#eee9dd', '#b7472e', '#272723'],
+  },
+  {
+    id: 'parallel', number: '03', name: 'Parallel', category: 'THE POSTER',
+    description: 'Electric, graphic, unapologetic. Separate workstreams with a shared sense of momentum.',
+    tags: ['Expressive', 'Bold', 'Cobalt + chartreuse'],
+    colors: ['#3935ed', '#d5fc64', '#f4f3ea'],
+  },
+];
+---
+<PreviewLayout title="Choose a direction" theme="gallery">
+  <div class="gallery">
+    <header class="gallery-nav">
+      <a class="wordmark" href="/" aria-label="Crit design studies home"><span class="mark" aria-hidden="true">+</span>crit<span class="wordmark-dot">.</span></a>
+      <span class="nav-note">PRODUCT / DESIGN STUDIES</span>
+      <a class="nav-link" href="#concepts">Explore the concepts <span aria-hidden="true">↙</span></a>
+    </header>
+
+    <main id="main">
+      <section class="intro" aria-labelledby="gallery-title">
+        <div>
+          <p class="eyebrow"><span class="status-dot" aria-hidden="true"></span> THREE DIRECTIONS. ONE CRIT.</p>
+          <h1 id="gallery-title">A different kind<br />of first impression<span>.</span></h1>
+        </div>
+        <div class="intro-note">
+          <span class="note-index">[ SELECT A DIRECTION ]</span>
+          <p>Same terminal.<br />Three personalities.</p>
+          <div class="intro-detail">Explore the full pages, try the workspace illustrations, and see which one feels like Crit.</div>
+        </div>
+      </section>
+
+      <section id="concepts" class="concepts" aria-label="Landing-page concepts">
+        {concepts.map((concept) => (
+          <a class={`concept-card ${concept.id}`} href={`/${concept.id}/`} aria-labelledby={`${concept.id}-name ${concept.id}-action`}>
+            <div class="card-meta"><span>{concept.number} / {concept.category}</span><div class="swatches" aria-hidden="true">{concept.colors.map(color => <i style={`--swatch: ${color}`}></i>)}</div></div>
+            <div class="preview-frame">
+              <img src={`/previews/${concept.id}.webp`} alt={`${concept.name} landing-page desktop preview`} width="1440" height="1080" loading="eager" />
+              <div class="preview-open" aria-hidden="true">Explore concept <span>↗</span></div>
+            </div>
+            <div class="card-heading"><h2 id={`${concept.id}-name`}>{concept.name}</h2><span class="card-arrow" aria-hidden="true">↗</span></div>
+            <p class="card-description">{concept.description}</p>
+            <div class="card-tags">{concept.tags.map(tag => <span>{tag}</span>)}</div>
+            <span id={`${concept.id}-action`} class="sr-only">Open full design</span>
+          </a>
+        ))}
+      </section>
+
+      <section class="closing" aria-label="About the concepts">
+        <svg class="closing-mark" viewBox="0 0 40 40" fill="none" aria-hidden="true"><path d="M20 2v36M2 20h36M7.3 7.3l25.4 25.4M7.3 32.7 32.7 7.3" stroke="currentColor" stroke-width="3" /></svg>
+        <p>Pick a feeling.<br /><span>We’ll make it unmistakably Crit.</span></p>
+        <div class="closing-note">Each direction includes a responsive landing page,<br />an interactive illustration, and a source-install section.<br />Use the floating selector to move between designs.</div>
+      </section>
+    </main>
+
+    <footer class="gallery-footer"><span>CRIT — WORKTREE-FIRST TERMINALS</span><span>OMP / OPENCODE / YOUR SHELL</span><a href="#main">Back to top ↑</a></footer>
+  </div>
+</PreviewLayout>
+
+<style>
+  :global(body[data-concept='gallery']) { background: #f3f2ed; color: #252822; }
+  .gallery { width: min(1480px, 100%); margin-inline: auto; padding: 0 56px; }
+  .gallery-nav { min-height: 112px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid #d5d7ce; gap: 24px; }
+  .wordmark { display: flex; align-items: center; gap: 9px; font-family: var(--font-display); font-size: 35px; letter-spacing: -2px; font-weight: 700; text-decoration: none; line-height: 1; }
+  .wordmark-dot { margin-left: -9px; color: #6d8146; }
+  .mark { display: grid; place-items: center; width: 30px; height: 30px; margin-right: 3px; background: #c3f66c; font-size: 32px; font-weight: 500; line-height: 1; letter-spacing: 0; }
+  .nav-note, .nav-link, .eyebrow, .note-index, .card-meta, .card-tags, .gallery-footer, .preview-open { font-family: var(--font-mono); }
+  .nav-note { font-size: 10px; letter-spacing: .07em; color: #71766b; }
+  .nav-link { font-size: 11px; display: flex; gap: 22px; text-decoration: none; align-items: center; }
+  .nav-link span { font-family: var(--font-sans); font-size: 22px; }
+  .intro { display: flex; justify-content: space-between; align-items: end; gap: 60px; padding: 87px 0 66px; }
+  .eyebrow { margin: 0 0 27px; display: flex; align-items: center; gap: 10px; color: #5e6858; font-size: 10px; letter-spacing: .07em; }
+  .status-dot { width: 6px; height: 6px; border-radius: 50%; background: #819d54; box-shadow: 0 0 0 4px #819d5416; }
+  h1 { font-family: var(--font-display); margin: 0; font-size: clamp(48px, 4.9vw, 76px); font-weight: 500; line-height: 1.045; letter-spacing: -.063em; }
+  h1 > span { color: #819d54; }
+  .intro-note { width: 265px; flex-shrink: 0; padding-bottom: 5px; }
+  .note-index { font-size: 9px; color: #858b7e; letter-spacing: .02em; }
+  .intro-note > p { margin: 19px 0 14px; font-size: 21px; letter-spacing: -.035em; line-height: 1.35; }
+  .intro-detail { font-size: 12px; color: #71766b; line-height: 1.75; max-width: 240px; }
+  .concepts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 28px; scroll-margin-top: 32px; }
+  .concept-card { min-width: 0; text-decoration: none; }
+  .card-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 14px; font-size: 9px; letter-spacing: .055em; color: #7d8376; }
+  .swatches { display: flex; gap: 3px; }
+  .swatches i { width: 10px; height: 10px; border-radius: 50%; background: var(--swatch); border: 1px solid #0000000b; }
+  .preview-frame { position: relative; aspect-ratio: 4 / 3; overflow: hidden; border: 1px solid #242a1414; background: #e7e8df; }
+  .preview-frame img { width: 100%; height: 100%; object-fit: cover; object-position: top; transition: transform .45s cubic-bezier(.2,.65,.3,1); }
+  .preview-open { position: absolute; bottom: 14px; left: 14px; right: 14px; display: flex; justify-content: space-between; align-items: center; padding: 13px 15px; background: #f7f8f0f0; color: #272c20; border: 1px solid #fff8; font-size: 10px; transform: translateY(75px); transition: transform .3s ease; backdrop-filter: blur(12px); }
+  .preview-open span { font-family: var(--font-sans); font-size: 17px; }
+  .concept-card:hover .preview-frame img, .concept-card:focus-visible .preview-frame img { transform: scale(1.035); }
+  .concept-card:hover .preview-open, .concept-card:focus-visible .preview-open { transform: translateY(0); }
+  .card-heading { display: flex; align-items: center; justify-content: space-between; margin-top: 23px; }
+  h2 { margin: 0; font-family: var(--font-display); font-size: 27px; font-weight: 500; letter-spacing: -.045em; }
+  .card-arrow { font-size: 23px; line-height: 1; color: #6d7564; transition: transform .2s ease; }
+  .concept-card:hover .card-arrow { transform: translate(3px,-3px); }
+  .card-description { font-size: 12px; color: #71766b; line-height: 1.7; max-width: 310px; margin: 13px 0 20px; }
+  .card-tags { display: flex; gap: 8px; flex-wrap: wrap; font-size: 8px; color: #6b7361; }
+  .card-tags span { padding: 6px 8px; border: 1px solid #d7dbd0; }
+  .closing { display: flex; align-items: center; gap: 25px; border-top: 1px solid #d5d7ce; margin-top: 73px; padding: 40px 0 43px; }
+  .closing-mark { width: 34px; height: 34px; flex-shrink: 0; color: #8b9b72; }
+  .closing p { margin: 0; font-size: 17px; letter-spacing: -.035em; line-height: 1.5; }
+  .closing p span { color: #79816f; }
+  .closing-note { margin-left: auto; font-size: 10px; color: #828879; line-height: 1.9; }
+  .gallery-footer { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 24px 0 32px; border-top: 1px solid #d5d7ce; color: #898f81; font-size: 8px; letter-spacing: .025em; }
+  .gallery-footer a { text-decoration: none; color: #4e5845; }
+  @media (min-width: 1700px) { .intro { padding-top: 104px; } }
+  @media (max-width: 1000px) {
+    .gallery { padding-inline: 30px; }
+    .intro { gap: 30px; padding-top: 62px; }
+    .intro-note { width: 210px; }
+    .concepts { gap: 18px; }
+    .card-meta { font-size: 8px; letter-spacing: 0; }
+    .swatches i { width: 8px; height: 8px; }
+    .card-description { font-size: 11px; }
+  }
+  @media (max-width: 760px) {
+    .gallery { padding-inline: 24px; }
+    .gallery-nav { min-height: 84px; }
+    .nav-note { display: none; }
+    .intro { display: block; padding: 55px 0 42px; }
+    h1 { font-size: clamp(42px, 8vw, 64px); }
+    .eyebrow { font-size: 8px; margin-bottom: 25px; }
+    .intro-note { width: auto; padding: 0; margin-top: 28px; }
+    .note-index, .intro-note > p { display: none; }
+    .intro-detail { max-width: 360px; }
+    .concepts { grid-template-columns: 1fr; gap: 42px; }
+    .card-meta { font-size: 10px; }
+    .swatches i { width: 11px; height: 11px; }
+    .card-heading { margin-top: 20px; }
+    .card-description { max-width: 100%; font-size: 13px; margin-bottom: 15px; }
+    .card-tags { font-size: 9px; }
+    .closing { flex-wrap: wrap; margin-top: 47px; gap: 20px; padding-block: 30px; }
+    .closing-note { margin: 0 0 0 59px; }
+    .gallery-footer { flex-wrap: wrap; font-size: 8px; line-height: 1.5; }
+    .gallery-footer > span:nth-child(2) { display: none; }
+  }
+</style>

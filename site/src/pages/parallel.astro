@@ -1,0 +1,822 @@
+---
+import PreviewLayout from '../layouts/PreviewLayout.astro';
+import ParallelLanes from '../components/parallel/ParallelLanes.astro';
+import ParallelSwitchboard from '../components/parallel/ParallelSwitchboard.astro';
+
+const sections = [
+  { href: '#lanes', label: 'Lanes' },
+  { href: '#shell', label: 'Shell' },
+  { href: '#ask', label: 'Ask' },
+  { href: '#stacks', label: 'Stacks' },
+  { href: '#lifecycle', label: 'Lifecycle' },
+];
+
+const heroFacts = [
+  { href: '#lanes', number: '01', title: 'A worktree per branch', body: 'Its own checkout, tab and sessions.' },
+  { href: '#shell', number: '02', title: 'Ctrl+D to the shell', body: 'From OMP or OpenCode. The agent keeps going.' },
+  { href: '#stacks', number: '03', title: 'Stacks, if you want them', body: 'Docker Compose per worktree, on its own loopback ports.' },
+];
+
+const laneKeys = [
+  ['Ctrl+Shift+T', 'New tab: a worktree, another project, or a switch'],
+  ['Ctrl+Tab', 'Next tab, on into the next open project'],
+  ['Ctrl+Shift+,', 'Split side by side'],
+  ['Ctrl+Shift+.', 'Split top and bottom'],
+  ['Ctrl+Shift+L', 'Cycle full, vertical and horizontal'],
+];
+
+const ctrlD = [
+  ['In OMP or OpenCode', 'Selects this worktree’s shell, or opens one. The agent keeps running.'],
+  ['In a shell', 'End of input, exactly as before. It never toggles back to the agent.'],
+  ['In native mode (F12)', 'Passed straight through to the focused terminal.'],
+];
+
+const planExample = JSON.stringify({ action: 'create_worktree', branch: 'feat/csv-export', base: null, agent: null }, null, 2);
+const planShapes = ['clarify', 'create_worktree', 'open', 'session', 'command'];
+const askPoints = [
+  'Never runs shell commands a model wrote. Destructive actions still wait for your confirmation.',
+  'Sends your request history plus project and worktree names and paths, not source files. Capped at 64 KiB, with a 50-second local deadline.',
+  'Vague requests get a follow-up question, answered in the same box. No model runs while the launcher is idle.',
+];
+const manualControls = [
+  'Open project folder',
+  'Open existing worktree',
+  'Switch project',
+  'New branch / worktree',
+  'New agent / shell session',
+  'Split side by side',
+  'Split top and bottom',
+  'Full width',
+  'Start isolated environment',
+  'Stop environment (retain data)',
+  'Restart environment',
+  'Refresh environment status',
+  'Environment logs',
+  'Open preview endpoint',
+  'Close worktree tab',
+  'Close agent / shell session',
+  'Remove worktree (clean only)',
+  'Toggle native Kitty shortcuts',
+  'Exit Crit',
+];
+
+const stacks = [
+  { branch: 'feat/csv-export', tone: 'lime', project: 'crit-5e1c…', ports: [['web', '32771', '3000'], ['api', '32772', '8000']] },
+  { branch: 'fix/date-parsing', tone: 'sky', project: 'crit-a90b…', ports: [['web', '32779', '3000'], ['api', '32780', '8000']] },
+];
+const critToml = `[compose]
+files = ["compose.yaml"]
+
+[compose.links.web]
+API_URL = "api:8000"`;
+const envCommands = [
+  ['crit env up', 'Start this worktree’s stack'],
+  ['crit env down', 'Stop it; volumes are kept'],
+  ['crit env restart', 'Restart it'],
+  ['crit env status', 'Services, health and published ports, as JSON'],
+  ['crit env logs', 'Follow the stack’s logs'],
+];
+
+interface LifecycleRow { event: string; keys?: string[]; command?: string; result: string }
+const lifecycle: LifecycleRow[] = [
+  { event: 'Close a tab', keys: ['Ctrl+Shift+Q'], result: 'The checkout stays on disk. The tab leaves the saved workspace; its chat history stays with the agent.' },
+  { event: 'Remove a worktree', keys: ['F1', 'F2'], result: 'A separate, confirmed step from either launcher. It refuses while the worktree has uncommitted or untracked changes, and the branch is kept.' },
+  { event: 'Exit Crit', keys: ['F10'], result: 'After you confirm, Crit stops the agent and shell processes it started. Checkouts and Compose stacks stay exactly as they are.' },
+  { event: 'Launch again', command: 'crit', result: 'Projects, worktrees, splits, focused panes and selected sessions reopen. Every saved OMP and OpenCode chat resumes exactly, background tabs included; shells start fresh in their worktrees.' },
+  { event: 'Start clean', command: 'crit --fresh', result: 'Skips restoration and starts a new saved workspace.' },
+];
+
+const steps = [
+  {
+    title: 'Build and install',
+    body: 'From the root of your local Crit checkout. Cargo builds the crit binary and installs it into Cargo’s bin directory.',
+    command: 'cargo install --path .',
+  },
+  {
+    title: 'Start it anywhere',
+    body: 'The first time, choose New terminal or a Git project, then press F1 and say what you want. After that, crit restores your saved workspace on startup.',
+    command: 'crit',
+  },
+  {
+    title: 'Keep the sheet handy',
+    body: 'Prints every shortcut, including the keys inside Ask Crit.',
+    command: 'crit keys',
+  },
+  {
+    title: 'Kitty mappings',
+    optional: true,
+    body: 'Installs Crit’s window-scoped Kitty mappings so its shortcuts and Kitty’s own can coexist. Reload Kitty’s config with Ctrl+Shift+F5 afterwards.',
+    command: 'crit setup kitty',
+  },
+];
+const needs = [
+  ['Rust with Cargo, and Git', 'To build Crit and to make worktrees.'],
+  ['OMP or OpenCode', 'For agent sessions. Ask Crit needs an authenticated OMP.'],
+  ['Docker Compose', 'Optional, for a stack per worktree.'],
+  ['Kitty', 'Optional, for the shortcut integration.'],
+];
+---
+<PreviewLayout
+  title="Parallel — Run your branches side by side"
+  theme="parallel"
+  description="Crit is a worktree-first terminal for OMP, OpenCode and ordinary shells. Every branch gets its own Git worktree, tab and sessions, so parallel work runs side by side."
+>
+  <div class="pl" id="top">
+    <header class="pl-top pl-wrap">
+      <a class="pl-brand" href="#top" aria-label="Crit, back to top">
+        <svg class="pl-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+          <rect class="pl-mark-bg" width="32" height="32" />
+          <path class="pl-mark-sky" d="M2 8L18 24H32" />
+          <path class="pl-mark-lime" d="M10 8L18 16H32" />
+          <path class="pl-mark-paper" d="M0 8H32" />
+        </svg>
+        <span class="pl-brand-name">crit</span>
+      </a>
+      <nav class="pl-nav" aria-label="Page sections">
+        {sections.map((section) => <a href={section.href}>{section.label}</a>)}
+      </nav>
+      <a class="pl-top-cta" href="#install">Install<span class="pl-wide-only"> from source</span><span aria-hidden="true">↓</span></a>
+    </header>
+
+    <main id="main">
+      <section class="pl-hero" aria-labelledby="hero-title">
+        <div class="pl-frame">
+          <span class="pl-crop pl-crop-tl" aria-hidden="true"></span>
+          <span class="pl-crop pl-crop-tr" aria-hidden="true"></span>
+          <span class="pl-crop pl-crop-bl" aria-hidden="true"></span>
+          <span class="pl-crop pl-crop-br" aria-hidden="true"></span>
+          <div class="pl-sheet pl-on-blue">
+            <ul class="pl-meta">
+              <li>Crit / worktree-first terminal</li>
+              <li>For OMP, OpenCode &amp; your shell</li>
+              <li>Design study Nº 03 — Parallel</li>
+            </ul>
+            <div class="pl-hero-grid">
+              <div class="pl-h1-box"><h1 id="hero-title" class="pl-h1"><span>Parallel, </span><span>by default.</span></h1></div>
+              <div class="pl-hero-aside">
+                <p class="pl-hero-lead">Crit is a worktree-first terminal for OMP, OpenCode and ordinary shells. Every branch you start gets its own Git worktree, its own tab and its own sessions, so the feature, the fix and the experiment run side by side instead of taking turns in one checkout.</p>
+                <div class="pl-actions">
+                  <a class="pl-btn" href="#install">Install from source <span aria-hidden="true">↓</span></a>
+                  <a class="pl-textlink" href="#lanes">Try the switchboard <span aria-hidden="true">→</span></a>
+                </div>
+              </div>
+            </div>
+            <div class="pl-hero-lanes"><ParallelLanes /></div>
+            <ul class="pl-facts">
+              {heroFacts.map((fact) => (
+                <li><a href={fact.href}><span class="pl-facts-n">{fact.number}</span><b>{fact.title}</b><span class="pl-facts-body">{fact.body}</span><span class="pl-facts-arrow" aria-hidden="true">→</span></a></li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <section class="pl-strip" aria-label="What Crit runs">
+        <div class="pl-wrap pl-strip-grid">
+          <p class="pl-strip-label">Runs</p>
+          <ul class="pl-strip-tools">
+            <li>OMP</li>
+            <li><span class="pl-slash" aria-hidden="true">/</span>OpenCode</li>
+            <li><span class="pl-slash" aria-hidden="true">/</span>your shell</li>
+          </ul>
+          <p class="pl-strip-note">On Git worktrees, with Docker Compose if you configure it. Crit isn’t another coding agent; it’s the terminal around the ones you already use.</p>
+        </div>
+      </section>
+
+      <section id="lanes" class="pl-section" aria-labelledby="lanes-title">
+        <div class="pl-wrap">
+          <header class="pl-head">
+            <p class="pl-num" aria-hidden="true">01</p>
+            <p class="pl-kicker">Lanes</p>
+            <h2 id="lanes-title" class="pl-h2">Every branch, its own lane.</h2>
+            <p class="pl-lead">Start a branch and Crit makes a Git worktree for it: a complete checkout on disk that shares one repository with the others. Each worktree is a tab with its own agent and shell sessions, and two can share the screen when the work wants a second look.</p>
+          </header>
+          <ParallelSwitchboard />
+          <ul class="pl-notes">
+            <li><h3>From the focused HEAD</h3><p>New worktrees start from the checkout in front of you, unless you name another base.</p></li>
+            <li><h3>Beside the repository</h3><p>Checkouts live under <code>.crit-worktrees/</code> next to the repository, one directory per branch.</p></li>
+            <li><h3>One checkout at a time</h3><p>Opening a Git folder opens that checkout only, never every branch at once.</p></li>
+            <li><h3>Switching keeps things running</h3><p>Move between tabs and projects; their agent and shell sessions stay alive while you do.</p></li>
+          </ul>
+          <ul class="pl-keys" aria-label="Lane shortcuts">
+            {laneKeys.map(([key, action]) => <li><kbd>{key}</kbd><span>{action}</span></li>)}
+          </ul>
+        </div>
+      </section>
+
+      <section id="shell" class="pl-section pl-on-blue" aria-labelledby="shell-title">
+        <div class="pl-wrap">
+          <header class="pl-head">
+            <p class="pl-num" aria-hidden="true">02</p>
+            <p class="pl-kicker">The shell</p>
+            <h2 id="shell-title" class="pl-h2">One key to the shell. The agent keeps going.</h2>
+            <p class="pl-lead">Inside OMP or OpenCode, Ctrl+D selects that worktree’s shell, or opens one if there isn’t one yet. The agent isn’t stopped; it carries on in its own session while you run the command yourself.</p>
+          </header>
+          <div class="pl-shell-grid">
+            <div class="pl-caps-art">
+              <div class="pl-caps" aria-hidden="true"><span class="pl-cap pl-cap-ctrl">Ctrl</span><span class="pl-cap-plus">+</span><span class="pl-cap pl-cap-d">D</span></div>
+              <div class="pl-route" aria-hidden="true">
+                <span class="pl-route-chip"><i class="pl-pulse"></i>omp 1 · working</span>
+                <span class="pl-route-arrow"></span>
+                <span class="pl-route-chip pl-route-on">[shell 2 · idle]</span>
+              </div>
+              <p class="pl-route-caption">After Ctrl+D the shell is selected, and omp 1 is still working beside it.</p>
+            </div>
+            <div>
+              <h3 class="pl-mini">What Ctrl+D does</h3>
+              <dl class="pl-ledger">
+                {ctrlD.map(([where, what]) => <div><dt>{where}</dt><dd>{what}</dd></div>)}
+              </dl>
+              <p class="pl-shell-back">Going back is its own move: <kbd>Ctrl+Shift+[</kbd> and <kbd>Ctrl+Shift+]</kbd> step through sessions, and <kbd>Ctrl+Shift+1</kbd> to <kbd>9</kbd> jump straight to one.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="ask" class="pl-section" aria-labelledby="ask-title">
+        <div class="pl-wrap">
+          <header class="pl-head">
+            <p class="pl-num" aria-hidden="true">03</p>
+            <p class="pl-kicker">Ask Crit</p>
+            <h2 id="ask-title" class="pl-h2">Say it. Or steer it.</h2>
+            <p class="pl-lead">F1 opens Ask Crit, a small launcher that turns a sentence into one of Crit’s own actions. F2 lists the same actions to pick by hand. Either way, nothing destructive happens without a yes.</p>
+          </header>
+          <div class="pl-modes">
+            <article class="pl-mode pl-mode-f1" aria-labelledby="f1-title">
+              <p class="pl-mode-key" aria-hidden="true">F1</p>
+              <h3 id="f1-title">Ask Crit</h3>
+              <p>Type what you want. Crit asks your authenticated OMP installation, using Haiku 5.5, to choose one constrained plan, then carries it out. The launcher has no tools, extensions or persistent session of its own.</p>
+              <figure class="pl-plan">
+                <figcaption>Example · illustrative request, real plan format</figcaption>
+                <p class="pl-plan-ask"><span aria-hidden="true">› </span>Start a branch called feat/csv-export.</p>
+                <pre><code>{planExample}</code></pre>
+              </figure>
+              <p class="pl-mini">The only plans it can return</p>
+              <ul class="pl-shapes">
+                {planShapes.map((shape) => <li>{shape}</li>)}
+              </ul>
+              <ul class="pl-points">
+                {askPoints.map((point) => <li>{point}</li>)}
+              </ul>
+            </article>
+            <article class="pl-mode pl-mode-f2" aria-labelledby="f2-title">
+              <p class="pl-mode-key" aria-hidden="true">F2</p>
+              <h3 id="f2-title">Manual controls</h3>
+              <p>Press F2 inside the launcher for the same actions as a plain list: Up, Down, Enter. No model involved.</p>
+              <ol class="pl-menu" aria-label="Manual controls, as F2 lists them">
+                {manualControls.map((item) => <li data-selected={item === 'New branch / worktree' ? '' : undefined}>{item}</li>)}
+              </ol>
+            </article>
+          </div>
+        </div>
+      </section>
+
+      <section id="stacks" class="pl-section pl-on-paper2" aria-labelledby="stacks-title">
+        <div class="pl-wrap">
+          <header class="pl-head">
+            <p class="pl-num" aria-hidden="true">04</p>
+            <p class="pl-kicker">Stacks · optional</p>
+            <h2 id="stacks-title" class="pl-h2">One compose file. A stack per lane.</h2>
+            <p class="pl-lead">If the repository has a Compose file, every worktree can run its own stack, and new worktrees start theirs automatically once it’s configured. Two branches can both run web and api without fighting over a host port.</p>
+          </header>
+          <div class="pl-stacks">
+            <div class="pl-stack-main">
+              <figure class="pl-stack-fig">
+                <figcaption>Illustrative. Docker allocates the loopback ports when each stack starts; these numbers are examples.</figcaption>
+                <p class="pl-stack-source"><code>compose.yaml</code><span>One file in the repository, a separate Compose project for each worktree.</span></p>
+                <div class="pl-stack-cols">
+                  {stacks.map((stack) => (
+                    <div class="pl-stack" data-tone={stack.tone}>
+                      <p class="pl-stack-head"><span class="pl-stack-dot" aria-hidden="true"></span>{stack.branch}</p>
+                      <dl>
+                        <div><dt>Project</dt><dd>{stack.project}</dd></div>
+                        <div><dt>Network</dt><dd>{stack.project}_default</dd></div>
+                        <div><dt>Volume</dt><dd>{stack.project}_pgdata</dd></div>
+                        <div><dt>Build image</dt><dd>{stack.project}:build-…</dd></div>
+                        {stack.ports.map(([service, host, container]) => (
+                          <div><dt>{service}</dt><dd><span class="pl-nowrap">127.0.0.1:<b>{host}</b></span> <span class="pl-nowrap">→ {container}</span></dd></div>
+                        ))}
+                      </dl>
+                    </div>
+                  ))}
+                </div>
+              </figure>
+              <p class="pl-stack-local">Ignored local files come along too: required Git-ignored Compose configuration, <code>.env</code> and service <code>env_file</code> inputs are copied from the source checkout as private, independent files. Files already in the new checkout are kept.</p>
+            </div>
+            <div class="pl-stack-side">
+              <div class="pl-caveat">
+                <h3>Not a security sandbox.</h3>
+                <p>It keeps local stacks apart for convenience. Bind mounts keep the paths you configured, so a shared absolute directory is still shared; use worktree-relative paths or named volumes for data that should stay separate. External networks, external volumes and host networking are refused.</p>
+              </div>
+              <figure class="pl-config">
+                <pre><code>{critToml}</code></pre>
+                <figcaption>Optional <code>crit.toml</code> in the repository. The link injects this worktree’s <code>http://127.0.0.1:PORT</code> for api into web’s runtime environment after api starts. Use your app’s actual variable name; build-time frontend URLs are configured in the app itself.</figcaption>
+              </figure>
+              <div>
+                <h3 class="pl-mini">Per worktree, from its folder</h3>
+                <dl class="pl-env">
+                  {envCommands.map(([command, meaning]) => <div><dt>{command}</dt><dd>{meaning}</dd></div>)}
+                </dl>
+                <p class="pl-env-note">Or ask Crit to “open the preview” for this worktree’s endpoint.</p>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="lifecycle" class="pl-section pl-on-ink" aria-labelledby="lifecycle-title">
+        <div class="pl-wrap">
+          <header class="pl-head">
+            <p class="pl-num" aria-hidden="true">05</p>
+            <p class="pl-kicker">Lifecycle</p>
+            <h2 id="lifecycle-title" class="pl-h2">Processes stop. The workspace comes back.</h2>
+            <p class="pl-lead">Crit owns the processes it starts, so exiting stops them. Checkouts stay on disk, Compose stacks keep running, and the next launch reopens your projects, splits and exact OMP and OpenCode chats.</p>
+          </header>
+          <ol class="pl-life">
+            {lifecycle.map((row, index) => (
+              <li>
+                <span class="pl-life-n" aria-hidden="true">{String(index + 1).padStart(2, '0')}</span>
+                <div class="pl-life-what">
+                  <h3>{row.event}</h3>
+                  <span class="pl-life-key">{row.command ? <code>{row.command}</code> : row.keys?.map((key, keyIndex) => <>{keyIndex > 0 && <span class="pl-life-or">or</span>}<kbd>{key}</kbd></>)}</span>
+                </div>
+                <p class="pl-life-result">{row.result}</p>
+              </li>
+            ))}
+          </ol>
+          <div class="pl-life-notes">
+            <p>Crit isn’t a background daemon, and there’s no tmux-style reattach. Running processes, unsent input and scrollback don’t come back; the saved workspace and chats reopen in new processes. Compose stacks are the deliberate exception: they keep running until you stop them, for example with <code>crit env down</code>.</p>
+            <p>The saved workspace is owner-private metadata in <code>$XDG_STATE_HOME/crit/workspace.json</code>, by default <code>~/.local/state/crit/workspace.json</code>. Chat contents stay in the agents’ own stores.</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="install" class="pl-install" aria-labelledby="install-title">
+        <div class="pl-frame">
+          <span class="pl-crop pl-crop-tl" aria-hidden="true"></span>
+          <span class="pl-crop pl-crop-tr" aria-hidden="true"></span>
+          <span class="pl-crop pl-crop-bl" aria-hidden="true"></span>
+          <span class="pl-crop pl-crop-br" aria-hidden="true"></span>
+          <div class="pl-sheet pl-on-blue">
+            <div class="pl-wrap">
+              <header class="pl-head">
+                <p class="pl-num" aria-hidden="true">06</p>
+                <p class="pl-kicker">Install</p>
+                <h2 id="install-title" class="pl-h2">Build it from your checkout.</h2>
+                <p class="pl-lead">Crit installs from source with Cargo. There’s no installer script or prebuilt download: build it from the root of a local Crit checkout, then run it from any folder.</p>
+              </header>
+              <div class="pl-install-grid">
+                <div>
+                  <ol class="pl-steps">
+                    {steps.map((step, index) => (
+                      <li class="pl-step">
+                        <span class="pl-step-n" aria-hidden="true">{index + 1}</span>
+                        <h3>{step.title}{step.optional && <span class="pl-tag">Optional</span>}</h3>
+                        <p>{step.body}</p>
+                        <div class="pl-cmd" data-command>
+                          <code>{step.command}</code>
+                          <button type="button" class="pl-copy" data-copy={step.command} aria-label={`Copy ${step.command}`}>Copy</button>
+                        </div>
+                      </li>
+                    ))}
+                  </ol>
+                  <p class="pl-copy-status" role="status" data-copy-status></p>
+                </div>
+                <div class="pl-needs">
+                  <h3 class="pl-mini">You’ll need</h3>
+                  <ul>
+                    {needs.map(([what, why]) => <li><b>{what}</b><span>{why}</span></li>)}
+                  </ul>
+                  <h3 class="pl-mini">Good to know</h3>
+                  <ul>
+                    <li>Each interactive start runs <code>omp update</code> and <code>opencode upgrade</code> before launching agents. If an update fails, Crit shows why and carries on with the installed version.</li>
+                    <li><code>crit --help</code> carries the full notes on projects, restore, Ask Crit and Docker.</li>
+                  </ul>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="pl-foot">
+      <div class="pl-wrap pl-foot-grid">
+        <div>
+          <p class="pl-foot-brand"><span class="pl-brand-name">crit</span><span>Worktree-first terminals for OMP, OpenCode and your shell.</span></p>
+          <p class="pl-foot-small">Apache-2.0 · Built from a local checkout · Design study 03, Parallel</p>
+        </div>
+        <nav class="pl-foot-nav" aria-label="Footer">
+          {sections.map((section) => <a href={section.href}>{section.label}</a>)}
+          <a href="#install">Install</a>
+          <a href="#top">Back to top <span aria-hidden="true">↑</span></a>
+        </nav>
+        <p class="pl-foot-note">The workspace, plan and ports on this page are illustrations drawn for this design, not captured from a running session.</p>
+      </div>
+    </footer>
+  </div>
+</PreviewLayout>
+
+<style>
+  :global(body[data-concept='parallel']) { background: #f4f3ea; color: #13122e; }
+  :global(body[data-concept='parallel'] ::selection) { background: #d5fc64; color: #13122e; }
+
+  .pl {
+    --pl-blue: #3935ed;
+    --pl-lime: #d5fc64;
+    --pl-paper: #f4f3ea;
+    --pl-paper-2: #e8e6d8;
+    --pl-ink: #13122e;
+    --pl-ink-2: #45446b;
+    --pl-sky: #90bfff;
+    --pl-on-blue-2: #d9d8ff;
+    --pl-on-ink-2: #bdbce0;
+    --pl-hair: rgb(244 243 234 / .3);
+    --pl-gutter: clamp(20px, 4.4vw, 64px);
+    --pl-max: 1360px;
+    --pl-sheet-margin: clamp(8px, 2vw, 32px);
+    overflow-x: hidden;
+    overflow-x: clip;
+    background: var(--pl-paper);
+    color: var(--pl-ink);
+    font: 400 16px/1.6 var(--font-sans);
+  }
+  .pl-wrap { width: min(100% - 2 * var(--pl-gutter), var(--pl-max)); margin-inline: auto; }
+  code { font-family: var(--font-mono); font-size: .92em; overflow-wrap: anywhere; }
+  kbd { display: inline-block; padding: 1px 7px 0; border: 1.5px solid currentColor; border-bottom-width: 3px; border-radius: 5px; font: 12.5px/1.5 var(--font-mono); white-space: nowrap; }
+  .pl-on-blue { background: var(--pl-blue); color: var(--pl-paper); }
+  .pl-on-ink { background: var(--pl-ink); color: var(--pl-paper); }
+  .pl-on-paper2 { background: var(--pl-paper-2); }
+  .pl-nowrap { white-space: nowrap; }
+
+  /* masthead */
+  .pl-top {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-areas: 'brand cta' 'nav nav';
+    align-items: center;
+    gap: 14px 20px;
+    padding: 18px 0 20px;
+  }
+  .pl-brand { grid-area: brand; justify-self: start; display: inline-flex; align-items: center; gap: 12px; text-decoration: none; }
+  .pl-mark { display: block; flex: none; width: 34px; height: 34px; }
+  .pl-mark-bg { fill: var(--pl-blue); }
+  .pl-mark path { fill: none; stroke-width: 4.2; stroke-linejoin: round; }
+  .pl-mark-sky { stroke: var(--pl-sky); }
+  .pl-mark-lime { stroke: var(--pl-lime); }
+  .pl-mark-paper { stroke: var(--pl-paper); }
+  .pl-brand-name { font: 900 31px/1 var(--font-sans); letter-spacing: -.06em; }
+  .pl-nav {
+    grid-area: nav;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 22px;
+    padding-top: 10px;
+    border-top: 2px solid var(--pl-ink);
+    font: 12.5px/1.4 var(--font-mono);
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+  .pl-nav a { padding: 6px 0; border-bottom: 2px solid transparent; text-decoration: none; transition: color .15s ease, border-color .15s ease; }
+  .pl-nav a:hover { border-bottom-color: currentColor; color: var(--pl-blue); }
+  .pl-top-cta { grid-area: cta; display: inline-flex; align-items: center; gap: 10px; padding: 12px 16px; background: var(--pl-ink); color: var(--pl-paper); font: 650 14px/1 var(--font-sans); text-decoration: none; transition: background .15s ease; }
+  .pl-top-cta:hover { background: var(--pl-blue); }
+  .pl-wide-only { display: none; }
+
+  /* hero sheet */
+  .pl-hero { padding-inline: var(--pl-sheet-margin); }
+  .pl-frame { position: relative; max-width: 1680px; margin-inline: auto; }
+  .pl-sheet { --pl-sheet-pad: clamp(18px, 4vw, 64px); position: relative; overflow: hidden; overflow: clip; padding: var(--pl-sheet-pad); }
+  .pl-crop { --line: linear-gradient(currentColor, currentColor); position: absolute; display: none; width: 18px; height: 18px; color: var(--pl-ink); }
+  .pl-crop-tl { top: -18px; left: -18px; background: var(--line) 0 100% / 13px 1px no-repeat, var(--line) 100% 0 / 1px 13px no-repeat; }
+  .pl-crop-tr { top: -18px; left: 100%; background: var(--line) 100% 100% / 13px 1px no-repeat, var(--line) 0 0 / 1px 13px no-repeat; }
+  .pl-crop-bl { top: 100%; left: -18px; background: var(--line) 0 0 / 13px 1px no-repeat, var(--line) 100% 100% / 1px 13px no-repeat; }
+  .pl-crop-br { top: 100%; left: 100%; background: var(--line) 100% 0 / 13px 1px no-repeat, var(--line) 0 100% / 1px 13px no-repeat; }
+  .pl-meta {
+    display: grid;
+    gap: 2px 24px;
+    margin: 0;
+    padding: 0 0 14px;
+    border-bottom: 1px solid var(--pl-hair);
+    color: var(--pl-on-blue-2);
+    font: 11.5px/1.5 var(--font-mono);
+    letter-spacing: .1em;
+    list-style: none;
+    text-transform: uppercase;
+  }
+  .pl-hero-grid { display: grid; gap: 28px 56px; margin-top: clamp(30px, 6vw, 84px); }
+  /* Sized against its own column so "by default." always fits: the line is ~4.92em wide. */
+  .pl-h1-box { container-type: inline-size; min-width: 0; }
+  .pl-h1 { margin: 0; font: 900 16vw/.84 var(--font-sans); font-size: min(19.8cqi, 14.5rem); letter-spacing: -.05em; }
+  .pl-h1 span { display: block; }
+  .pl-h1 span + span { color: var(--pl-lime); }
+  .pl-hero-aside { max-width: 38rem; }
+  .pl-hero-lead { margin: 0; font-size: clamp(1.06rem, 1rem + .35vw, 1.3rem); line-height: 1.5; }
+  .pl-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 16px 26px; margin-top: 28px; }
+  .pl-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 18px;
+    padding: 16px 22px;
+    border: 2px solid var(--pl-lime);
+    background: var(--pl-lime);
+    color: var(--pl-ink);
+    font: 700 15px/1 var(--font-sans);
+    text-decoration: none;
+    transition: background .15s ease, border-color .15s ease;
+  }
+  .pl-btn:hover { border-color: var(--pl-paper); background: var(--pl-paper); }
+  .pl-btn:focus-visible { outline-color: var(--pl-paper); }
+  .pl-textlink { font: 650 15px/1.3 var(--font-sans); text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 6px; transition: color .15s ease; }
+  .pl-textlink:hover { color: var(--pl-lime); }
+  .pl-hero-lanes { margin: clamp(40px, 6vw, 88px) 0 0 calc(-1 * var(--pl-sheet-pad)); }
+  .pl-facts { display: grid; margin: clamp(36px, 5vw, 64px) 0 0; padding: 0; border-top: 1px solid var(--pl-hair); list-style: none; }
+  .pl-facts a { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; column-gap: 16px; padding: 18px 0; border-bottom: 1px solid var(--pl-hair); text-decoration: none; }
+  .pl-facts-n { grid-row: 1 / span 2; padding-top: 3px; color: var(--pl-lime); font: 12px/1.6 var(--font-mono); }
+  .pl-facts b { font: 800 1.15rem/1.3 var(--font-sans); letter-spacing: -.02em; }
+  .pl-facts-body { grid-column: 2; color: var(--pl-on-blue-2); font-size: 15px; line-height: 1.5; }
+  .pl-facts-arrow { grid-column: 3; grid-row: 1 / span 2; align-self: center; font-size: 1.3rem; transition: transform .2s ease, color .2s ease; }
+  .pl-facts a:hover b { text-decoration: underline; text-decoration-thickness: 2px; text-underline-offset: 4px; }
+  .pl-facts a:hover .pl-facts-arrow { color: var(--pl-lime); transform: translateX(4px); }
+
+  /* strip */
+  .pl-strip { margin-top: var(--pl-sheet-margin); border-block: 3px solid var(--pl-ink); background: var(--pl-lime); color: var(--pl-ink); }
+  .pl-strip-grid { display: grid; align-items: center; gap: 10px 36px; padding-block: clamp(22px, 3.2vw, 38px); }
+  .pl-strip-label { margin: 0; font: 12.5px/1.3 var(--font-mono); letter-spacing: .12em; text-transform: uppercase; }
+  .pl-strip-tools { display: flex; flex-wrap: wrap; gap: 0 .32em; margin: 0; padding: 0; font: 900 clamp(2rem, 1.1rem + 3.6vw, 4.25rem)/1.04 var(--font-sans); letter-spacing: -.05em; list-style: none; }
+  .pl-slash { margin-right: .32em; color: var(--pl-blue); }
+  .pl-strip-note { max-width: 30rem; margin: 0; font-size: 15.5px; line-height: 1.5; }
+
+  /* section frame */
+  .pl-section { padding-block: clamp(64px, 9vw, 136px); }
+  .pl-head {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: end;
+    column-gap: 16px;
+    margin-bottom: clamp(36px, 5vw, 64px);
+    padding-top: 16px;
+    border-top: 6px solid currentColor;
+  }
+  .pl-num { margin: 0; color: var(--pl-blue); font: 900 4.5rem/.8 var(--font-sans); letter-spacing: -.07em; }
+  .pl-on-blue .pl-num, .pl-on-ink .pl-num { color: var(--pl-lime); }
+  .pl-kicker { margin: 0 0 3px; font: 12.5px/1.3 var(--font-mono); letter-spacing: .12em; text-transform: uppercase; }
+  .pl-h2 { grid-column: 1 / -1; margin: 24px 0 0; font: 850 clamp(2.5rem, 1.4rem + 5.2vw, 6.25rem)/.94 var(--font-sans); letter-spacing: -.05em; text-wrap: balance; }
+  .pl-lead { grid-column: 1 / -1; max-width: 40rem; margin: 22px 0 0; color: var(--pl-ink-2); font-size: clamp(1.06rem, 1rem + .3vw, 1.3rem); line-height: 1.55; }
+  .pl-on-blue .pl-lead { color: var(--pl-on-blue-2); }
+  .pl-on-ink .pl-lead { color: var(--pl-on-ink-2); }
+  .pl-mini { margin: 0 0 12px; font: 400 12px/1.4 var(--font-mono); letter-spacing: .1em; text-transform: uppercase; }
+
+  /* 01 lanes */
+  .pl-notes { display: grid; gap: 28px 32px; margin: clamp(48px, 6vw, 80px) 0 0; padding: 0; list-style: none; }
+  .pl-notes li { padding-top: 14px; border-top: 4px solid var(--pl-ink); }
+  .pl-notes h3 { margin: 0 0 8px; font: 800 1.25rem/1.2 var(--font-sans); letter-spacing: -.025em; }
+  .pl-notes p { margin: 0; color: var(--pl-ink-2); }
+  .pl-keys { display: flex; flex-wrap: wrap; gap: 12px 30px; margin: 40px 0 0; padding: 20px 0 0; border-top: 1px solid var(--pl-ink); font-size: 15px; list-style: none; }
+  .pl-keys li { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+
+  /* 02 shell */
+  .pl-shell-grid { display: grid; align-items: center; gap: clamp(44px, 6vw, 88px); }
+  .pl-caps-art { container-type: inline-size; display: grid; gap: 30px; min-width: 0; }
+  .pl-caps { display: flex; align-items: center; gap: 12px; gap: 3cqi; }
+  .pl-cap {
+    display: grid;
+    place-items: center;
+    height: 26vw;
+    height: min(30cqi, 190px);
+    border: 3px solid var(--pl-ink);
+    border-radius: 14px;
+    box-shadow: 0 10px 0 var(--pl-ink);
+    color: var(--pl-ink);
+    font-family: var(--font-sans);
+    font-weight: 850;
+  }
+  .pl-cap-ctrl { width: 36vw; width: min(44cqi, 280px); background: var(--pl-paper); font-size: 7vw; font-size: min(8.5cqi, 3.6rem); letter-spacing: -.04em; }
+  .pl-cap-d { width: 26vw; width: min(30cqi, 190px); background: var(--pl-lime); font-size: 15vw; font-size: min(18cqi, 7.75rem); letter-spacing: -.05em; }
+  .pl-cap-plus { color: var(--pl-lime); font: 900 8vw/1 var(--font-sans); font-size: min(10cqi, 4.5rem); }
+  .pl-route { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; font: 12px/1 var(--font-mono); }
+  .pl-route-chip { display: inline-flex; align-items: center; padding: 9px 11px; border: 2px solid var(--pl-paper); white-space: nowrap; }
+  .pl-route-on { border-color: var(--pl-lime); background: var(--pl-lime); color: var(--pl-ink); }
+  .pl-pulse { width: 8px; height: 8px; margin-right: 8px; border-radius: 50%; background: var(--pl-lime); animation: pl-pulse 1.6s ease-in-out infinite; }
+  .pl-route-arrow { position: relative; flex: 0 0 34px; height: 2px; background: var(--pl-lime); }
+  .pl-route-arrow::after { content: ''; position: absolute; top: -5px; right: -2px; border-top: 6px solid transparent; border-bottom: 6px solid transparent; border-left: 9px solid var(--pl-lime); }
+  .pl-route-caption { margin: 0; color: var(--pl-on-blue-2); font-size: 15px; }
+  .pl-on-blue .pl-mini { color: var(--pl-on-blue-2); }
+  .pl-ledger { margin: 0; border-top: 2px solid currentColor; }
+  .pl-ledger div { display: grid; gap: 4px 24px; padding: 18px 0; border-bottom: 1px solid var(--pl-hair); }
+  .pl-ledger dt { color: var(--pl-lime); font: 12.5px/1.5 var(--font-mono); letter-spacing: .1em; text-transform: uppercase; }
+  .pl-ledger dd { margin: 0; font-size: 1.1rem; line-height: 1.5; }
+  .pl-shell-back { margin: 22px 0 0; color: var(--pl-on-blue-2); }
+
+  /* 03 ask */
+  .pl-modes { display: grid; gap: 24px; }
+  .pl-mode { min-width: 0; padding: clamp(22px, 3.4vw, 46px); border: 3px solid var(--pl-ink); }
+  .pl-mode-f1 { border-color: var(--pl-blue); background: var(--pl-blue); color: var(--pl-paper); }
+  .pl-mode-f2 { background: var(--pl-paper); }
+  .pl-mode-key { margin: 0; font: 900 clamp(4.5rem, 3rem + 6vw, 8.5rem)/.8 var(--font-sans); letter-spacing: -.06em; }
+  .pl-mode-f1 .pl-mode-key { color: var(--pl-lime); }
+  .pl-mode-f2 .pl-mode-key { color: var(--pl-blue); }
+  .pl-mode h3 { margin: 22px 0 12px; font: 850 clamp(1.75rem, 1.2rem + 1.6vw, 2.6rem)/1 var(--font-sans); letter-spacing: -.04em; }
+  .pl-mode > p { max-width: 36rem; margin: 0; }
+  .pl-mode-f2 > p { color: var(--pl-ink-2); }
+  .pl-mode-f1 .pl-mini { margin: 28px 0 10px; color: var(--pl-on-blue-2); }
+  .pl-plan { margin: 28px 0 0; border: 2px solid var(--pl-ink); background: var(--pl-ink); color: var(--pl-paper); }
+  .pl-plan figcaption { padding: 8px 14px; background: var(--pl-lime); color: var(--pl-ink); font: 11.5px/1.4 var(--font-mono); letter-spacing: .08em; text-transform: uppercase; }
+  .pl-plan-ask { margin: 0; padding: 14px 16px 0; color: var(--pl-lime); font: 13.5px/1.5 var(--font-mono); }
+  .pl-plan pre { margin: 0; padding: 10px 16px 16px; overflow-x: auto; color: #e6e5ff; font: 12.5px/1.6 var(--font-mono); }
+  .pl-plan code, .pl-config code { font-size: inherit; }
+  .pl-shapes { display: flex; flex-wrap: wrap; gap: 8px; margin: 0; padding: 0; list-style: none; }
+  .pl-shapes li { padding: 5px 10px; border: 1.5px solid var(--pl-hair); font: 13px/1.4 var(--font-mono); }
+  .pl-points { display: grid; gap: 12px; margin: 26px 0 0; padding: 0; list-style: none; }
+  .pl-points li { position: relative; padding-left: 26px; }
+  .pl-points li::before { content: ''; position: absolute; top: .5em; left: 0; width: 11px; height: 11px; background: var(--pl-lime); }
+  .pl-menu { margin: 26px 0 0; padding: 12px 0; border: 2px solid var(--pl-ink); background: #0c1019; color: #e0e4e8; font: 13px/1.9 var(--font-mono); list-style: none; }
+  .pl-menu li { overflow: hidden; padding: 0 14px; text-overflow: ellipsis; white-space: pre; }
+  .pl-menu li::before { content: '  '; }
+  .pl-menu li[data-selected] { color: #90bfff; }
+  .pl-menu li[data-selected]::before { content: '› '; }
+
+  /* 04 stacks */
+  .pl-stacks { display: grid; gap: 32px; }
+  .pl-stack-main, .pl-stack-side { min-width: 0; }
+  .pl-stack-fig { margin: 0; }
+  .pl-stack-fig figcaption { margin: 0 0 14px; color: var(--pl-ink-2); font: 12px/1.5 var(--font-mono); letter-spacing: .05em; }
+  .pl-stack-source { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 14px; margin: 0 0 16px; padding: 14px 16px; border: 3px solid var(--pl-ink); background: var(--pl-ink); color: var(--pl-paper); }
+  .pl-stack-source code { color: var(--pl-lime); font-size: 15px; }
+  .pl-stack-source span { color: var(--pl-on-ink-2); font-size: 14.5px; }
+  .pl-stack-cols { display: grid; gap: 16px; }
+  .pl-stack { min-width: 0; border: 3px solid var(--pl-ink); background: var(--pl-paper); }
+  .pl-stack[data-tone='lime'] { --tone: var(--pl-lime); }
+  .pl-stack[data-tone='sky'] { --tone: var(--pl-sky); }
+  .pl-stack-head { display: flex; align-items: center; gap: 10px; margin: 0; padding: 12px 16px; border-bottom: 3px solid var(--pl-ink); background: var(--tone); font: 800 1.05rem/1.2 var(--font-sans); letter-spacing: -.01em; }
+  .pl-stack-dot { flex: none; width: 14px; height: 14px; border-radius: 50%; background: var(--pl-ink); }
+  .pl-stack dl { margin: 0; padding: 4px 16px 10px; font: 12.5px/1.5 var(--font-mono); }
+  .pl-stack dl div { display: grid; grid-template-columns: 5.5rem minmax(0, 1fr); gap: 12px; padding: 9px 0; border-bottom: 1px dashed #bcb9a6; }
+  .pl-stack dl div:last-child { border-bottom: 0; }
+  .pl-stack dt { color: var(--pl-ink-2); font-size: 11px; letter-spacing: .06em; text-transform: uppercase; }
+  .pl-stack dd { margin: 0; overflow-wrap: anywhere; }
+  .pl-stack dd b { color: var(--pl-blue); font-weight: 400; }
+  .pl-stack-local { max-width: 46rem; margin: 20px 0 0; color: var(--pl-ink-2); }
+  .pl-stack-side { display: grid; gap: 24px; }
+  .pl-caveat { padding: clamp(22px, 3vw, 34px); border: 3px solid var(--pl-ink); background: var(--pl-lime); }
+  .pl-caveat h3 { margin: 0 0 12px; font: 900 clamp(1.8rem, 1.3rem + 1.7vw, 2.75rem)/.98 var(--font-sans); letter-spacing: -.045em; }
+  .pl-caveat p { margin: 0; }
+  .pl-config { margin: 0; }
+  .pl-config pre { margin: 0; padding: 16px 18px; overflow-x: auto; border: 3px solid var(--pl-ink); background: var(--pl-ink); color: #e6e5ff; font: 13.5px/1.7 var(--font-mono); }
+  .pl-config figcaption { margin-top: 12px; color: var(--pl-ink-2); font-size: 14.5px; }
+  .pl-env { margin: 0; border-top: 2px solid var(--pl-ink); }
+  .pl-env div { display: grid; gap: 2px 16px; padding: 11px 0; border-bottom: 1px solid var(--pl-ink); }
+  .pl-env dt { color: var(--pl-blue); font: 13.5px/1.5 var(--font-mono); }
+  .pl-env dd { margin: 0; font-size: 15px; }
+  .pl-env-note { margin: 14px 0 0; color: var(--pl-ink-2); font-size: 14.5px; }
+
+  /* 05 lifecycle */
+  .pl-life { margin: 0; padding: 0; border-top: 2px solid currentColor; list-style: none; }
+  .pl-life li { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 10px 18px; padding: 24px 0; border-bottom: 1px solid rgb(244 243 234 / .22); }
+  .pl-life-n { padding-top: .45em; color: var(--pl-lime); font: 13px/1 var(--font-mono); }
+  .pl-life-what h3 { margin: 0; font: 850 clamp(1.6rem, 1.15rem + 1.7vw, 2.6rem)/1 var(--font-sans); letter-spacing: -.04em; }
+  .pl-life-key { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 12px; }
+  .pl-life-key code { padding: 3px 8px; border: 1.5px solid currentColor; font-size: 13px; }
+  .pl-life-or { color: var(--pl-on-ink-2); font-size: 14px; }
+  .pl-life-result { grid-column: 2; max-width: 40rem; margin: 0; color: var(--pl-on-ink-2); font-size: 1.08rem; line-height: 1.55; }
+  .pl-life-notes { display: grid; gap: 18px 40px; margin-top: 34px; color: var(--pl-on-ink-2); }
+  .pl-life-notes p { max-width: 44rem; margin: 0; }
+
+  /* 06 install */
+  .pl-install { padding: clamp(48px, 7vw, 104px) var(--pl-sheet-margin); }
+  .pl-install .pl-sheet { padding: clamp(56px, 8vw, 120px) 0; }
+  .pl-install-grid { display: grid; gap: 36px; }
+  .pl-steps { display: grid; gap: 14px; margin: 0; padding: 0; list-style: none; }
+  .pl-step { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: baseline; gap: 8px 16px; padding: clamp(16px, 2.4vw, 24px); border: 3px solid var(--pl-ink); background: var(--pl-paper); color: var(--pl-ink); }
+  .pl-step-n { color: var(--pl-blue); font: 900 2.25rem/.9 var(--font-sans); letter-spacing: -.05em; }
+  .pl-step h3 { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; margin: 0; font: 800 1.3rem/1.2 var(--font-sans); letter-spacing: -.02em; }
+  .pl-tag { padding: 3px 8px; border: 1.5px solid currentColor; font: 400 11px/1.3 var(--font-mono); letter-spacing: .1em; text-transform: uppercase; }
+  .pl-step p { grid-column: 1 / -1; margin: 0; color: var(--pl-ink-2); }
+  .pl-cmd { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 3px; margin-top: 6px; border: 3px solid var(--pl-ink); background: var(--pl-ink); }
+  .pl-cmd code { flex: 999 1 14rem; min-width: 0; padding: 12px 14px; overflow-x: auto; color: var(--pl-lime); font-size: 14px; line-height: 1.4; white-space: pre; }
+  .pl-copy { flex: 1 0 6.5rem; padding: 11px 16px; border: 0; background: var(--pl-lime); color: var(--pl-ink); font: 750 14px/1 var(--font-sans); transition: background .15s ease; }
+  .pl-copy:hover { background: var(--pl-paper); }
+  .pl-copy:focus-visible { outline: 3px solid var(--pl-ink); outline-offset: -7px; }
+  .pl-copy[data-result='denied'] { background: var(--pl-paper); }
+  .pl-copy-status { min-height: 3em; margin: 18px 0 0; color: var(--pl-lime); font: 13.5px/1.5 var(--font-mono); }
+  .pl-needs { min-width: 0; }
+  .pl-needs ul { margin: 0 0 32px; padding: 0; border-top: 2px solid currentColor; list-style: none; }
+  .pl-needs ul:last-child { margin-bottom: 0; }
+  .pl-needs li { padding: 14px 0; border-bottom: 1px solid var(--pl-hair); }
+  .pl-needs b { display: block; font-weight: 750; }
+  .pl-needs li span { color: var(--pl-on-blue-2); }
+
+  /* footer */
+  .pl-foot { padding: 36px 0 132px; border-top: 2px solid var(--pl-ink); }
+  .pl-foot-grid { display: grid; gap: 24px 48px; }
+  .pl-foot-brand { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 16px; margin: 0; }
+  .pl-foot-brand .pl-brand-name { font-size: 26px; }
+  .pl-foot-brand span + span { color: var(--pl-ink-2); }
+  .pl-foot-small { margin: 10px 0 0; color: var(--pl-ink-2); font: 12px/1.5 var(--font-mono); letter-spacing: .05em; }
+  .pl-foot-nav { display: flex; flex-wrap: wrap; align-content: start; gap: 6px 22px; font: 12.5px/1.4 var(--font-mono); letter-spacing: .08em; text-transform: uppercase; }
+  .pl-foot-nav a { padding: 4px 0; text-decoration: none; }
+  .pl-foot-nav a:hover { color: var(--pl-blue); text-decoration: underline; text-underline-offset: 4px; }
+  .pl-foot-note { grid-column: 1 / -1; margin: 0; padding-top: 16px; border-top: 1px solid #c9c7b6; color: var(--pl-ink-2); font: 12px/1.6 var(--font-mono); }
+
+  @keyframes pl-pulse { 50% { opacity: .3; } }
+
+  @media (min-width: 480px) {
+    .pl-env div { grid-template-columns: 10.5rem minmax(0, 1fr); }
+  }
+  @media (min-width: 560px) {
+    .pl-wide-only { display: inline; }
+  }
+  @media (min-width: 640px) {
+    .pl-ledger div { grid-template-columns: minmax(10rem, 14rem) minmax(0, 1fr); }
+    .pl-step { grid-template-columns: 3.25rem minmax(0, 1fr); }
+    .pl-step-n { grid-row: 1 / span 3; }
+    .pl-step p, .pl-cmd { grid-column: 2; }
+    .pl-cmd code { font-size: 15px; }
+    .pl-plan pre { font-size: 13.5px; }
+  }
+  @media (min-width: 720px) {
+    .pl-notes { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (min-width: 760px) {
+    .pl-meta { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .pl-meta li:nth-child(2) { text-align: center; }
+    .pl-meta li:nth-child(3) { text-align: right; }
+    .pl-stack-cols { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .pl-stack dl div { grid-template-columns: 6.25rem minmax(0, 1fr); }
+  }
+  @media (min-width: 860px) {
+    .pl-facts { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .pl-facts a { height: 100%; padding: 22px 22px 4px 0; border-bottom: 0; }
+    .pl-facts li + li a { padding-left: 22px; border-left: 1px solid var(--pl-hair); }
+  }
+  @media (min-width: 900px) {
+    .pl-life li { grid-template-columns: 4rem minmax(0, 5fr) minmax(0, 7fr); align-items: start; column-gap: 28px; }
+    .pl-life-result { grid-column: 3; padding-top: .3em; }
+    .pl-life-notes { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .pl-foot-grid { grid-template-columns: minmax(0, 1fr) minmax(0, 30rem); }
+    .pl-foot-nav { justify-content: flex-end; }
+  }
+  @media (min-width: 960px) {
+    .pl-top { grid-template-columns: auto minmax(0, 1fr) auto; grid-template-areas: 'brand nav cta'; gap: 20px 40px; padding: 22px 0; }
+    .pl-nav { justify-content: center; gap: 4px 32px; padding-top: 0; border-top: 0; }
+    .pl-head { grid-template-columns: repeat(12, minmax(0, 1fr)); align-items: start; column-gap: 24px; padding-top: 20px; }
+    .pl-num { grid-column: 1 / span 3; grid-row: 1 / span 3; font-size: clamp(7rem, 12.5vw, 12rem); }
+    .pl-kicker { grid-column: 4 / -1; margin-top: 6px; }
+    .pl-h2 { grid-column: 4 / -1; margin-top: 16px; }
+    .pl-lead { grid-column: 4 / span 7; }
+    .pl-shell-grid { grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); }
+  }
+  @media (min-width: 1000px) {
+    .pl-crop { display: block; }
+  }
+  @media (min-width: 1024px) {
+    .pl-modes { grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); }
+  }
+  @media (min-width: 1100px) {
+    .pl-strip-grid { grid-template-columns: auto minmax(0, 1fr) minmax(16rem, 24rem); }
+    .pl-notes { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .pl-stack-side { grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: start; gap: 32px; }
+    .pl-env div { grid-template-columns: minmax(0, 1fr); }
+    .pl-install-grid { grid-template-columns: minmax(0, 7fr) minmax(0, 4fr); align-items: start; gap: 56px; }
+  }
+  @media (min-width: 1280px) {
+    .pl-hero-grid { grid-template-columns: minmax(0, 1fr) minmax(17rem, 22rem); align-items: end; }
+    .pl-hero-aside { padding-bottom: .4rem; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .pl-pulse { animation: none; }
+  }
+</style>
+
+<script>
+  const copyStatus = document.querySelector<HTMLElement>('[data-copy-status]');
+  for (const button of document.querySelectorAll<HTMLButtonElement>('button[data-copy]')) {
+    const idle = button.textContent ?? 'Copy';
+    let reset = 0;
+    button.addEventListener('click', async () => {
+      const text = button.dataset.copy ?? '';
+      let copied = false;
+      try {
+        if (!window.isSecureContext || !navigator.clipboard) throw new Error('Clipboard unavailable');
+        await navigator.clipboard.writeText(text);
+        copied = true;
+      } catch {
+        // Denied or unavailable: select the command so it can be copied by hand.
+        const code = button.closest('[data-command]')?.querySelector('code');
+        if (code) window.getSelection()?.selectAllChildren(code);
+      }
+      button.textContent = copied ? 'Copied' : 'Not copied';
+      button.dataset.result = copied ? 'copied' : 'denied';
+      if (copyStatus) {
+        copyStatus.textContent = copied
+          ? `Copied “${text}” to the clipboard.`
+          : `Clipboard access was blocked, so “${text}” is selected instead. Copy it with Ctrl+C or ⌘C.`;
+      }
+      window.clearTimeout(reset);
+      reset = window.setTimeout(() => {
+        button.textContent = idle;
+        delete button.dataset.result;
+      }, 2600);
+    });
+  }
+</script>

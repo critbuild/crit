@@ -1,0 +1,70 @@
+---
+/** Fig. 1 — a hand-plotted branch graph where each branch ends in its own tab. */
+const mainCommits = [80, 150, 220, 290, 360, 430, 500];
+const featureCommits = [340, 410, 480];
+const fixCommits = [480];
+---
+<div class="bf-scroll" tabindex="0" aria-label="Scrollable figure">
+  <svg class="bf" viewBox="0 0 760 320" role="img" aria-labelledby="bf-title bf-desc">
+    <title id="bf-title">One branch, one worktree, one tab</title>
+    <desc id="bf-desc">A commit graph. The main line runs left to right into a tab labelled main. Two branches, feat/login-fixes and fix/flaky-ci, fork from it and each run into their own tab: one with an OMP session working, one with an idle shell.</desc>
+
+    <!-- main -->
+    <path class="bf-line" d="M36 170 H 580" />
+    <text class="bf-branch" x="44" y="158">main</text>
+    {mainCommits.map((x) => <circle class="bf-commit" cx={x} cy="170" r="4.5" />)}
+
+    <!-- feat/login-fixes -->
+    <path class="bf-line" d="M220 170 C 258 170 262 80 300 80 H 580" />
+    <text class="bf-branch" x="300" y="68">feat/login-fixes</text>
+    {featureCommits.map((x) => <circle class="bf-commit bf-commit-accent" cx={x} cy="80" r="4.5" />)}
+    <circle class="bf-fork" cx="220" cy="170" r="7" />
+
+    <!-- fix/flaky-ci -->
+    <path class="bf-line" d="M360 170 C 398 170 402 260 440 260 H 580" />
+    <text class="bf-branch" x="440" y="248">fix/flaky-ci</text>
+    {fixCommits.map((x) => <circle class="bf-commit bf-commit-accent" cx={x} cy="260" r="4.5" />)}
+    <circle class="bf-fork" cx="360" cy="170" r="7" />
+
+    <!-- rooms -->
+    <g class="bf-room">
+      <rect x="580" y="54" width="150" height="52" rx="5" />
+      <text class="bf-tab" x="594" y="76"><tspan class="bf-index">2</tspan> feat/login-fixes <tspan class="bf-mark">*</tspan></text>
+      <text class="bf-session" x="594" y="94">[omp 1 · working]</text>
+    </g>
+    <g class="bf-room">
+      <rect x="580" y="144" width="150" height="52" rx="5" />
+      <text class="bf-tab" x="594" y="166"><tspan class="bf-index">1</tspan> main <tspan class="bf-mark bf-mark-idle">·</tspan></text>
+      <text class="bf-session" x="594" y="184">shell 1 · idle</text>
+    </g>
+    <g class="bf-room">
+      <rect x="580" y="234" width="150" height="52" rx="5" />
+      <text class="bf-tab" x="594" y="256"><tspan class="bf-index">3</tspan> fix/flaky-ci <tspan class="bf-mark bf-mark-idle">·</tspan></text>
+      <text class="bf-session" x="594" y="274">[shell 1 · idle]</text>
+    </g>
+
+    <!-- annotations -->
+    <text class="bf-note" x="36" y="304">one repository · one .git · three checkouts on disk</text>
+    <text class="bf-note bf-note-accent" x="580" y="38">one tab each</text>
+    <text class="bf-note bf-note-accent" x="186" y="200">worktree create</text>
+  </svg>
+</div>
+
+<style>
+  .bf-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  .bf-scroll:focus-visible { outline-offset: 2px; }
+  .bf { display: block; width: 100%; height: auto; min-width: 600px; font-family: var(--font-mono); }
+  .bf-line { fill: none; stroke: var(--fn-ink, #1c1917); stroke-width: 1.5; }
+  .bf-commit { fill: var(--fn-paper, #f2ede2); stroke: var(--fn-ink, #1c1917); stroke-width: 1.5; }
+  .bf-commit-accent { fill: var(--fn-orange, #bf4a14); stroke: var(--fn-orange, #bf4a14); }
+  .bf-fork { fill: none; stroke: var(--fn-orange, #bf4a14); stroke-width: 1.5; stroke-dasharray: 2 2; }
+  .bf-branch { font-size: 12px; fill: var(--fn-ink-2, #4b453d); }
+  .bf-room rect { fill: var(--fn-card, #faf7f0); stroke: var(--fn-ink, #1c1917); stroke-width: 1.2; }
+  .bf-tab { font-size: 12px; font-weight: 700; fill: var(--fn-ink, #1c1917); }
+  .bf-index { font-weight: 400; fill: var(--fn-ink-3, #857b6d); }
+  .bf-mark { fill: var(--fn-orange, #bf4a14); }
+  .bf-mark-idle { fill: var(--fn-ink-3, #857b6d); }
+  .bf-session { font-size: 11px; fill: var(--fn-ink-3, #857b6d); }
+  .bf-note { font-size: 11px; fill: var(--fn-ink-3, #857b6d); letter-spacing: .04em; }
+  .bf-note-accent { fill: var(--fn-orange, #bf4a14); }
+</style>

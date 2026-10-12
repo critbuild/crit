@@ -1,0 +1,131 @@
+---
+/**
+ * Illustrative rendering of Crit's F1 launcher. Strings follow the real
+ * dialog: the heading, model line, example prompts, the `›` input line and
+ * the footer. In manual mode it shows the F2 list instead.
+ */
+interface Props {
+  mode?: 'ask' | 'manual';
+  input?: string;
+  question?: string;
+  status?: string;
+  plan?: string;
+  items?: string[];
+  selected?: number;
+}
+const {
+  mode = 'ask',
+  input = '',
+  question,
+  status = 'Enter to act · destructive actions still require confirmation.',
+  plan,
+  items = [],
+  selected = 0,
+} = Astro.props;
+const examples = [
+  'Start a branch for login fixes in a separate worktree.',
+  'Open the API project with OpenCode.',
+  "Show this workspace's logs.",
+];
+---
+<div class="lx" data-mode={mode}>
+  <div class="lx-title"><span>{mode === 'ask' ? 'Ask Crit' : 'Manual controls'}</span><span class="lx-key">{mode === 'ask' ? 'F1' : 'F1 then F2'}</span></div>
+  {mode === 'ask' ? (
+    <div class="lx-body">
+      <p class="lx-lead">Describe what you want. Crit handles the workspace.</p>
+      <p class="lx-muted">Haiku 5.5 · current project and focused workspace</p>
+      {question ? (
+        <p class="lx-question">{question}</p>
+      ) : (
+        <p class="lx-muted lx-examples">{examples.map((example) => <span>{example}</span>)}</p>
+      )}
+      <p class="lx-input"><span class="lx-glyph" aria-hidden="true">› </span>{input}<span class="lx-cursor" aria-hidden="true" /></p>
+      <p class="lx-muted">{status}</p>
+      <p class="lx-muted lx-foot">Enter send · Esc cancel · Ctrl+U clear · F2 manual controls</p>
+    </div>
+  ) : (
+    <div class="lx-body">
+      <ol class="lx-list">
+        {items.map((item, index) => (
+          <li data-selected={index === selected ? '' : undefined}>{index === selected ? '› ' : '  '}{item}</li>
+        ))}
+      </ol>
+      <p class="lx-muted lx-foot">↑/↓ select · Enter · Esc · no model involved</p>
+    </div>
+  )}
+  {plan && (
+    <p class="lx-plan">
+      <span class="lx-plan-label">plan</span>
+      <code>{plan}</code>
+    </p>
+  )}
+</div>
+
+<style>
+  .lx {
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.6;
+    color: var(--fn-ink, #1c1917);
+  }
+  .lx-title {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    padding: 6px 14px;
+    border: 1px solid var(--fn-ink, #1c1917);
+    border-bottom: 0;
+    border-radius: 6px 6px 0 0;
+    background: var(--fn-paper-2, #ece5d6);
+    font-weight: 700;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+    font-size: 11px;
+  }
+  .lx-key { font-weight: 400; color: var(--fn-orange, #bf4a14); }
+  .lx-body {
+    padding: 12px 14px 10px;
+    border: 1px solid var(--fn-ink, #1c1917);
+    border-radius: 0 0 6px 6px;
+    background: var(--fn-card, #faf7f0);
+  }
+  .lx-body p { margin: 0; overflow-wrap: anywhere; }
+  .lx-lead { font-weight: 700; }
+  .lx-muted { color: var(--fn-ink-3, #857b6d); }
+  .lx-examples { display: grid; margin-top: 10px !important; }
+  .lx-question { margin-top: 10px !important; color: var(--fn-orange, #bf4a14); }
+  .lx-input {
+    margin: 8px 0 !important;
+    padding: 6px 10px;
+    border: 1px solid var(--fn-rule-2, #c4b79f);
+    border-radius: 4px;
+    background: #fff;
+    color: var(--fn-ink, #1c1917);
+  }
+  .lx-glyph { color: var(--fn-orange, #bf4a14); font-weight: 700; }
+  .lx-cursor { display: inline-block; width: .6em; height: 1.05em; vertical-align: -0.15em; margin-left: 1px; background: var(--fn-ink, #1c1917); }
+  .lx-foot { margin-top: 8px !important; font-size: 11px; }
+  .lx-list { list-style: none; margin: 0; padding: 0; white-space: pre; }
+  .lx-list li { color: var(--fn-ink-3, #857b6d); }
+  .lx-list li[data-selected] { color: var(--fn-orange, #bf4a14); font-weight: 700; }
+  .lx-plan {
+    display: flex;
+    gap: 10px;
+    align-items: baseline;
+    margin: 10px 0 0;
+    font-size: 11.5px;
+    color: var(--fn-ink-2, #4b453d);
+  }
+  .lx-plan-label {
+    flex: none;
+    padding: 1px 6px;
+    border-radius: 3px;
+    background: var(--fn-orange, #bf4a14);
+    color: #fff8f0;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+  }
+  .lx-plan code { font: inherit; overflow-wrap: anywhere; }
+</style>

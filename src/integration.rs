@@ -24,12 +24,24 @@ pub enum AgentState {
     Exited,
 }
 
+/// Unknown preserves the last identity; Clear is an authoritative no-chat selection.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", content = "identity", rename_all = "lowercase")]
+pub enum ResumeUpdate {
+    #[default]
+    Unknown,
+    Clear,
+    Selected(String),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentUpdate {
     pub session: u64,
     pub state: AgentState,
     pub message: Option<String>,
+    #[serde(default)]
+    pub resume: ResumeUpdate,
 }
 
 pub struct IntegrationServer {
@@ -88,7 +100,7 @@ pub fn start(tx: SyncSender<crate::event::Event>) -> Result<IntegrationServer> {
         thread::Builder::new()
             .name("crit-integrations".into())
             .spawn(move || {
-                let mut previous = HashMap::<u64, (AgentState, Option<String>)>::new();
+                let mut previous = HashMap::<u64, AgentUpdate>::new();
                 while !stop.load(Ordering::Acquire) {
                     let mut stream = match listener.accept() {
                         Ok((stream, _)) => stream,
@@ -101,12 +113,10 @@ pub fn start(tx: SyncSender<crate::event::Event>) -> Result<IntegrationServer> {
                     let Ok(update) = read_update(&mut stream) else {
                         continue;
                     };
-                    let duplicate = previous
-                        .get(&update.session)
-                        .is_some_and(|last| last.0 == update.state && last.1 == update.message);
+                    let duplicate = previous.get(&update.session) == Some(&update);
                     if !duplicate {
                         let session = update.session;
-                        let last = (update.state, update.message.clone());
+                        let last = update.clone();
                         let mut event = crate::event::Event::Agent(update);
                         loop {
                             if stop.load(Ordering::Acquire) {
@@ -164,6 +174,11 @@ fn read_update(stream: &mut UnixStream) -> Result<AgentUpdate> {
                 .is_some_and(|message| message.len() > 4096)
             {
                 bail!("lifecycle message is too long");
+            }
+            if let ResumeUpdate::Selected(identity) = &update.resume
+                && (identity.is_empty() || identity.len() > 4096 || identity.contains('\0'))
+            {
+                bail!("invalid resume identity");
             }
             return Ok(update);
         }
@@ -340,6 +355,7 @@ pub fn command(
     kind: &str,
     session: u64,
     socket: &Path,
+    resume: Option<&str>,
 ) -> Result<(String, Vec<String>, Vec<(String, String)>)> {
     if !matches!(kind, "omp" | "opencode") {
         bail!("unsupported agent {kind:?}; expected omp or opencode");
@@ -358,6 +374,10 @@ pub fn command(
         ),
         ("CRIT_AGENT_PID".into(), String::new()),
     ];
+    if let Some(identity) = resume {
+        validate_resume(kind, identity)?;
+        env.push(("CRIT_RESUME_ID".into(), identity.into()));
+    }
     let mut args = Vec::new();
     if kind == "omp" {
         args.push("--extension".into());
@@ -368,7 +388,13 @@ pub fn command(
                 .context("extension path is not UTF-8")?
                 .into(),
         );
+        if let Some(identity) = resume {
+            args.extend(["--resume".into(), identity.into()]);
+        }
     } else {
+        if let Some(identity) = resume {
+            args.extend(["--session".into(), identity.into()]);
+        }
         let mut config = parse_config(
             &std::env::var("OPENCODE_CONFIG_CONTENT").unwrap_or_else(|_| "{}".into()),
             "OPENCODE_CONFIG_CONTENT",
@@ -419,6 +445,74 @@ pub fn command(
         ));
     }
     Ok((kind.into(), args, env))
+}
+
+fn validate_resume(kind: &str, identity: &str) -> Result<()> {
+    use std::io::BufRead;
+    if identity.is_empty() || identity.len() > 4096 || identity.contains('\0') {
+        bail!("invalid {kind} resume identity");
+    }
+    if kind == "omp" {
+        let path = Path::new(identity);
+        if !path.is_absolute() {
+            bail!("OMP resume target must be an absolute session file path");
+        }
+        let file =
+            fs::File::open(path).with_context(|| format!("opening saved OMP chat {identity}"))?;
+        if !file.metadata()?.is_file() {
+            bail!("saved OMP chat is not a regular file: {identity}");
+        }
+        // OMP treats missing/empty/invalid-header files as new chats. Refuse that
+        // fallback; inspect only the header, never copy the conversation.
+        let mut reader = std::io::BufReader::new(file).take(1024 * 1024);
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
+        let mut header: Value = serde_json::from_str(&line)
+            .with_context(|| format!("reading saved OMP chat header {identity}"))?;
+        // Current OMP puts a fixed title slot before the header; legacy files
+        // start directly with the header. Match its title-slot discriminator.
+        if header["type"] == "title"
+            && header["v"] == 1
+            && header["title"].is_string()
+            && header["updatedAt"].is_string()
+            && header["pad"].is_string()
+            && (header.get("source").is_none()
+                || matches!(header["source"].as_str(), Some("auto" | "user")))
+        {
+            line.clear();
+            reader.read_line(&mut line)?;
+            header = serde_json::from_str(&line)
+                .with_context(|| format!("reading saved OMP chat header {identity}"))?;
+        }
+        // OMP's header predicate requires only type/id; cwd/version were optional
+        // in older journals and are filled by its migration layer.
+        if header["type"] != "session" || !header["id"].is_string() {
+            bail!("saved OMP chat has no valid session header: {identity}");
+        }
+    } else {
+        // OpenCode's missing-session TUI route falls back to Home. Check the
+        // native database through its CLI, requesting only this ID's metadata.
+        let query = format!(
+            "SELECT id FROM session WHERE id = '{}' LIMIT 1",
+            identity.replace('\'', "''")
+        );
+        let output = std::process::Command::new("opencode")
+            .args(["db", "--format", "json", &query])
+            .output()
+            .context("checking saved OpenCode chat")?;
+        if !output.status.success() {
+            bail!("could not check saved OpenCode chat {identity}");
+        }
+        let rows: Value = serde_json::from_slice(&output.stdout)
+            .context("reading OpenCode chat existence result")?;
+        if !rows
+            .as_array()
+            .is_some_and(|rows| rows.len() == 1 && rows[0]["id"].as_str() == Some(identity))
+        {
+            bail!("saved OpenCode chat does not exist: {identity}");
+        }
+    }
+    Ok(())
 }
 
 fn substitute_tui_config(text: &str, base: &Path) -> Result<String> {
@@ -480,6 +574,54 @@ mod tests {
         client.write_all(frame).unwrap();
         let mut ack = [0];
         client.read_exact(&mut ack).is_ok() && ack == [b'\n']
+    }
+
+    #[test]
+    fn identity_only_updates_and_authoritative_clear_are_not_duplicates() {
+        let (tx, rx) = mpsc::sync_channel(4);
+        let server = start(tx).unwrap();
+        for resume in [
+            json!({"status": "selected", "identity": "/sessions/first.jsonl"}),
+            json!({"status": "selected", "identity": "/sessions/second.jsonl"}),
+            json!({"status": "clear"}),
+            json!({"status": "unknown"}),
+        ] {
+            let mut frame = serde_json::to_vec(&json!({
+                "session": 7, "state": "idle", "message": null, "resume": resume,
+            }))
+            .unwrap();
+            frame.push(b'\n');
+            assert!(send(&server.socket_path, &frame));
+            let crate::event::Event::Agent(update) =
+                rx.recv_timeout(Duration::from_secs(1)).unwrap()
+            else {
+                panic!("expected identity update");
+            };
+            assert_eq!(serde_json::to_value(update.resume).unwrap(), resume);
+            assert!(send(&server.socket_path, &frame));
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
+    fn omp_restore_refuses_missing_empty_and_invalid_session_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("exact chat ' name.jsonl");
+        let identity = file.to_str().unwrap();
+        assert!(validate_resume("omp", identity).is_err());
+        fs::write(&file, "").unwrap();
+        assert!(validate_resume("omp", identity).is_err());
+        fs::write(&file, "{\"type\":\"message\"}\n").unwrap();
+        assert!(validate_resume("omp", identity).is_err());
+        fs::write(
+            &file,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"exact\",\"cwd\":\"/tmp\"}\n",
+        )
+        .unwrap();
+        assert!(validate_resume("omp", identity).is_ok());
+        fs::write(&file, "{\"type\":\"title\",\"v\":1,\"title\":\"Chat\",\"updatedAt\":\"2026-10-11\",\"pad\":\"\"}\n{\"type\":\"session\",\"id\":\"legacy\"}\n").unwrap();
+        assert!(validate_resume("omp", identity).is_ok());
+        assert!(validate_resume("omp", "relative.jsonl").is_err());
     }
 
     #[test]

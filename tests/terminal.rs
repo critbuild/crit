@@ -14,6 +14,32 @@ impl Drop for ChildGuard {
     }
 }
 
+fn drive_until(
+    writer: &mut impl Write,
+    rx: &mpsc::Receiver<Vec<u8>>,
+    screen: &mut vt100::Parser,
+    input: &[u8],
+    ready: impl Fn(&str) -> bool,
+) {
+    writer.write_all(input).unwrap();
+    writer.flush().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if ready(&screen.screen().contents()) {
+            return;
+        }
+        let bytes = rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "terminal interaction did not complete: {error}\n{}",
+                    screen.screen().contents()
+                )
+            });
+        screen.process(&bytes);
+    }
+}
+
 #[test]
 fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_selection() {
     let home = tempfile::tempdir().unwrap();
@@ -111,6 +137,7 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
             .unwrap();
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_crit"));
         command.arg("--no-kitty");
+        command.arg("--fresh");
         if direct_start {
             command.args(["--agent", "shell"]);
         }
@@ -200,6 +227,84 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
             had_git_metadata,
             "opening a terminal must not create Git metadata",
         );
+        if direct_start && cwd == repo {
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                b"\x1bOP\x1bOQ\x1b[H\x1b[B\x1b[B\x1b[B\rmain\r",
+                |contents| contents.contains("│› main") && contents.contains("already"),
+            );
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b", |contents| {
+                !contents.contains("│› main")
+            });
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                b"\x1b[44;6uintegration-split\r",
+                |contents| {
+                    contents.lines().nth(1).is_some_and(|header| {
+                        header.contains("│") && header.contains("› integration-split")
+                    })
+                },
+            );
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                b"\x1bOP\x1bOQ\x1b[H\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\x1b[B\r",
+                |contents| {
+                    contents.lines().nth(1).is_some_and(|header| {
+                        header.trim_start().starts_with("› integration-split")
+                            && !header.contains("│")
+                    })
+                },
+            );
+            for _ in 0..9 {
+                writer.write_all(b"\x1b[13;6u\x1b[B\x1b[B\r").unwrap();
+            }
+            drive_until(&mut writer, &rx, &mut screen, b"", |contents| {
+                contents
+                    .lines()
+                    .nth(1)
+                    .is_some_and(|header| header.contains("[shell 10"))
+            });
+            pair.master
+                .resize(PtySize {
+                    rows: 9,
+                    cols: 29,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap();
+            screen.screen_mut().set_size(9, 29);
+            drive_until(&mut writer, &rx, &mut screen, b"", |contents| {
+                contents.contains("enlarge")
+            });
+            writer.write_all(b"\x1b[21~y").unwrap();
+            writer.flush().unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "invisible confirmation terminated the application"
+            );
+            pair.master
+                .resize(PtySize {
+                    rows: 24,
+                    cols: 100,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap();
+            screen.screen_mut().set_size(24, 100);
+            drive_until(&mut writer, &rx, &mut screen, b"", |contents| {
+                contents
+                    .lines()
+                    .nth(1)
+                    .is_some_and(|header| header.trim_start().starts_with("› integration-split"))
+            });
+        }
         writer.write_all(b"\x1b[21~y").unwrap();
         writer.flush().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);

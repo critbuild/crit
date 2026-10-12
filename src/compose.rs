@@ -7,8 +7,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -251,18 +252,300 @@ fn checked(command: &mut Command, operation: &str) -> Result<Output> {
     Ok(output)
 }
 
+/// Prepare ignored Compose inputs using an explicit checkout of the same repository.
+/// This is an environment operation: failure does not invalidate a created worktree.
+/// Retrying is safe; existing regular target files are never overwritten.
+pub fn prepare_local_files(source: &Worktree, target: &Worktree) -> Result<()> {
+    let source_repository = crate::worktree::discover(&source.path)?;
+    let target_repository = crate::worktree::discover(&target.path)?;
+    ensure!(
+        source_repository.common_dir == target_repository.common_dir,
+        "local Compose configuration source belongs to a different repository"
+    );
+    ensure!(
+        source.path != target.path,
+        "configuration source must be another checkout"
+    );
+    copy_local_file(&source.path, &target.path, Path::new("crit.toml"))?;
+    if !has_config(source) && !has_config(target) {
+        return Ok(());
+    }
+    copy_local_file(&source.path, &target.path, Path::new(".env"))?;
+    // Bootstrap only the manifests Crit actually selects, including a local override.
+    // A tracked file absent in the target branch must remain absent.
+    if has_config(source) {
+        for file in compose_files(source, &settings(source)?)? {
+            let relative = local_relative(&source.path, &file)?;
+            copy_local_file(&source.path, &target.path, &relative)?;
+        }
+    }
+    if !has_config(target) {
+        return Ok(());
+    }
+    let settings = settings(target)?;
+    if let Some(files) = &settings.files {
+        for file in files {
+            let relative = local_relative(&target.path, file)?;
+            copy_local_file(&source.path, &target.path, &relative)?;
+        }
+    }
+    let files = compose_files(target, &settings)?;
+    let directory = files[0]
+        .parent()
+        .context("Compose file has no parent directory")?;
+    for file in &files {
+        let relative = local_relative(&target.path, file)?;
+        // Also reject symlinked manifests: discovery must not read another checkout.
+        secure_file(&target.path, &relative, false)?;
+    }
+    let project_env = local_relative(&target.path, &directory.join(".env"))?;
+    copy_local_file(&source.path, &target.path, &project_env)?;
+    let mut command = config_command(target, &files, "crit-local-inputs")?;
+    command.arg("--no-env-resolution");
+    let output = checked(&mut command, "discover local Compose env files")?;
+    let config: Value = serde_json::from_slice(&output.stdout)
+        .context("Docker Compose returned invalid config JSON")?;
+    for relative in env_files(&config, &target.path, directory)? {
+        copy_local_file(&source.path, &target.path, &relative)?;
+    }
+    Ok(())
+}
+
+fn local_relative(root: &Path, path: &Path) -> Result<PathBuf> {
+    let path = if path.is_absolute() {
+        path.strip_prefix(root)
+            .context("local Compose input is outside the checkout")?
+    } else {
+        path
+    };
+    let mut relative = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(name) => relative.push(name),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                ensure!(relative.pop(), "local Compose input escapes the checkout");
+            }
+            _ => bail!("local Compose input escapes the checkout"),
+        }
+    }
+    ensure!(
+        !relative.as_os_str().is_empty(),
+        "local Compose input is not a file"
+    );
+    Ok(relative)
+}
+
+fn env_files(config: &Value, root: &Path, directory: &Path) -> Result<BTreeSet<PathBuf>> {
+    let mut files = BTreeSet::new();
+    for service in services(config)?.values() {
+        if let Some(values) = service.get("env_file") {
+            for value in values
+                .as_array()
+                .context("Compose env_file must be an array")?
+            {
+                let path = value
+                    .as_str()
+                    .or_else(|| value.get("path").and_then(Value::as_str))
+                    .context("Compose env_file has no path")?;
+                files.insert(local_relative(root, &directory.join(path))?);
+            }
+        }
+    }
+    Ok(files)
+}
+
+// Walk directory descriptors, not canonicalized strings, so symlink substitution
+// cannot redirect reads or writes between validation and copying.
+fn secure_parent(
+    root: &Path,
+    relative: &Path,
+    create: bool,
+) -> Result<Option<(fs::File, std::ffi::CString)>> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let relative = local_relative(root, relative)?;
+    let mut directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(root)?;
+    let parts: Vec<_> = relative.components().collect();
+    for (index, component) in parts.iter().enumerate() {
+        let name = CString::new(component.as_os_str().as_bytes())?;
+        if index + 1 == parts.len() {
+            return Ok(Some((directory, name)));
+        }
+        let flags = libc::O_RDONLY | libc::O_DIRECTORY;
+        let mut fd = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0
+            && create
+            && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
+        {
+            let result = unsafe { libc::mkdirat(directory.as_raw_fd(), name.as_ptr(), 0o700) };
+            if result < 0
+                && std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(std::io::Error::last_os_error())
+                    .context("create local configuration directory");
+            }
+            fd = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )
+            };
+        }
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if !create && error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(error)
+                .with_context(|| format!("open local configuration {}", relative.display()));
+        }
+        let file = unsafe { fs::File::from_raw_fd(fd) };
+        ensure!(
+            file.metadata()?.is_dir(),
+            "local Compose input parent is not a directory"
+        );
+        directory = file;
+    }
+    unreachable!("validated nonempty relative file path")
+}
+
+fn secure_file(root: &Path, relative: &Path, create: bool) -> Result<Option<fs::File>> {
+    let Some((directory, name)) = secure_parent(root, relative, create)? else {
+        return Ok(None);
+    };
+    let flags = if create {
+        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL
+    } else {
+        libc::O_RDONLY | libc::O_NONBLOCK
+    };
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if !create && error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(error)
+            .with_context(|| format!("open local configuration {}", relative.display()));
+    }
+    let file = unsafe { fs::File::from_raw_fd(fd) };
+    ensure!(
+        file.metadata()?.is_file(),
+        "local Compose input is not a regular file: {}",
+        relative.display()
+    );
+    Ok(Some(file))
+}
+
+fn copy_local_file(source: &Path, target: &Path, relative: &Path) -> Result<()> {
+    let relative = local_relative(target, relative)?;
+    if let Some(existing) = secure_file(target, &relative, false)? {
+        // An existing hard link to the source is not an independent local copy.
+        if let Some(original) = secure_file(source, &relative, false)? {
+            use std::os::unix::fs::MetadataExt;
+            let a = existing.metadata()?;
+            let b = original.metadata()?;
+            ensure!(
+                a.dev() != b.dev() || a.ino() != b.ino(),
+                "target Compose input shares the source file"
+            );
+        }
+        return Ok(());
+    }
+    if !crate::worktree::ignored_local_file(source, &relative)?
+        || !crate::worktree::ignored_local_file(target, &relative)?
+    {
+        return Ok(());
+    }
+    let Some(mut input) = secure_file(source, &relative, false)? else {
+        return Ok(());
+    };
+    let (directory, name) =
+        secure_parent(target, &relative, true)?.context("create local Compose directory")?;
+    static COPY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+    let temporary = std::ffi::CString::new(format!(
+        ".crit-copy-{}-{}",
+        std::process::id(),
+        COPY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            temporary.as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    ensure!(
+        fd >= 0,
+        "create temporary local Compose input: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut output = unsafe { fs::File::from_raw_fd(fd) };
+    let result = (|| -> Result<()> {
+        std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        let result = unsafe {
+            libc::renameat2(
+                directory.as_raw_fd(),
+                temporary.as_ptr(),
+                directory.as_raw_fd(),
+                name.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result < 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("publish local Compose input without replacing existing file");
+        }
+        Ok(())
+    })();
+    // The directory descriptor keeps cleanup inside the validated checkout.
+    unsafe {
+        libc::unlinkat(directory.as_raw_fd(), temporary.as_ptr(), 0);
+    }
+    result.with_context(|| format!("copy local Compose input {}", relative.display()))?;
+    Ok(())
+}
+
+fn config_command(worktree: &Worktree, files: &[PathBuf], project: &str) -> Result<Command> {
+    let directory = files[0]
+        .parent()
+        .context("Compose file has no parent directory")?;
+    let mut command = docker(worktree, project);
+    command.args(["compose", "--project-name", project]);
+    command.arg("--project-directory").arg(directory);
+    for file in files {
+        command.arg("--file").arg(file);
+    }
+    command.args(["config", "--format", "json"]);
+    Ok(command)
+}
+
 fn resolved(worktree: &Worktree, settings: &Settings, manifest: &Manifest) -> Result<Value> {
     let files = compose_files(worktree, settings)?;
     let directory = files[0]
         .parent()
         .context("Compose file has no parent directory")?;
-    let mut command = docker(worktree, &manifest.project);
-    command.args(["compose", "--project-name", &manifest.project]);
-    command.arg("--project-directory").arg(directory);
-    for file in &files {
-        command.arg("--file").arg(file);
-    }
-    command.args(["config", "--format", "json"]);
+    let mut command = config_command(worktree, &files, &manifest.project)?;
     let output = checked(&mut command, "resolve Compose configuration")?;
     let mut config: Value = serde_json::from_slice(&output.stdout)
         .context("Docker Compose returned invalid config JSON")?;
@@ -881,6 +1164,220 @@ pub fn logs_args(worktree: &Worktree) -> Result<Vec<String>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn local_fixture() -> (tempfile::TempDir, Worktree, Worktree) {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("source");
+        fs::create_dir(&root).unwrap();
+        let run = |arguments: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&root)
+                    .args(arguments)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        run(&["init", "-b", "main"]);
+        fs::write(
+            root.join(".gitignore"),
+            ".env\ncrit.toml\n*.override.yml\n/env/\n",
+        )
+        .unwrap();
+        run(&["add", ".gitignore"]);
+        run(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-m",
+            "fixture",
+        ]);
+        let repository = crate::worktree::discover(&root).unwrap();
+        let source = crate::worktree::list(&repository).unwrap().remove(0);
+        let target = crate::worktree::create(&repository, "copy-test", None).unwrap();
+        (directory, source, target)
+    }
+
+    #[test]
+    fn local_env_copies_are_private_independent_and_preserve_existing_files() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (_directory, source, target) = local_fixture();
+        fs::create_dir(source.path.join("env")).unwrap();
+        fs::write(source.path.join("env/keycloak.env"), "SECRET=source\n").unwrap();
+        fs::write(source.path.join("env/database.db"), "not an env input").unwrap();
+        let config = json!({"services": {"auth": {"env_file": [
+            {"path": target.path.join("env/keycloak.env"), "required": true}
+        ]}}});
+        for path in env_files(&config, &target.path, &target.path).unwrap() {
+            copy_local_file(&source.path, &target.path, &path).unwrap();
+        }
+        let copied = target.path.join("env/keycloak.env");
+        assert_eq!(fs::read_to_string(&copied).unwrap(), "SECRET=source\n");
+        assert_eq!(
+            fs::metadata(&copied).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_ne!(
+            fs::metadata(&copied).unwrap().ino(),
+            fs::metadata(source.path.join("env/keycloak.env"))
+                .unwrap()
+                .ino()
+        );
+        assert!(!target.path.join("env/database.db").exists());
+        fs::write(&copied, "SECRET=target\n").unwrap();
+        copy_local_file(&source.path, &target.path, Path::new("env/keycloak.env")).unwrap();
+        assert_eq!(fs::read_to_string(&copied).unwrap(), "SECRET=target\n");
+        assert_eq!(
+            fs::read_to_string(source.path.join("env/keycloak.env")).unwrap(),
+            "SECRET=source\n"
+        );
+    }
+
+    #[test]
+    fn local_copy_rejects_escapes_symlinks_and_shared_hardlinks() {
+        use std::os::unix::fs::symlink;
+        let (directory, source, target) = local_fixture();
+        let outside = directory.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("secret.env"), "outside").unwrap();
+        assert!(local_relative(&target.path, Path::new("../outside/secret.env")).is_err());
+        assert!(
+            env_files(
+                &json!({"services": {"auth": {"env_file": [outside.join("secret.env")]}}}),
+                &target.path,
+                &target.path
+            )
+            .is_err()
+        );
+        symlink(&outside, source.path.join("env")).unwrap();
+        assert!(copy_local_file(&source.path, &target.path, Path::new("env/secret.env")).is_err());
+        fs::remove_file(source.path.join("env")).unwrap();
+        fs::create_dir(source.path.join("env")).unwrap();
+        fs::write(source.path.join("env/secret.env"), "source").unwrap();
+        symlink(&outside, target.path.join("env")).unwrap();
+        assert!(copy_local_file(&source.path, &target.path, Path::new("env/secret.env")).is_err());
+        fs::remove_file(target.path.join("env")).unwrap();
+        fs::create_dir(target.path.join("env")).unwrap();
+        symlink(
+            source.path.join("env/secret.env"),
+            target.path.join("env/secret.env"),
+        )
+        .unwrap();
+        assert!(copy_local_file(&source.path, &target.path, Path::new("env/secret.env")).is_err());
+        fs::remove_file(target.path.join("env/secret.env")).unwrap();
+        fs::hard_link(
+            source.path.join("env/secret.env"),
+            target.path.join("env/secret.env"),
+        )
+        .unwrap();
+        assert!(copy_local_file(&source.path, &target.path, Path::new("env/secret.env")).is_err());
+        assert_eq!(
+            fs::read_to_string(outside.join("secret.env")).unwrap(),
+            "outside"
+        );
+    }
+
+    #[test]
+    fn local_copy_does_not_restore_tracked_files_or_unignored_inputs() {
+        let (_directory, source, target) = local_fixture();
+        fs::write(source.path.join("plain.env"), "not ignored").unwrap();
+        copy_local_file(&source.path, &target.path, Path::new("plain.env")).unwrap();
+        assert!(!target.path.join("plain.env").exists());
+        fs::write(source.path.join(".env"), "tracked on source").unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&source.path)
+                .args(["add", "--force", ".env"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        copy_local_file(&source.path, &target.path, Path::new(".env")).unwrap();
+        assert!(!target.path.join(".env").exists());
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&source.path)
+                .args(["reset", "--", ".env"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::write(target.path.join(".env"), "tracked on target").unwrap();
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(&target.path)
+                .args(["add", "--force", ".env"])
+                .status()
+                .unwrap()
+                .success()
+        );
+        fs::remove_file(target.path.join(".env")).unwrap();
+        copy_local_file(&source.path, &target.path, Path::new(".env")).unwrap();
+        assert!(!target.path.join(".env").exists());
+    }
+
+    #[test]
+    fn preparation_rejects_unrelated_source_without_copying() {
+        let (_one, source, _unused) = local_fixture();
+        let (_two, _unused_source, target) = local_fixture();
+        fs::write(source.path.join(".env"), "SECRET=unrelated").unwrap();
+        assert!(
+            prepare_local_files(&source, &target)
+                .unwrap_err()
+                .to_string()
+                .contains("different repository")
+        );
+        assert!(!target.path.join(".env").exists());
+    }
+
+    #[test]
+    fn discovery_keeps_env_paths_in_target_and_uses_no_env_resolution() {
+        let (_directory, source, target) = local_fixture();
+        let files = vec![target.path.join("docker-compose.yml")];
+        let mut command = config_command(&target, &files, "crit-local-inputs").unwrap();
+        command.arg("--no-env-resolution");
+        let arguments: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(arguments.contains(&"--no-env-resolution".to_owned()));
+        assert_eq!(command.get_current_dir(), Some(target.path.as_path()));
+        let config = json!({"services": {"auth": {"env_file": ["env/keycloak.env", {"path": "./env/web.env", "required": false}]}}});
+        assert_eq!(
+            env_files(&config, &target.path, &target.path).unwrap(),
+            BTreeSet::from([
+                PathBuf::from("env/keycloak.env"),
+                PathBuf::from("env/web.env")
+            ])
+        );
+        assert!(
+            !arguments
+                .iter()
+                .any(|arg| arg.contains(source.path.to_str().unwrap()))
+        );
+    }
+
+    #[test]
+    fn preparation_uses_explicit_nonmain_checkout_for_local_configuration() {
+        let (_directory, main, target) = local_fixture();
+        let repository = crate::worktree::discover(&main.path).unwrap();
+        let source = crate::worktree::create(&repository, "source-branch", None).unwrap();
+        fs::write(main.path.join("crit.toml"), "# main config\n").unwrap();
+        fs::write(source.path.join("crit.toml"), "# split source config\n").unwrap();
+        // No Compose manifest: this exercises source identity without running Docker.
+        prepare_local_files(&source, &target).unwrap();
+        assert_eq!(
+            fs::read_to_string(target.path.join("crit.toml")).unwrap(),
+            "# split source config\n"
+        );
+    }
 
     #[test]
     fn isolation_names_resources_and_allocates_loopback_tcp_and_udp() {

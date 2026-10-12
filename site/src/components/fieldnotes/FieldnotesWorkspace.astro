@@ -1,0 +1,160 @@
+---
+/**
+ * Illustrative Crit workspace drawn in the Fieldnotes paper palette.
+ * Vocabulary mirrors the real TUI: a tab bar (project name, numbered
+ * worktree tabs with state marks), a workspace header per pane
+ * (`› label` plus `[kind n · state]` sessions) and a mono transcript.
+ * Everything is static markup so it works without JavaScript and with
+ * Astro's scoped styles.
+ */
+export type State = 'working' | 'idle' | 'input' | 'exited';
+export interface Tab { label: string; state: State; selected?: boolean; callout?: number }
+export interface Project { name: string; current?: boolean; tabs: Tab[] }
+export interface Session { kind: string; state: State; active?: boolean; callout?: number }
+export interface Line {
+  kind?: 'label' | 'agent' | 'cmd' | 'out' | 'dim' | 'cursor';
+  text: string;
+  callout?: number;
+}
+export interface Pane { label: string; focused?: boolean; sessions: Session[]; lines: Line[] }
+interface Props {
+  projects: Project[];
+  panes: Pane[];
+  split?: 'vertical' | 'horizontal';
+  description: string;
+}
+const MARK: Record<State, string> = { working: '*', idle: '·', input: '!', exited: 'x' };
+const { projects, panes, split = 'vertical', description } = Astro.props;
+---
+<div class="ws" data-split={split} role="group" aria-label={description}>
+  <div class="ws-tabs">
+    {projects.map((project, p) => (
+      <span class="ws-project" data-current={project.current ? '' : undefined}>
+        {p > 0 && <span class="ws-divider" aria-hidden="true">│</span>}
+        <span class="ws-project-name">{project.name}</span>
+        {project.tabs.map((tab, t) => (
+          <span class="ws-tab" data-selected={tab.selected ? '' : undefined} data-state={tab.state}>
+            <span class="ws-tab-index">{t + 1}</span>
+            <span class="ws-tab-label">{tab.label}</span>
+            <span class="ws-mark" aria-hidden="true">{MARK[tab.state]}</span>
+            {tab.callout && <span class="ws-callout">{tab.callout}</span>}
+          </span>
+        ))}
+      </span>
+    ))}
+  </div>
+  <div class="ws-panes">
+    {panes.map((pane) => (
+      <div class="ws-pane" data-focused={pane.focused ? '' : undefined}>
+        <div class="ws-head">
+          <span class="ws-label">{pane.focused ? '› ' : ''}{pane.label}</span>
+          {pane.sessions.map((session, s) => (
+            <span class="ws-session" data-active={session.active ? '' : undefined} data-state={session.state}>
+              {session.active ? '[' : ''}{session.kind} {s + 1} · {session.state}{session.active ? ']' : ''}
+              {session.callout && <span class="ws-callout">{session.callout}</span>}
+            </span>
+          ))}
+        </div>
+        <div class="ws-body">
+          {pane.lines.map((line) => (
+            <p class="ws-line" data-kind={line.kind ?? 'out'}>
+              {line.kind === 'agent' && <span class="ws-glyph" aria-hidden="true">› </span>}
+              {(line.kind === 'cmd' || line.kind === 'cursor') && <span class="ws-glyph" aria-hidden="true">$ </span>}
+              {line.text}
+              {line.kind === 'cursor' && <span class="ws-cursor" aria-hidden="true" />}
+              {line.callout && <span class="ws-callout">{line.callout}</span>}
+            </p>
+          ))}
+        </div>
+      </div>
+    ))}
+  </div>
+</div>
+
+<style>
+  .ws {
+    --ws-ink: var(--fn-ink, #1c1917);
+    --ws-muted: var(--fn-ink-3, #857b6d);
+    --ws-rule: var(--fn-rule, #d6cbb7);
+    --ws-accent: var(--fn-orange, #bf4a14);
+    --ws-bg: var(--fn-card, #faf7f0);
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--ws-ink);
+    background: var(--ws-bg);
+    border: 1px solid var(--ws-ink);
+    border-radius: 6px;
+    box-shadow: 8px 8px 0 -1px var(--ws-bg), 8px 8px 0 0 var(--ws-ink);
+    overflow: hidden;
+  }
+  .ws-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 2px 0;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--ws-rule);
+    background: var(--fn-paper-2, #ece5d6);
+  }
+  .ws-project { display: inline-flex; flex-wrap: wrap; align-items: center; color: var(--ws-muted); }
+  .ws-project[data-current] { color: var(--ws-ink); }
+  .ws-project-name { font-weight: 700; padding: 0 8px 0 4px; letter-spacing: .02em; }
+  .ws-project:not([data-current]) .ws-project-name { font-weight: 400; }
+  .ws-divider { padding: 0 6px; color: var(--ws-rule); }
+  .ws-tab { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 3px; color: var(--ws-muted); white-space: nowrap; }
+  .ws-tab[data-selected] { color: var(--ws-accent); background: var(--ws-bg); box-shadow: inset 0 0 0 1px var(--ws-rule); }
+  .ws-tab-index { font-size: 11px; opacity: .75; }
+  .ws-mark { font-weight: 700; }
+  .ws-tab[data-state='working'] .ws-mark, .ws-session[data-state='working'] { color: var(--ws-accent); }
+  .ws-tab[data-state='input'] .ws-mark { color: var(--ws-ink); }
+  .ws-panes { display: grid; }
+  .ws[data-split='vertical'] .ws-panes { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
+  .ws[data-split='vertical'] .ws-pane + .ws-pane { border-left: 1px solid var(--ws-rule); }
+  .ws[data-split='horizontal'] .ws-pane + .ws-pane { border-top: 1px solid var(--ws-rule); }
+  .ws-pane { min-width: 0; }
+  .ws-head {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 14px;
+    padding: 8px 16px;
+    border-bottom: 1px dashed var(--ws-rule);
+    color: var(--ws-muted);
+  }
+  .ws-label { font-weight: 700; color: var(--ws-ink); }
+  .ws-pane[data-focused] .ws-label { color: var(--ws-accent); }
+  .ws-session { white-space: nowrap; }
+  .ws-session:not([data-active]) { color: var(--ws-muted); }
+  .ws-session[data-active][data-state='idle'] { color: var(--ws-ink); }
+  .ws-body { padding: 14px 16px 18px; }
+  .ws-line { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; }
+  .ws-line[data-kind='label'] { color: var(--ws-muted); font-size: 11.5px; margin-bottom: 6px; }
+  .ws-line[data-kind='dim'] { color: var(--ws-muted); }
+  .ws-line[data-kind='cmd'], .ws-line[data-kind='cursor'] { color: var(--ws-ink); font-weight: 700; }
+  .ws-line[data-kind='cmd'] + .ws-line[data-kind='out'], .ws-line[data-kind='out'] + .ws-line[data-kind='out'] { padding-left: 1.2em; }
+  .ws-glyph { color: var(--ws-accent); font-weight: 700; }
+  .ws-cursor { display: inline-block; width: .6em; height: 1.05em; vertical-align: -0.15em; background: var(--ws-ink); }
+  .ws-callout {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 17px;
+    height: 17px;
+    margin-left: 8px;
+    border-radius: 50%;
+    background: var(--ws-accent);
+    color: #fff8f0;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+    vertical-align: middle;
+    transform: translateY(-1px);
+  }
+  @media (max-width: 640px) {
+    .ws { font-size: 12px; }
+    .ws-tabs { padding: 6px 8px; }
+    .ws-head, .ws-body { padding-inline: 12px; }
+    .ws[data-split='vertical'] .ws-panes { grid-template-columns: 1fr; }
+    .ws[data-split='vertical'] .ws-pane + .ws-pane { border-left: 0; border-top: 1px solid var(--ws-rule); }
+  }
+</style>

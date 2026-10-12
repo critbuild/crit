@@ -12,6 +12,8 @@ export function createReporter() {
   let pending;
   let draining;
   let previous;
+  let resume = process.env.CRIT_RESUME_ID
+    ? { status: "selected", identity: process.env.CRIT_RESUME_ID } : { status: "unknown" };
 
   function send(next) {
     return new Promise((resolve) => {
@@ -28,7 +30,7 @@ export function createReporter() {
       client.on("connect", () => {
         if (!next.current()) return finish(false);
         // Keep Rust's entire u64 range intact rather than rounding through Number.
-        client.write(`{"session":${session},"state":${JSON.stringify(next.state)},"message":${JSON.stringify(next.message)}}\n`);
+        client.write(`{"session":${session},"state":${JSON.stringify(next.state)},"message":${JSON.stringify(next.message)},"resume":${JSON.stringify(next.resume)}}\n`);
       });
       client.on("data", (data) => finish(data.includes(10)));
       client.on("error", () => finish(false));
@@ -45,19 +47,29 @@ export function createReporter() {
       const next = pending;
       pending = undefined;
       if (!next.current()) continue;
-      if (previous?.state === next.state && previous?.message === next.message) continue;
-      previous = await send(next) ? next : undefined;
+      next.resume = next.identity === undefined ? resume
+        : typeof next.identity === "string" && next.identity
+          ? { status: "selected", identity: next.identity } : { status: "clear" };
+      if (previous?.state === next.state && previous?.message === next.message &&
+          previous?.resume.status === next.resume.status && previous?.resume.identity === next.resume.identity) continue;
+      if (await send(next)) {
+        previous = next;
+        resume = next.resume;
+      } else previous = undefined;
     }
   }
 
-  function report(state, message, current = () => true) {
-    pending = { state, message: typeof message === "string" ? message.slice(0, 512) : null, current };
+  // Undefined means unavailable evidence, null means an explicit no-chat selection.
+  // Keep the guard third for existing asynchronous lifecycle callers.
+  function report(state, message, current = () => true, identity) {
+    if (!current()) return Promise.resolve();
+    pending = { state, message: typeof message === "string" ? message.slice(0, 512) : null, current, identity };
     if (!draining) {
       draining = drain().finally(() => {
         draining = undefined;
         if (pending) {
           const next = pending;
-          void report(next.state, next.message, next.current);
+          void report(next.state, next.message, next.current, next.identity);
         }
       });
     }

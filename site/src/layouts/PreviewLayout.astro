@@ -1,0 +1,47 @@
+---
+import '@fontsource-variable/inter';
+import '@fontsource-variable/space-grotesk';
+import '@fontsource/instrument-serif/latin-400.css';
+import '@fontsource/instrument-serif/latin-400-italic.css';
+import '@fontsource/ibm-plex-mono/latin-400.css';
+import '../styles/global.css';
+
+interface Props {
+  title: string;
+  description?: string;
+  theme: 'signal' | 'fieldnotes' | 'parallel' | 'gallery';
+}
+const { title, description = 'Crit: worktree-first terminals for OMP, OpenCode, and your shell. Explore three landing-page design directions.', theme } = Astro.props;
+const concepts = [
+  { id: 'signal', number: '01', label: 'Signal' },
+  { id: 'fieldnotes', number: '02', label: 'Fieldnotes' },
+  { id: 'parallel', number: '03', label: 'Parallel' },
+];
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={description} />
+    <meta name="color-scheme" content={theme === 'signal' ? 'dark' : 'light'} />
+    <meta name="theme-color" content={theme === 'signal' ? '#10120f' : '#f5f4ef'} />
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+    <title>{title} — Crit design studies</title>
+  </head>
+  <body data-concept={theme}>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <slot />
+    {theme !== 'gallery' && (
+      <nav class="review-dock" aria-label="Design concepts">
+        <a class="review-home" href="/" aria-label="All design concepts">
+          <svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M1 1h5v5H1zm9 0h5v5h-5zM1 10h5v5H1zm9 0h5v5h-5z" stroke="currentColor" /></svg>
+          Designs
+        </a>
+        {concepts.map((concept) => (
+          <a href={`/${concept.id}/`} aria-label={`${concept.number}: ${concept.label}`} aria-current={theme === concept.id ? 'page' : undefined}>{concept.number}</a>
+        ))}
+      </nav>
+    )}
+  </body>
+</html>

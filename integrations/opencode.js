@@ -20,11 +20,12 @@ async function server() {
   const reporter = createReporter();
   if (!reporter) return {};
   claimed = true;
-  let selected;
+  let selected = process.env.CRIT_RESUME_ID || undefined;
   let state = "unknown";
   let error;
   const parents = new Map();
   const blockers = new Map();
+  let epoch = 0;
 
   function root(id) {
     const seen = new Set();
@@ -35,14 +36,17 @@ async function server() {
     }
   }
   function publish() {
+    const generation = epoch;
     const request = selected && [...blockers.values()].find((request) => root(request.sessionID) === selected);
     return reporter.report(request ? "blocked" : state,
-      request ? request.questions?.[0]?.question || request.permission || "Waiting for user input" : error);
+      request ? request.questions?.[0]?.question || request.permission || "Waiting for user input" : error,
+      () => generation === epoch, selected ?? null);
   }
+  await publish();
   return {
     "chat.message": async ({ sessionID }) => {
       if (!sessionID || parents.has(sessionID)) return;
-      if (selected && selected !== sessionID) return;
+      if (selected !== sessionID) { epoch += 1; blockers.clear(); }
       selected = sessionID;
       state = "working";
       error = undefined;
@@ -52,6 +56,15 @@ async function server() {
       const data = event?.properties ?? {};
       if (data.info?.id && data.info.parentID) parents.set(data.info.id, data.info.parentID);
       const id = data.sessionID ?? data.info?.id;
+      if (event.type === "session.created" && data.info?.id && !data.info.parentID) {
+        epoch += 1;
+        selected = data.info.id;
+        blockers.clear();
+        state = "idle";
+        error = undefined;
+        await publish();
+        return;
+      }
       if (!selected || root(id) !== selected) return;
       switch (event.type) {
         case "permission.asked":
@@ -83,7 +96,12 @@ async function server() {
         case "session.deleted":
           for (const [key, request] of blockers) if (request.sessionID === id) blockers.delete(key);
           parents.delete(id);
-          if (id === selected) { selected = undefined; state = "unknown"; error = undefined; }
+          if (id === selected) {
+            epoch += 1;
+            selected = undefined;
+            state = "unknown";
+            error = undefined;
+          }
           break;
         default:
           return;

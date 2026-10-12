@@ -1,5 +1,5 @@
 use crate::{
-    app::{IntentTarget, Project},
+    app::{EnvironmentOp, IntentTarget, LayoutMode, Project},
     compose::Environment,
     integration::AgentUpdate,
     intent::{Agent, Plan},
@@ -16,6 +16,7 @@ pub enum Event {
     },
     Agent(AgentUpdate),
     ProjectOpened {
+        request: u64,
         result: Result<Project, String>,
         agent: Option<Agent>,
     },
@@ -33,10 +34,14 @@ pub enum Event {
     },
     Created {
         project: PathBuf,
+        source: PathBuf,
+        preparation_error: Option<String>,
         agent: Option<Agent>,
+        split: Option<LayoutMode>,
         result: Result<Worktree, String>,
     },
     Worktrees {
+        request: u64,
         project: PathBuf,
         result: Result<Vec<Worktree>, String>,
     },
@@ -46,6 +51,8 @@ pub enum Event {
     },
     Environment {
         tree: String,
+        operation: EnvironmentOp,
+        prepared: bool,
         result: Result<Environment, String>,
     },
     Error(String),

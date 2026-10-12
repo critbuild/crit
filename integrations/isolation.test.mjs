@@ -7,7 +7,7 @@ import net from "node:net";
 import test from "node:test";
 import { createReporter } from "./reporter.js";
 
-const keys = ["CRIT_ENV", "CRIT_SESSION", "CRIT_SOCKET", "CRIT_AGENT_PID"];
+const keys = ["CRIT_ENV", "CRIT_SESSION", "CRIT_SOCKET", "CRIT_AGENT_PID", "CRIT_RESUME_ID"];
 async function isolated(run) {
   const before = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
   try { await run(); }
@@ -55,6 +55,7 @@ test("stale selection work is discarded and full u64 identity survives transport
     process.env.CRIT_SESSION = "18446744073709551615";
     process.env.CRIT_SOCKET = socket;
     process.env.CRIT_AGENT_PID = "";
+    process.env.CRIT_RESUME_ID = "chat-restored";
     const reporter = createReporter();
     assert.ok(reporter);
     await reporter.report("working", undefined, () => false);
@@ -63,6 +64,21 @@ test("stale selection work is discarded and full u64 identity survives transport
     assert.equal(frames.length, 1);
     assert.match(frames[0], /^\{"session":18446744073709551615,"state":"blocked"/);
     assert.equal(JSON.parse(frames[0]).message, "Root permission");
+    assert.deepEqual(JSON.parse(frames[0]).resume, { status: "selected", identity: "chat-restored" });
+    await reporter.report("blocked", "Root permission", () => true, "chat-second");
+    assert.equal(frames.length, 2, "identity-only change must not be deduplicated");
+    assert.equal(JSON.parse(frames[1]).resume.identity, "chat-second");
+    await reporter.report("blocked", "Root permission", () => false, "chat-stale");
+    let stillCurrent = true;
+    const stale = reporter.report("working", undefined, () => stillCurrent, "chat-stale-on-connect");
+    stillCurrent = false;
+    await stale;
+    await reporter.report("unknown");
+    assert.equal(JSON.parse(frames.at(-1)).resume.identity, "chat-second", "stale work cannot replace identity");
+    await reporter.report("unknown", undefined, () => true, null);
+    assert.deepEqual(JSON.parse(frames.at(-1)).resume, { status: "clear" });
+    await reporter.report("exited");
+    assert.deepEqual(JSON.parse(frames.at(-1)).resume, { status: "clear" }, "teardown cannot resurrect a chat");
   } finally {
     await new Promise((resolve) => listener.close(resolve));
     await rm(directory, { recursive: true, force: true });

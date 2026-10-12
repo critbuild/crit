@@ -5,6 +5,7 @@ mod integration;
 mod intent;
 mod keys;
 mod kitty;
+mod restore;
 mod terminal;
 mod ui;
 mod updates;
@@ -16,20 +17,24 @@ use std::path::{Path, PathBuf};
 const HELP: &str = "crit — worktree-first terminals for OMP and OpenCode
 
 USAGE
-  crit [--repo PATH] [--agent omp|opencode|shell] [--no-kitty]
+  crit [--fresh] [--repo PATH] [--agent omp|opencode|shell] [--no-kitty]
   crit worktree list [--repo PATH]
   crit worktree create BRANCH [--base REF] [--repo PATH]
   crit worktree remove PATH [--repo PATH]
   crit env up|down|restart|status|logs [--repo PATH]
+  crit env up|restart --source PATH [--repo PATH]
   crit setup kitty|agents|all
   crit keys
 
-Start with New terminal or choose a Git project. Press F1 and describe what
-you want. Ctrl+D in an agent opens its workspace shell without stopping it;
+Crit restores your saved workspace on startup. With no saved workspace, choose
+New terminal or a Git project. F1 opens Ask Crit. Ctrl+D in an agent opens its
+workspace shell without stopping it;
 Ctrl+D in a shell keeps normal EOF behavior, and native mode passes it through.
-Ctrl+Shift+T creates a worktree; Ctrl+Shift+Enter opens a session. F12
-persistently toggles Crit/native Kitty shortcuts. Run `crit setup kitty` once
-to enable the window-scoped mappings.
+Ctrl+Shift+T opens a new tab: a worktree here, another project folder, or an
+open project. Ctrl+Shift+, or . splits: name a branch and its worktree opens in
+the second pane. Ctrl+Shift+Enter opens a session. F12 persistently toggles
+Crit/native Kitty shortcuts. Run `crit setup kitty` once to enable the
+window-scoped mappings.
 
 ASK CRIT
   F1 opens a natural-language launcher using anthropic/claude-haiku-5-5,
@@ -49,14 +54,26 @@ ASK CRIT
   F2 inside the launcher opens manual controls: Up/Down and Enter, no AI needed.
 
 APPEARANCE
-  Crit uses the terminal's default background, including its tabs, dialogs,
-  and status strip, so leftover pixels at the window edges blend into the UI.
+  Crit uses the terminal's default background, including its tabs and
+  dialogs, so leftover pixels at the window edges blend into the UI.
   Embedded agents querying the background receive this Kitty window's current
   color when its remote-control socket is available.
   Crit removes Kitty padding/margins only in its own terminal and restores
   configured spacing on exit. Other terminals are unaffected.
+  A thin, soft-white divider spans the full terminal width below workspace/
+  session headers. Its row is excluded from the embedded terminal's size.
+  No bottom row is reserved when there is no notice.
   Window shape, rounded corners, borders, shadows, and desktop gaps stay under
   your normal compositor configuration; Crit installs no desktop overrides.
+  The minimum interactive size is 30x10. Below it, typing, paste, mouse input,
+  and confirmations pause; Esc and F12 remain available. Enlarge to resume.
+  Notices occupy reserved rows, never terminal output. Long notices show
+  their final lines with an overflow marker. Selected sessions stay visible
+  in the workspace header even when other session labels overflow.
+  A thin scrollbar uses the right gutter when normal-screen history exists.
+  Click or drag it to review history or return to live output at the bottom.
+  Mouse-aware apps receive the wheel normally; Shift+wheel scrolls Crit's
+  history instead. Typing or pasting returns to live output.
 
 UPDATES
   Each interactive startup runs omp update and opencode upgrade before
@@ -85,16 +102,48 @@ PROJECTS
   Ask \"open a project\" to browse Git folders, subfolders, or worktrees.
   Absolute, ~/, ./ and ../ paths open directly. Other relative folders open
   when no detected project matches; paths use the displayed base folder.
-  Opening a folder opens only its checkout, not every branch/worktree.
+  A folder outside any Git repository opens as a terminal-only tab named
+  after the folder. Opening a Git folder opens only its checkout, not every
+  branch/worktree.
   Ask to open an existing worktree or switch to a named project.
   Already open projects and shell/agent sessions stay alive when switching.
   A terminal-only workspace can open Git projects later through F1 / F2.
   Worktree and Docker actions require opening a Git project first.
   New worktrees use the focused checkout's current HEAD, not another project.
-  Project/session state lasts until Crit exits; this is not a persistent daemon.
+  Esc cancels pending project opens and worktree listings; late results
+  cannot reopen canceled dialogs or replace newer ones. Failed worktree creation
+  restores its input only while its original workspace is focused and no newer
+  dialog is open.
+  Returning a split to full width keeps the focused worktree.
+  Saved projects, worktrees, splits, focused panes and selected sessions reopen.
+
+RESTORE
+  Crit checkpoints workspace changes and exact OMP/OpenCode chat references in
+  $XDG_STATE_HOME/crit/workspace.json (default ~/.local/state/crit/workspace.json).
+  Metadata is owner-private; chat contents stay in the agents' own stores.
+  All saved agent sessions reopen, including those in background tabs/projects.
+  OMP resumes its exact session file; OpenCode resumes its exact session ID.
+  Switching chats inside an agent updates its saved reference. Closing a session
+  or tab removes it from the saved workspace, without deleting chat history.
+  Shells reopen fresh in their worktrees; running processes, unsent input and
+  terminal scrollback are not restored. Docker log followers are not reopened.
+  --fresh skips restoration and starts a new saved workspace; use it with
+  --repo / --agent to choose a different starting point.
+  Missing worktrees/chats or invalid state show an error and leave the original
+  snapshot untouched; saving is disabled in that window. Fix the cause and
+  restart to retry, or explicitly use --fresh to replace the saved workspace.
+  Only one Crit window owns the snapshot. Additional windows do not restore or
+  overwrite it while the owner is running, and display that limitation.
 
 DOCKER
   New worktrees automatically start their Compose stack when configured.
+  Required Git-ignored local Compose configuration, .env and service env_file
+  inputs are copied from the source checkout as private, independent files.
+  Existing target files are preserved; shared links and path escapes are refused.
+  A preparation failure leaves the new checkout usable. Fix its local files and
+  start its environment again to retry from the remembered source checkout.
+  For a checkout created before this support, explicitly supply its source:
+    crit env up --repo /path/to/worktree --source /path/to/source-checkout
   Each worktree gets its own project, networks, named volumes, build image,
   and dynamically allocated loopback host ports. Ask \"open the preview\".
   External networks/volumes and host networking are refused. Bind mounts
@@ -113,8 +162,9 @@ DOCKER
 LIFECYCLE
 
 Closing a tab never deletes its Git checkout. Docker down retains volumes.
-Crit owns its agent processes; exiting closes all open projects' sessions,
-not Docker stacks. Agent state hooks are launch-scoped, not global plugins.
+Crit owns its agent processes; exiting stops them, not Docker stacks. The next
+launch restores the saved workspace and supported chats, not the old processes.
+Agent hooks are launch-scoped, not global plugins. Crit is not a background daemon.
 ";
 
 fn main() {
@@ -132,6 +182,8 @@ fn run() -> Result<()> {
     let mut base = None;
     let mut use_kitty = true;
     let mut direct_start = false;
+    let mut fresh = false;
+    let mut source = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--help" | "-h" => {
@@ -153,6 +205,12 @@ fn run() -> Result<()> {
                     .context("--agent requires omp, opencode, or shell")?
             }
             "--base" => base = Some(args.next().context("--base requires a Git reference")?),
+            "--fresh" => fresh = true,
+            "--source" => {
+                source = Some(PathBuf::from(
+                    args.next().context("--source requires a checkout path")?,
+                ))
+            }
             "--no-kitty" => use_kitty = false,
             _ if arg.starts_with('-') => bail!("unknown option {arg}; use --help"),
             _ => positionals.push(arg),
@@ -161,8 +219,19 @@ fn run() -> Result<()> {
     if !matches!(agent.as_str(), "omp" | "opencode" | "shell") {
         bail!("unsupported agent {agent:?}; choose omp, opencode, or shell");
     }
+    if fresh && !positionals.is_empty() {
+        bail!("--fresh is only available when opening Crit");
+    }
+    if source.is_some()
+        && !(positionals.first().is_some_and(|command| command == "env")
+            && positionals
+                .get(1)
+                .is_some_and(|operation| matches!(operation.as_str(), "up" | "restart")))
+    {
+        bail!("--source is only available with crit env up|restart");
+    }
     match positionals.first().map(String::as_str) {
-        None => app::run(&repo, &agent, use_kitty, direct_start),
+        None => app::run(&repo, &agent, use_kitty, direct_start, fresh),
         Some("keys") if positionals.len() == 1 => {
             print!("{}", keys::HELP);
             Ok(())
@@ -199,6 +268,11 @@ fn run() -> Result<()> {
                 Some("create") if positionals.len() == 3 => {
                     let tree = worktree::create(&repository, &positionals[2], base.as_deref())?;
                     println!("{}", tree.path.display());
+                    let source = selected_tree(&repository, &repo)?;
+                    compose::prepare_local_files(&source, &tree).with_context(|| {
+                        format!("worktree was created at {}; local environment preparation failed (retry with crit env up --repo '{}' --source '{}')",
+                            tree.path.display(), tree.path.display(), source.path.display())
+                    })?;
                 }
                 Some("remove") if positionals.len() == 3 => {
                     let path = Path::new(&positionals[2]).canonicalize()?;
@@ -216,6 +290,11 @@ fn run() -> Result<()> {
         Some("env") if positionals.len() == 2 => {
             let repository = worktree::discover(&repo)?;
             let tree = selected_tree(&repository, &repo)?;
+            if let Some(source) = source {
+                let source_repository = worktree::discover(&source)?;
+                let source = selected_tree(&source_repository, &source)?;
+                compose::prepare_local_files(&source, &tree)?;
+            }
             let environment = match positionals[1].as_str() {
                 "up" => compose::up(&tree)?,
                 "down" => compose::down(&tree)?,

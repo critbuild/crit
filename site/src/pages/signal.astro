@@ -1,0 +1,456 @@
+---
+import PreviewLayout from '../layouts/PreviewLayout.astro';
+---
+
+<PreviewLayout title="Signal — Separate work. One terminal." theme="signal" description="Crit is a worktree-first terminal workspace for OMP, OpenCode, and shells. Separate branches. Keep your context.">
+  <div class="signal-page">
+    <header class="masthead wrap">
+      <a class="wordmark" href="#main" aria-label="Crit home"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>crit<span class="wordmark-dot">.</span></a>
+      <nav aria-label="Main navigation"><a href="#workflow">The workflow</a><a href="#under-the-hood">Under the hood</a><a class="nav-start" href="#start">Start building <span aria-hidden="true">↗</span></a></nav>
+    </header>
+
+    <main id="main">
+      <section class="hero wrap" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="eyebrow"><span class="signal-dot"></span> WORKTREE-FIRST TERMINAL WORKSPACE</p>
+          <h1 id="hero-title">Separate<br />work.<br /><span>One terminal.</span></h1>
+          <p class="hero-description">A place for every branch. A shell for every idea.<br class="desktop-break" /> Bring your agents and your worktrees together—without mixing them up.</p>
+          <div class="hero-actions"><a class="primary-button" href="#start">Get started <span aria-hidden="true">↗</span></a><a class="text-link" href="#workspace">Explore the workspace <span aria-hidden="true">↓</span></a></div>
+          <p class="hero-fine">OMP / OPENCODE / YOUR SHELL <span>APACHE-2.0</span></p>
+        </div>
+
+        <div class="hero-instrument" id="workspace">
+          <div class="instrument-caption"><span>FIG. 01 / WORKSPACE</span><span>INTERACTIVE ILLUSTRATION</span></div>
+          <div class="workspace-console">
+            <div class="console-toolbar"><span class="console-brand">crit <span>/ atlas</span></span><span class="toolbar-status"><span class="signal-dot"></span> 3 WORKTREES</span></div>
+            <div class="project-bar"><span class="project-active">atlas</span><span class="project-quiet">website</span><span class="project-quiet">sdk</span><span class="project-label">PROJECTS</span></div>
+            <div class="console-body">
+              <div class="worktree-list" role="group" aria-label="Choose illustrative worktree">
+                <span class="list-label">WORKTREES</span>
+                <button type="button" class="branch-option selected" data-branch="auth" aria-pressed="true"><span class="branch-symbol" aria-hidden="true">⑂</span><span><strong>feat/auth</strong><small>OMP + shell</small></span><span class="branch-indicator"></span></button>
+                <button type="button" class="branch-option" data-branch="api" aria-pressed="false"><span class="branch-symbol" aria-hidden="true">⑂</span><span><strong>fix/api</strong><small>OpenCode + shell</small></span><span class="branch-indicator"></span></button>
+                <button type="button" class="branch-option" data-branch="main" aria-pressed="false"><span class="branch-symbol" aria-hidden="true">⑂</span><span><strong>main</strong><small>Shell</small></span><span class="branch-indicator"></span></button>
+                <div class="tree-foot"><span class="tree-lines" aria-hidden="true">└─</span> one branch<br />&nbsp;&nbsp;&nbsp;one worktree</div>
+              </div>
+              <div class="panes">
+                <div class="agent-pane focused" data-pane="agent">
+                  <div class="pane-heading"><span id="agent-name">OMP</span><span class="pane-state" id="agent-state">AGENT SESSION</span></div>
+                  <div class="agent-content"><p class="terminal-muted" id="agent-location">~/atlas/feat-auth</p><p class="terminal-prompt" id="agent-request"><span>›</span> Add session authentication</p><p id="agent-output">Reviewing the existing auth flow.<br />Working in <span class="terminal-lime">feat/auth</span>.</p><div class="agent-steps" id="agent-steps"><span>↳ src/auth/session.ts</span><span>↳ src/routes/login.ts</span></div><p class="agent-ready"><span class="signal-dot"></span><span id="agent-ready">Agent session open</span></p></div>
+                </div>
+                <div class="shell-pane" data-pane="shell">
+                  <div class="pane-heading"><span>SHELL</span><span class="shell-path" id="shell-branch">feat/auth</span></div>
+                  <div class="shell-content"><p><span class="terminal-lime">❯</span> <span id="shell-command">git status --short</span></p><p class="terminal-muted" id="shell-output">M src/auth/session.ts<br /> M src/routes/login.ts</p><p class="shell-cursor"><span class="terminal-lime">❯</span> <span class="cursor" aria-hidden="true"></span></p></div>
+                </div>
+              </div>
+            </div>
+            <div class="console-bottom"><span id="workspace-path">atlas / feat-auth</span><span>F1 ask <span class="bottom-divider">/</span> F2 controls</span></div>
+          </div>
+          <div class="demo-controls"><button type="button" id="focus-shell"><kbd>Ctrl</kbd><span>+</span><kbd>D</kbd><span class="demo-button-label">Focus the shell</span><span aria-hidden="true">↗</span></button><p id="demo-status" aria-live="polite">Select a branch. Keep the contexts separate.</p></div>
+          <div class="instrument-coordinate" aria-hidden="true">BRANCH ≠ CONTEXT SWITCH</div>
+        </div>
+      </section>
+
+      <div class="compatibility wrap"><p>YOUR TOOLS.<br /><strong>MORE ROOM TO WORK.</strong></p><div><span>OMP</span><span>OpenCode</span><span class="shell-tool"><span aria-hidden="true">›_</span> Shells</span><span class="git-tool"><span aria-hidden="true">⑂</span> Git worktrees</span></div><span class="compatibility-note">Not another coding agent.<br />The workspace around yours.</span></div>
+
+      <section class="workflow wrap section" id="workflow" aria-labelledby="workflow-title">
+        <div class="section-intro"><p class="eyebrow">01 / KEEP YOUR CONTEXT</p><h2 id="workflow-title">More than one task.<br /><span>Less than one mess.</span></h2><p>Give parallel work a place of its own. Move between branches, agents, and shells without turning your terminal into a guessing game.</p></div>
+        <div class="workflow-rows">
+          <article><span class="step-number">01</span><div><h3>Branch out. Literally.</h3><p>Each branch gets a Git worktree. Your files live in separate working directories, with project tabs and split worktrees to keep the bigger picture in view.</p></div><span class="row-art branch-art" aria-hidden="true">main <i>┬── feat/auth</i><i>└── fix/api</i></span></article>
+          <article><span class="step-number">02</span><div><h3>Drop into a shell.</h3><p>Press Ctrl+D inside an agent to open or select its workspace shell. Your agent stays alive. Inside the shell, Ctrl+D keeps its normal EOF behavior.</p></div><span class="row-art key-art" aria-hidden="true"><kbd>Ctrl</kbd><span>+</span><kbd>D</kbd></span></article>
+          <article><span class="step-number">03</span><div><h3>Pick up where you left it.</h3><p>Switch projects without closing their sessions. Exit, then reopen Crit: your saved workspace and the same OMP/OpenCode chats return. Shells start fresh; old processes do not survive.</p></div><span class="row-art session-art" aria-hidden="true"><i></i> SAME CHAT</span></article>
+        </div>
+      </section>
+
+      <section class="infrastructure" id="under-the-hood" aria-labelledby="infra-title">
+        <div class="wrap infrastructure-grid">
+          <div class="infra-copy"><p class="eyebrow">02 / SEPARATION, ALL THE WAY DOWN</p><h2 id="infra-title">Same project.<br /><span>Different moving parts.</span></h2><p>Optionally give each worktree its own Docker Compose project, networks, named volumes, and dynamic loopback ports.</p><p class="infra-note">Local development separation—not a security sandbox. Configured bind mounts can still share data. Exiting Crit does not stop your Docker stacks.</p></div>
+          <div class="compose-diagram" aria-label="Illustration of separate Compose resources for two worktrees"><div class="diagram-title"><span>OPTIONAL / DOCKER COMPOSE</span><span aria-hidden="true">↗</span></div><div class="compose-lane"><div class="lane-branch"><span aria-hidden="true">⑂</span> feat/auth</div><div class="lane-connector" aria-hidden="true"></div><div class="resource-group"><span>COMPOSE PROJECT A</span><p><i></i> Network A</p><p><i></i> Named volume A</p><p class="port">127.0.0.1:<b>49152</b></p></div></div><div class="compose-lane"><div class="lane-branch"><span aria-hidden="true">⑂</span> fix/api</div><div class="lane-connector" aria-hidden="true"></div><div class="resource-group"><span>COMPOSE PROJECT B</span><p><i></i> Network B</p><p><i></i> Named volume B</p><p class="port">127.0.0.1:<b>49153</b></p></div></div><p class="diagram-caption">Illustrative resources and port assignments</p></div>
+        </div>
+      </section>
+
+      <section class="controls-section wrap section" aria-labelledby="controls-title"><div><p class="eyebrow">03 / TWO WAYS IN</p><h2 id="controls-title">Ask naturally.<br /><span>Or take the controls.</span></h2></div><div class="control-options"><article><kbd>F1</kbd><div><h3>Ask Crit</h3><p>Use the natural-language launcher to tell Crit what you need. Requires authenticated OMP.</p></div></article><article><kbd>F2</kbd><div><h3>Manual controls</h3><p>Prefer the direct route? Open the manual controls. No natural-language launcher required.</p></div></article></div></section>
+
+      <section class="start-section wrap" id="start" aria-labelledby="start-title"><div class="start-copy"><p class="eyebrow">04 / MAKE ROOM</p><h2 id="start-title">Your next branch<br />starts here<span>.</span></h2><p>Open source. Apache-2.0.<br />Built for the work already on your terminal.</p></div><div class="install-panel"><div class="install-header"><span>BUILD FROM SOURCE</span><button type="button" id="copy-install">Copy commands <span aria-hidden="true">⧉</span></button></div><p class="install-context">From the root of a local Crit checkout:</p><pre><code id="install-commands">cargo install --path .
+crit</code></pre><p class="install-requirements">You’ll need <strong>Rust / Cargo</strong> and <strong>Git</strong>. Have OMP or OpenCode available when you use them. Docker Compose is optional.</p><details><summary>Using Kitty? <span aria-hidden="true">+</span></summary><div><p>For optional Kitty integration, run:</p><code>crit setup kitty</code><p>Then reload your Kitty configuration.</p></div></details><p class="copy-status" id="copy-status" aria-live="polite">Two commands. Your own local checkout.</p></div></section>
+    </main>
+    <footer class="wrap footer"><a class="wordmark" href="#main">crit<span class="wordmark-dot">.</span></a><p>Separate work. Stay in your flow.</p><a href="#start">Build from source <span aria-hidden="true">↗</span></a><span>CONCEPT 01 / SIGNAL</span></footer>
+  </div>
+</PreviewLayout>
+
+<script>
+  const examples = {
+    auth: { branch: 'feat/auth', path: 'feat-auth', agent: 'OMP', request: 'Add session authentication', output: 'Reviewing the existing auth flow.', files: ['src/auth/session.ts', 'src/routes/login.ts'], command: 'git status --short', shell: ' M src/auth/session.ts\n M src/routes/login.ts' },
+    api: { branch: 'fix/api', path: 'fix-api', agent: 'OPENCODE', request: 'Fix response pagination', output: 'Tracing the pagination boundary.', files: ['src/api/list.ts', 'src/api/pagination.ts'], command: 'git diff --stat', shell: ' src/api/list.ts       | 8 +++++---\n src/api/pagination.ts | 6 ++++--' },
+    main: { branch: 'main', path: 'main', agent: 'NO AGENT', request: 'A clean starting point', output: 'This worktree has a shell, no agent.', files: ['Working tree clean', 'Ready for your next task'], command: 'git status --short', shell: 'Working tree clean' },
+  };
+  let selected: keyof typeof examples = 'auth';
+  let shellFocused = false;
+  const text = (id: string, value: string) => { const el = document.getElementById(id); if (el) el.textContent = value; };
+  function updateFocus() {
+    document.querySelector('[data-pane="agent"]')?.classList.toggle('focused', !shellFocused);
+    document.querySelector('[data-pane="shell"]')?.classList.toggle('focused', shellFocused);
+    text('agent-state', selected === 'main' ? 'NO SESSION' : shellFocused ? 'STILL OPEN' : 'AGENT SESSION');
+    const label = document.querySelector('#focus-shell .demo-button-label');
+    if (label) label.textContent = shellFocused ? 'Shell selected' : 'Focus the shell';
+    const button = document.getElementById('focus-shell') as HTMLButtonElement | null;
+    if (button) button.disabled = shellFocused;
+  }
+  document.querySelectorAll<HTMLButtonElement>('[data-branch]').forEach(button => {
+    button.addEventListener('click', () => {
+      const key = button.dataset.branch as keyof typeof examples;
+      const example = examples[key];
+      if (!example) return;
+      selected = key;
+      shellFocused = key === 'main';
+      document.querySelectorAll('[data-branch]').forEach(option => {
+        const active = option === button;
+        option.classList.toggle('selected', active);
+        option.setAttribute('aria-pressed', String(active));
+      });
+      text('agent-name', example.agent);
+      text('agent-location', `~/atlas/${example.path}`);
+      text('agent-request', `› ${example.request}`);
+      text('agent-output', `${example.output}\nWorking in ${example.branch}.`);
+      const steps = document.getElementById('agent-steps');
+      if (steps) steps.replaceChildren(...example.files.map(file => { const span = document.createElement('span'); span.textContent = `↳ ${file}`; return span; }));
+      text('agent-ready', key === 'main' ? 'Shell-only worktree' : 'Agent session open');
+      text('shell-branch', example.branch);
+      text('shell-command', example.command);
+      text('shell-output', example.shell);
+      text('workspace-path', `atlas / ${example.path}`);
+      text('demo-status', `${example.branch} selected. ${key === 'main' ? 'A clean shell-only workspace.' : `${example.agent} and shell have their own context.`}`);
+      updateFocus();
+    });
+  });
+  document.getElementById('focus-shell')?.addEventListener('click', () => {
+    shellFocused = true;
+    updateFocus();
+    text('demo-status', 'Shell focused. The agent session stays open.');
+  });
+  document.getElementById('copy-install')?.addEventListener('click', async () => {
+    try {
+      if (!navigator.clipboard) throw new Error('Clipboard unavailable');
+      await navigator.clipboard.writeText('cargo install --path .\ncrit');
+      text('copy-status', 'Copied. Run these from your local Crit checkout.');
+    } catch {
+      text('copy-status', 'Clipboard unavailable. Select and copy the commands above.');
+    }
+  });
+</script>
+
+<style>
+  :global(body[data-concept='signal']) { background: #10120f; color: #e8eae3; }
+  .signal-page { --lime: #c6f36b; --muted: #969d91; --line: #30362c; background: #10120f; color: #e8eae3; overflow: hidden; padding-bottom: 80px; }
+  .wrap { width: min(1392px, calc(100% - 112px)); margin-inline: auto; }
+  a { color: inherit; text-decoration: none; }
+  .masthead { height: 104px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--line); }
+  .wordmark { font: 700 37px/1 var(--font-display); letter-spacing: -2px; display: inline-flex; align-items: center; }
+  .wordmark-dot { color: var(--lime); }
+  .brand-mark { display: flex; align-items: center; gap: 3px; margin-right: 14px; }
+  .brand-mark i { background: var(--lime); width: 5px; height: 24px; transform: skewY(-28deg); }
+  .brand-mark i:nth-child(2) { height: 33px; }
+  nav { display: flex; gap: 34px; align-items: center; font-size: 12px; font-weight: 500; }
+  nav a { color: #b6bbae; transition: color .2s; }
+  nav a:hover, .text-link:hover { color: var(--lime); }
+  .nav-start { color: #e8eae3; border-left: 1px solid var(--line); padding-left: 34px; }
+  .nav-start span { margin-left: 20px; color: var(--lime); }
+  .hero { display: grid; grid-template-columns: 1fr 1.05fr; gap: 42px; padding-top: 81px; padding-bottom: 76px; align-items: center; }
+  .eyebrow { font: 10px/1.6 var(--font-mono); letter-spacing: 1.25px; color: var(--muted); margin: 0 0 30px; }
+  .hero .eyebrow { display: flex; align-items: center; gap: 9px; white-space: nowrap; }
+  .signal-dot { width: 5px; height: 5px; background: var(--lime); display: inline-block; flex-shrink: 0; border-radius: 50%; }
+  h1 { margin: 0; font: 500 clamp(65px, 6.7vw, 104px)/.98 var(--font-display); letter-spacing: -.065em; }
+  h1 > span { color: var(--lime); white-space: nowrap; }
+  .hero-description { font-size: 14px; line-height: 1.9; color: #b3b9aa; margin: 31px 0 27px; max-width: 380px; }
+  .hero-actions { display: flex; gap: 24px; align-items: center; }
+  .primary-button { background: var(--lime); color: #171d10; padding: 15px 20px; font-size: 12px; font-weight: 650; display: flex; align-items: center; gap: 37px; transition: background .2s; }
+  .primary-button:hover { background: #d8ff94; }
+  .text-link { font-size: 11px; display: flex; gap: 13px; align-items: center; }
+  .hero-fine { font: 10px/1.6 var(--font-mono); letter-spacing: .65px; color: #8a937e; margin-top: 29px; display: flex; gap: 20px; }
+  .hero-fine span { border-left: 1px solid var(--line); padding-left: 20px; }
+  .hero-instrument { position: relative; min-width: 0; padding-top: 16px; }
+  .hero-instrument::before { content: ''; position: absolute; inset: -38px -34px -49px -34px; background-image: linear-gradient(#20251c 1px, transparent 1px), linear-gradient(90deg, #20251c 1px, transparent 1px); background-size: 32px 32px; opacity: .55; mask-image: linear-gradient(90deg, transparent, #000 20%, #000 80%, transparent); pointer-events: none; }
+  .instrument-caption { position: relative; display: flex; justify-content: space-between; font: 8px var(--font-mono); letter-spacing: 1px; color: #7f8975; margin: 0 0 13px; }
+  .workspace-console { position: relative; background: #171b14; border: 1px solid #46513b; box-shadow: 0 20px 50px #0005, 7px 7px 0 #1d2318, 8px 8px 0 #313a27; border-radius: 4px; font-family: var(--font-mono); overflow: hidden; }
+  .console-toolbar { display: flex; align-items: center; justify-content: space-between; height: 47px; padding: 0 16px; background: #242a1e; border-bottom: 1px solid #39422e; }
+  .console-brand { font-size: 14px; font-weight: 600; color: var(--lime); }
+  .console-brand span { font-size: 10px; color: #a0aa94; font-weight: 400; margin-left: 7px; }
+  .toolbar-status { font-size: 7px; letter-spacing: .8px; color: #a2ac95; display: flex; gap: 7px; align-items: center; }
+  .project-bar { height: 39px; display: flex; align-items: stretch; border-bottom: 1px solid #323a2b; gap: 0; font-size: 9px; }
+  .project-bar > span:not(.project-label) { padding: 13px 19px; }
+  .project-active { color: var(--lime); border-bottom: 2px solid var(--lime); background: #c6f36b08; }
+  .project-quiet { color: #7b8570; }
+  .project-label { margin-left: auto; padding: 15px 13px; font-size: 9px; color: #8e9c80; letter-spacing: 1px; }
+  .console-body { display: grid; grid-template-columns: 142px 1fr; min-height: 359px; }
+  .worktree-list { border-right: 1px solid #343d2b; background: #191f15; padding-top: 18px; }
+  .list-label { font-size: 7px; letter-spacing: 1px; color: #89957c; display: block; margin: 0 14px 14px; }
+  .branch-option { display: flex; text-align: left; align-items: center; gap: 8px; padding: 12px 11px; width: 100%; color: #9fa991; border: 0; border-left: 2px solid transparent; background: transparent; cursor: pointer; font-family: var(--font-mono); }
+  .branch-option:hover { background: #252e1e; }
+  .branch-option.selected { background: #c6f36b0c; border-left-color: var(--lime); color: var(--lime); }
+  .branch-symbol { font-size: 20px; }
+  .branch-option strong { display: block; font-size: 9px; font-weight: 400; }
+  .branch-option small { display: block; font-size: 7px; color: #879579; margin-top: 5px; }
+  .branch-indicator { width: 4px; height: 4px; border-radius: 50%; background: #5f6e52; margin-left: auto; }
+  .selected .branch-indicator { background: var(--lime); }
+  .tree-foot { border-top: 1px solid #303926; margin: 43px 13px 0; padding-top: 18px; font-size: 9px; line-height: 1.8; color: #8e9c80; }
+  .tree-lines { color: var(--lime); }
+  .panes { min-width: 0; padding: 8px; display: grid; grid-template-rows: 1fr 130px; gap: 7px; }
+  .agent-pane, .shell-pane { border: 1px solid #34412a; background: #11160e; min-width: 0; transition: border-color .2s, background .2s; }
+  .focused { border-color: #9ac850; background: #151c10; }
+  .pane-heading { display: flex; justify-content: space-between; background: #1e2718; border-bottom: 1px solid #303d25; padding: 9px 10px; font-size: 8px; color: #adbba0; letter-spacing: .8px; gap: 6px; }
+  .focused .pane-heading { color: var(--lime); background: #27351c; }
+  .pane-state, .shell-path { font-size: 9px; color: #a2b18f; }
+  .agent-content { padding: 12px; font-size: 9px; line-height: 1.8; color: #bec8b4; }
+  .agent-content p { margin: 0 0 12px; white-space: pre-line; }
+  .terminal-muted { color: #7d8c70; }
+  .terminal-prompt { color: #e0e8d5; }
+  .terminal-prompt span { color: var(--lime); margin-right: 6px; }
+  .terminal-lime { color: var(--lime); }
+  .agent-steps { display: grid; color: #899a79; margin-bottom: 13px; }
+  .agent-content .agent-ready { margin: 0; font-size: 7px; color: #93a783; display: flex; align-items: center; gap: 6px; }
+  .shell-content { padding: 9px 11px; font-size: 9px; line-height: 1.7; }
+  .shell-content p { margin: 0 0 4px; white-space: pre; }
+  .cursor { display: inline-block; width: 6px; height: 10px; background: #d1ddc2; vertical-align: -1px; }
+  .console-bottom { display: flex; justify-content: space-between; background: #252f1e; color: #9caa8f; font-size: 7px; padding: 9px 12px; }
+  .bottom-divider { margin: 0 7px; color: #98aa87; }
+  .demo-controls { position: relative; display: flex; justify-content: space-between; align-items: flex-start; gap: 17px; padding-top: 21px; }
+  .demo-controls button { display: flex; align-items: center; gap: 5px; font: 8px var(--font-mono); color: #c8d3bc; border: 0; background: transparent; padding: 0; cursor: pointer; white-space: nowrap; }
+  .demo-controls button:disabled { cursor: default; opacity: .55; }
+  kbd { font-family: var(--font-mono); }
+  .demo-controls kbd { border: 1px solid #48543c; padding: 4px; border-radius: 3px; }
+  .demo-button-label { margin-left: 5px; }
+  .demo-controls p { font: 8px/1.7 var(--font-mono); color: #859479; text-align: right; margin: 0; max-width: 170px; }
+  .instrument-coordinate { position: relative; font: 9px var(--font-mono); color: #8a937e; letter-spacing: 1px; margin-top: 21px; text-align: right; }
+  .compatibility { padding: 29px 0; display: flex; align-items: center; border-block: 1px solid var(--line); gap: 44px; }
+  .compatibility > p { font: 8px/1.8 var(--font-mono); color: #8b9382; margin: 0; min-width: 140px; letter-spacing: .5px; }
+  .compatibility strong { color: #bec6b4; font-weight: 400; }
+  .compatibility > div { flex: 1; display: flex; justify-content: space-around; gap: 25px; align-items: center; color: #c1c7b9; font: 500 19px var(--font-display); }
+  .shell-tool { font-family: var(--font-mono); font-size: 16px; }
+  .shell-tool > span, .git-tool > span { color: #79876b; margin-right: 4px; }
+  .compatibility-note { font-size: 9px; line-height: 1.7; color: #7e8874; border-left: 1px solid var(--line); padding-left: 29px; }
+  .section { padding-block: 99px; }
+  h2 { margin: 0; font: 500 44px/1.12 var(--font-display); letter-spacing: -2px; }
+  h2 > span { color: #88967b; }
+  .section-intro { display: grid; grid-template-columns: 1fr 1fr; column-gap: 80px; align-items: end; margin-bottom: 48px; }
+  .section-intro .eyebrow { grid-column: 1 / -1; margin-bottom: 22px; }
+  .section-intro > p:last-child { max-width: 330px; font-size: 12px; line-height: 1.9; color: #a1aa97; margin: 0 0 3px auto; }
+  .workflow-rows { border-top: 1px solid var(--line); }
+  .workflow-rows article { display: grid; grid-template-columns: 55px 1fr 210px; gap: 22px; align-items: center; padding: 30px 0; border-bottom: 1px solid var(--line); }
+  .step-number { font: 10px var(--font-mono); color: var(--lime); align-self: start; padding-top: 5px; }
+  h3 { font: 500 19px var(--font-display); letter-spacing: -.5px; margin: 0 0 9px; }
+  .workflow-rows p { font-size: 12px; color: #9aa48e; line-height: 1.85; max-width: 510px; margin: 0; }
+  .row-art { font: 10px/1.7 var(--font-mono); color: #a6b696; justify-self: center; }
+  .branch-art i { display: block; color: #849773; font-style: normal; margin-left: 25px; }
+  .key-art { display: flex; align-items: center; gap: 9px; }
+  .key-art kbd { padding: 12px 16px; border: 1px solid #4e5b43; border-bottom-width: 3px; border-radius: 5px; background: #1b2316; color: #b5c8a3; }
+  .session-art { font-size: 8px; letter-spacing: 1px; display: flex; align-items: center; gap: 10px; }
+  .session-art i { width: 7px; height: 7px; background: var(--lime); border-radius: 50%; }
+  .infrastructure { background: #1c2317; border-block: 1px solid #343e2a; padding: 75px 0; }
+  .infrastructure-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 85px; align-items: center; }
+  .infra-copy h2 { font-size: 40px; }
+  .infra-copy > p:not(.eyebrow) { max-width: 350px; font-size: 12px; line-height: 1.9; color: #a9b49e; margin-top: 24px; }
+  .infra-copy .infra-note { font-size: 12px !important; color: #a0af90 !important; padding-left: 13px; border-left: 1px solid #4b5c3c; }
+  .compose-diagram { border: 1px solid #46533a; padding: 21px 24px; background: #141a10; font-family: var(--font-mono); }
+  .diagram-title { display: flex; justify-content: space-between; font-size: 8px; letter-spacing: 1px; color: #869977; padding-bottom: 19px; border-bottom: 1px solid #34422a; }
+  .diagram-title > span:last-child { color: var(--lime); }
+  .compose-lane { display: grid; grid-template-columns: 89px 1fr 177px; align-items: center; padding-top: 23px; }
+  .lane-branch { font-size: 10px; color: #c1d1b3; }
+  .lane-branch > span { color: var(--lime); font-size: 20px; margin-right: 5px; vertical-align: -1px; }
+  .lane-connector { height: 1px; background: #4c633c; position: relative; }
+  .lane-connector::after { content: ''; height: 5px; width: 5px; background: var(--lime); position: absolute; right: 0; top: -2px; }
+  .resource-group { border: 1px solid #4c633c; padding: 13px 14px 10px; background: #1a2513; }
+  .resource-group > span { font-size: 7px; letter-spacing: .6px; color: #a0b68d; }
+  .resource-group p { font-size: 9px; color: #99ad87; margin: 10px 0; }
+  .resource-group i { display: inline-block; width: 4px; height: 4px; border: 1px solid #91a97d; margin-right: 6px; }
+  .resource-group .port { padding-top: 9px; border-top: 1px solid #35472a; font-size: 8px; margin-bottom: 0; }
+  .port b { font-weight: 400; color: var(--lime); }
+  .diagram-caption { font-size: 7px; color: #748c62; margin: 18px 0 0; }
+  .controls-section { display: grid; grid-template-columns: 1fr 1fr; gap: 85px; align-items: center; }
+  .control-options { border-top: 1px solid var(--line); }
+  .control-options article { display: flex; gap: 22px; padding: 26px 0; border-bottom: 1px solid var(--line); }
+  .control-options kbd { font-size: 13px; padding: 9px 11px; border: 1px solid #49573d; border-radius: 4px; color: var(--lime); align-self: start; }
+  .control-options h3 { font-size: 17px; }
+  .control-options p { font-size: 11px; line-height: 1.8; color: #9ba68f; margin: 0; max-width: 285px; }
+  .start-section { display: grid; grid-template-columns: 1fr 1fr; gap: 70px; border-top: 1px solid var(--line); padding-block: 76px 85px; align-items: center; }
+  .start-copy h2 { font-size: 53px; letter-spacing: -2.5px; }
+  .start-copy h2 > span { color: var(--lime); }
+  .start-copy > p:last-child { color: #98a28b; font-size: 12px; line-height: 1.9; margin: 23px 0 0; }
+  .install-panel { background: #1c2317; border: 1px solid #3e4a33; padding: 23px; }
+  .install-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; font: 8px var(--font-mono); color: #9aad88; letter-spacing: .7px; }
+  .install-header button { border: 0; background: transparent; padding: 4px 0; color: var(--lime); font: 8px var(--font-mono); cursor: pointer; }
+  .install-header button span { margin-left: 8px; }
+  .install-context { color: #98a88b; font-size: 10px; margin: 24px 0 12px; }
+  pre { background: #10170b; border: 1px solid #34462a; margin: 0; padding: 17px; color: #d3e6bd; font: 13px/2 var(--font-mono); overflow-x: auto; }
+  .install-requirements { color: #91a181; font-size: 10px; line-height: 1.9; margin: 17px 0 18px; }
+  .install-requirements strong { color: #becdb0; font-weight: 500; }
+  details { border-top: 1px solid #37452c; border-bottom: 1px solid #37452c; font-size: 10px; color: #b1c4a0; }
+  summary { cursor: pointer; padding: 14px 0; }
+  summary > span { float: right; color: var(--lime); }
+  details[open] summary > span { transform: rotate(45deg); }
+  details > div { padding-bottom: 13px; color: #94a985; line-height: 1.8; }
+  details code { color: var(--lime); font-family: var(--font-mono); }
+  .copy-status { font: 8px/1.7 var(--font-mono); color: #7f916f; margin: 16px 0 0; min-height: 14px; }
+  .footer { border-top: 1px solid var(--line); padding-block: 28px; display: flex; align-items: center; gap: 30px; }
+  .footer .wordmark { font-size: 29px; }
+  .footer p { font-size: 10px; color: #7f8c73; margin: 0; flex: 1; }
+  .footer > a:not(.wordmark) { font-size: 10px; color: #c0cbb6; }
+  .footer > a > span { color: var(--lime); margin-left: 7px; }
+  .footer > span { font: 7px var(--font-mono); letter-spacing: .5px; color: #65735a; border-left: 1px solid var(--line); padding-left: 25px; }
+  @media (min-width: 1600px) { .hero { gap: 80px; } }
+  @media (max-width: 1100px) {
+    .wrap { width: calc(100% - 64px); }
+    .hero { gap: 27px; padding-top: 64px; }
+    h1 { font-size: clamp(60px, 7vw, 80px); }
+    .hero .eyebrow { font-size: 8px; letter-spacing: .6px; }
+    .hero-description { font-size: 12px; }
+    .hero-actions { gap: 16px; }
+    .primary-button { padding: 14px 16px; gap: 22px; }
+    .text-link { font-size: 9px; gap: 8px; }
+    .console-body { grid-template-columns: 116px 1fr; }
+    .branch-option { gap: 5px; padding-inline: 8px; }
+    .branch-option strong { font-size: 8px; }
+    .agent-content, .shell-content { font-size: 8px; }
+    .demo-controls { flex-wrap: wrap; gap: 10px; }
+    .demo-controls p { max-width: none; text-align: left; }
+    .compatibility { gap: 15px; }
+    .compatibility > p { min-width: 117px; font-size: 7px; }
+    .compatibility > div { gap: 15px; font-size: 16px; }
+    .shell-tool { font-size: 13px; }
+    .compatibility-note { padding-left: 15px; font-size: 8px; }
+    .infrastructure-grid, .controls-section { gap: 40px; }
+    .compose-diagram { padding: 18px; }
+    .compose-lane { grid-template-columns: 80px 1fr 154px; }
+    h2 { font-size: 38px; }
+    .infra-copy h2 { font-size: 35px; }
+    .start-copy h2 { font-size: 44px; }
+  }
+  @media (max-width: 800px) {
+    .masthead { height: 83px; }
+    nav { gap: 20px; font-size: 10px; }
+    .nav-start { padding-left: 20px; }
+    .nav-start span { margin-left: 9px; }
+    .hero { grid-template-columns: 1fr; padding-top: 54px; gap: 45px; }
+    h1 { font-size: clamp(65px, 12vw, 92px); }
+    h1 br:nth-of-type(1) { display: none; }
+    .hero .eyebrow { font-size: 9px; }
+    .hero-description { font-size: 14px; max-width: 410px; }
+    .hero-actions { gap: 26px; }
+    .text-link { font-size: 11px; }
+    .hero-instrument { max-width: 600px; width: 100%; justify-self: center; }
+    .console-body { grid-template-columns: 142px 1fr; }
+    .branch-option { padding: 12px 11px; gap: 8px; }
+    .branch-option strong { font-size: 9px; }
+    .agent-content, .shell-content { font-size: 10px; }
+    .demo-controls { flex-wrap: nowrap; }
+    .demo-controls p { max-width: 240px; text-align: right; }
+    .compatibility { flex-wrap: wrap; gap: 20px; }
+    .compatibility > div { justify-content: space-between; }
+    .compatibility-note { display: none; }
+    .section { padding-block: 65px; }
+    .section-intro { column-gap: 30px; }
+    .section-intro > p:last-child { font-size: 11px; }
+    h2 { font-size: 33px; }
+    .workflow-rows article { grid-template-columns: 25px 1fr 133px; gap: 15px; }
+    .workflow-rows p { font-size: 11px; }
+    .key-art kbd { padding: 10px; }
+    .session-art { font-size: 7px; letter-spacing: .3px; }
+    .infrastructure-grid { grid-template-columns: 1fr; gap: 30px; }
+    .infra-copy > p:not(.eyebrow) { max-width: 470px; }
+    .compose-diagram { max-width: 500px; width: 100%; }
+    .compose-lane { grid-template-columns: 100px 1fr 190px; }
+    .infrastructure { padding-block: 55px; }
+    .controls-section { gap: 30px; }
+    .start-section { gap: 28px; }
+    .start-copy h2 { font-size: 37px; }
+    .install-panel { padding: 18px; }
+    .footer { gap: 19px; flex-wrap: wrap; }
+    .footer > span { display: none; }
+  }
+  @media (max-width: 540px) {
+    .wrap { width: calc(100% - 40px); }
+    .masthead { height: 76px; }
+    .wordmark { font-size: 32px; }
+    .brand-mark { margin-right: 10px; }
+    .brand-mark i { width: 4px; height: 20px; }
+    .brand-mark i:nth-child(2) { height: 27px; }
+    nav a:not(.nav-start) { display: none; }
+    .nav-start { border: 0; padding: 0; font-size: 11px; }
+    .hero { padding-top: 41px; padding-bottom: 44px; gap: 28px; }
+    .hero .eyebrow { font-size: 10px; letter-spacing: .7px; margin-bottom: 25px; }
+    h1 { font-size: clamp(57px, 12.3vw, 67px); }
+    h1 br:nth-of-type(1) { display: initial; }
+    h1 > span { white-space: nowrap; }
+    .hero-description { font-size: 12px; margin-top: 24px; }
+    .desktop-break { display: none; }
+    .hero-actions { gap: 19px; }
+    .primary-button { font-size: 11px; gap: 20px; }
+    .text-link { font-size: 11px; gap: 5px; }
+    .hero-fine { font-size: 9px; gap: 14px; }
+    .hero-fine span { padding-left: 14px; }
+    .hero-instrument::before { inset: -16px -20px -20px; }
+    .instrument-caption { font-size: 9px; letter-spacing: .3px; }
+    .console-toolbar { padding-inline: 11px; height: 41px; }
+    .console-brand { font-size: 12px; }
+    .toolbar-status { font-size: 9px; }
+    .project-bar > span:not(.project-label) { padding: 13px 14px; }
+    .project-label { display: none; }
+    .console-body { grid-template-columns: 1fr; min-height: 0; }
+    .worktree-list { display: flex; flex-wrap: wrap; padding-top: 12px; border-right: 0; border-bottom: 1px solid #343d2b; }
+    .list-label { width: 100%; font-size: 9px; margin: 0 10px 8px; }
+    .branch-option { flex: 1; width: auto; min-height: 54px; gap: 5px; padding: 10px 7px; }
+    .branch-symbol { font-size: 15px; }
+    .branch-option strong { font-size: 10px; }
+    .branch-option small { font-size: 8px; margin-top: 4px; }
+    .branch-indicator { display: none; }
+    .tree-foot { display: none; }
+    .panes { padding: 7px; gap: 7px; grid-template-rows: auto auto; }
+    .pane-heading { padding: 10px; font-size: 10px; letter-spacing: .3px; }
+    .pane-state, .shell-path { font-size: 9px; }
+    .agent-content { padding: 14px 12px; font-size: 11px; }
+    .agent-content p { margin-bottom: 12px; }
+    .agent-content .agent-ready { font-size: 9px; }
+    .shell-content { padding: 12px; font-size: 11px; }
+    .shell-content p { white-space: pre-wrap; }
+    .console-bottom { font-size: 9px; padding-inline: 10px; }
+    .demo-controls { flex-direction: column; gap: 11px; padding-top: 19px; }
+    .demo-controls button { min-height: 36px; font-size: 11px; }
+    .demo-controls p { text-align: left; font-size: 10px; max-width: none; }
+    .instrument-coordinate { font-size: 9px; margin-top: 14px; }
+    .compatibility { display: block; padding-block: 23px; }
+    .compatibility > p { margin-bottom: 20px; font-size: 7px; }
+    .compatibility > p br { display: none; }
+    .compatibility strong { margin-left: 7px; }
+    .compatibility > div { gap: 13px; font-size: 14px; }
+    .shell-tool { font-size: 11px; }
+    .git-tool { font-size: 12px; }
+    .git-tool > span { display: none; }
+    .section { padding-block: 52px; }
+    .eyebrow { font-size: 10px; letter-spacing: .9px; margin-bottom: 20px; }
+    h2 { font-size: 34px; letter-spacing: -1.7px; }
+    .section-intro { display: block; margin-bottom: 30px; }
+    .section-intro > p:last-child { margin: 20px 0 0; max-width: 310px; font-size: 11px; }
+    .workflow-rows article { grid-template-columns: 22px 1fr; gap: 12px; padding-block: 25px; }
+    h3 { font-size: 18px; }
+    .row-art { grid-column: 2; justify-self: start; margin-top: 9px; }
+    .branch-art { font-size: 9px; }
+    .key-art kbd { padding: 7px 12px; }
+    .session-art { font-size: 8px; }
+    .infra-copy h2 { font-size: 33px; }
+    .compose-diagram { padding: 17px 14px; }
+    .compose-lane { grid-template-columns: 78px 1fr 160px; }
+    .lane-branch { font-size: 8px; }
+    .lane-branch > span { font-size: 16px; margin-right: 3px; }
+    .resource-group { padding: 12px; }
+    .resource-group > span { font-size: 6px; }
+    .controls-section { grid-template-columns: 1fr; gap: 27px; }
+    .control-options article { padding-block: 23px; }
+    .control-options p { max-width: none; }
+    .start-section { grid-template-columns: 1fr; padding-block: 49px; gap: 28px; }
+    .start-copy h2 { font-size: 43px; }
+    .start-copy > p:last-child { font-size: 11px; }
+    .install-panel { padding: 19px; }
+    pre { font-size: 12px; }
+    .footer { padding-block: 25px; gap: 17px; }
+    .footer p { font-size: 9px; }
+    .footer > a:not(.wordmark) { width: 100%; font-size: 10px; }
+  }
+</style>

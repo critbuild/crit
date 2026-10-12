@@ -1,0 +1,583 @@
+---
+/**
+ * Fig. 01, the Parallel switchboard: an interactive, illustrative Crit workspace.
+ * The window borrows the TUI's own vocabulary and palette: numbered tabs with
+ * state marks and a `› label` workspace header with `[kind n · state]` sessions.
+ * A soft-white rule separates the header from terminal content. Every pane,
+ * session chip and transcript is rendered here, so Astro's scoped styles apply
+ * and the figure reads correctly without JavaScript; the script only flips
+ * attributes and announces each change in the status line.
+ */
+type Kind = 'omp' | 'opencode' | 'shell';
+type State = 'working' | 'input' | 'idle';
+interface Line {
+  kind: 'cmd' | 'out' | 'agent' | 'busy' | 'ask' | 'choice' | 'prompt';
+  text: string;
+}
+interface Session { kind: Kind; state: State; closed?: boolean; lines: Line[] }
+interface Lane { id: string; branch: string; tone: 'paper' | 'lime' | 'sky'; sessions: Session[] }
+
+const lanes: Lane[] = [
+  {
+    id: 'main',
+    branch: 'main',
+    tone: 'paper',
+    sessions: [
+      {
+        kind: 'shell',
+        state: 'idle',
+        lines: [
+          { kind: 'cmd', text: 'git worktree list' },
+          { kind: 'out', text: '~/dev/harbor              0c4f2e1 [main]' },
+          { kind: 'out', text: '…/feat-csv-export-…       7a91b3d [feat/csv-export]' },
+          { kind: 'out', text: '…/fix-date-parsing-…      e25d8c0 [fix/date-parsing]' },
+          { kind: 'prompt', text: '' },
+        ],
+      },
+    ],
+  },
+  {
+    id: 'csv',
+    branch: 'feat/csv-export',
+    tone: 'lime',
+    sessions: [
+      {
+        kind: 'omp',
+        state: 'working',
+        lines: [
+          { kind: 'agent', text: 'reading src/reports/export.rs' },
+          { kind: 'agent', text: 'adding a CSV writer beside the JSON one' },
+          { kind: 'agent', text: 'editing src/reports/export.rs  +38 −4' },
+          { kind: 'busy', text: 'running cargo test reports::export' },
+        ],
+      },
+      {
+        kind: 'shell',
+        state: 'idle',
+        lines: [
+          { kind: 'cmd', text: 'git diff --stat' },
+          { kind: 'out', text: ' src/reports/export.rs | 42 +++++++++++++++++++--' },
+          { kind: 'out', text: ' 1 file changed, 38 insertions(+), 4 deletions(-)' },
+          { kind: 'prompt', text: '' },
+        ],
+      },
+    ],
+  },
+  {
+    id: 'dates',
+    branch: 'fix/date-parsing',
+    tone: 'sky',
+    sessions: [
+      {
+        kind: 'opencode',
+        state: 'input',
+        lines: [
+          { kind: 'agent', text: 'found two date parsers that disagree on UTC' },
+          { kind: 'agent', text: 'invoice due dates go through both of them' },
+          { kind: 'ask', text: 'Keep invoice due dates in UTC?' },
+          { kind: 'choice', text: '1 Keep UTC    2 Use the customer’s timezone' },
+        ],
+      },
+      { kind: 'shell', state: 'idle', closed: true, lines: [{ kind: 'prompt', text: '' }] },
+    ],
+  },
+];
+const initialLane = 'csv';
+const layouts = [
+  { id: 'full', label: 'Full' },
+  { id: 'vertical', label: 'Side by side', key: 'Ctrl+Shift+,' },
+  { id: 'horizontal', label: 'Top & bottom', key: 'Ctrl+Shift+.' },
+];
+
+const MARK: Record<State, string> = { working: '*', input: '!', idle: '·' };
+const STATE_WORD: Record<State, string> = { working: 'working', input: 'waiting for input', idle: 'idle' };
+const STATE_TEXT: Record<State, string> = { working: 'is working', input: 'is waiting for input', idle: 'is idle' };
+const GLYPH: Partial<Record<Line['kind'], string>> = { cmd: '$', prompt: '$', agent: '›', busy: '•', ask: '?' };
+
+const laneState = (lane: Lane): State => {
+  const open = lane.sessions.filter((session) => !session.closed);
+  if (open.some((session) => session.state === 'input')) return 'input';
+  return open.some((session) => session.state === 'working') ? 'working' : 'idle';
+};
+// Junction routes in a 44 × 196 box: three 60px lane bars with 8px gaps, centred at y = 30, 98, 166.
+const route = (index: number) => {
+  const y = 30 + index * 68;
+  return `M12 0V${y - 12}Q12 ${y} 24 ${y}H44`;
+};
+const start = lanes.find((lane) => lane.id === initialLane) ?? lanes[0];
+const startSessions = start.sessions.flatMap((session, index) => (session.closed ? [] : [`${session.kind} ${index + 1} ${STATE_TEXT[session.state]}`]));
+const startStatus = `${start.branch} is focused, showing ${start.sessions[0].kind} 1. In this worktree, ${startSessions.join('; ')}.`;
+const clientLanes = lanes.map(({ id, branch, sessions }) => ({
+  id,
+  branch,
+  sessions: sessions.map(({ kind, state, closed = false }) => ({ kind, state, closed })),
+}));
+---
+<figure class="sb" data-switchboard data-lanes={JSON.stringify(clientLanes)} data-initial-lane={initialLane} data-layout="full">
+  <figcaption class="sb-caption">
+    <span>Fig. 01 · Switchboard</span>
+    <span class="sb-honest">Interactive illustration, drawn for this page. Not actual agent output.</span>
+  </figcaption>
+
+  <div class="sb-grid">
+    <div class="sb-controls">
+      <fieldset class="sb-set sb-set-lanes">
+        <legend class="sb-legend">Worktrees in harbor</legend>
+        <div class="sb-lane-list">
+          <svg class="sb-junction" viewBox="0 0 44 196" preserveAspectRatio="none" aria-hidden="true" focusable="false">
+            <g class="sb-junction-base">{lanes.map((_, index) => <path d={route(index)} />)}</g>
+            <g>{lanes.map((lane, index) => <path class="sb-route" data-route={lane.id} data-on={lane.id === initialLane ? '' : undefined} d={route(index)} />)}</g>
+          </svg>
+          {lanes.map((lane, index) => (
+            <label class="sb-lane" data-tone={lane.tone}>
+              <input type="radio" name="sb-lane" value={lane.id} checked={lane.id === initialLane} />
+              <span class="sb-lane-bar">
+                <span class="sb-lane-dot" aria-hidden="true"></span>
+                <span class="sb-lane-num">{index + 1}</span>
+                <span class="sb-lane-text">
+                  <span class="sb-lane-name">{lane.branch}<span class="sb-lane-mark" data-state={laneState(lane)} aria-hidden="true">{MARK[laneState(lane)]}</span><span class="sr-only">, {STATE_WORD[laneState(lane)]}</span></span>
+                  <span class="sb-lane-sum">{lane.sessions.map((session, sessionIndex) => <span data-lane-session={`${lane.id}:${sessionIndex}`} hidden={session.closed}>{session.kind}</span>)}</span>
+                </span>
+              </span>
+            </label>
+          ))}
+        </div>
+      </fieldset>
+
+      <div class="sb-set" role="group" aria-labelledby="sb-keys-title">
+        <p class="sb-legend" id="sb-keys-title">Session keys</p>
+        <div class="sb-keys">
+          <button type="button" class="sb-key" data-key="shell" aria-disabled="false">
+            <span class="sb-caps"><kbd>Ctrl</kbd><span aria-hidden="true">+</span><kbd>D</kbd></span>
+            <span>Shell; the agent keeps running</span>
+          </button>
+          <button type="button" class="sb-key" data-key="first" aria-disabled="true">
+            <span class="sb-caps"><kbd>Ctrl</kbd><span aria-hidden="true">+</span><kbd>Shift</kbd><span aria-hidden="true">+</span><kbd>1</kbd></span>
+            <span>Back to session 1</span>
+          </button>
+        </div>
+      </div>
+
+      <fieldset class="sb-set">
+        <legend class="sb-legend">Layout</legend>
+        <div class="sb-seg">
+          {layouts.map((layout) => (
+            <label class="sb-seg-opt">
+              <input type="radio" name="sb-layout" value={layout.id} checked={layout.id === 'full'} />
+              <span class="sb-seg-face">
+                <span class="sb-seg-icon" data-icon={layout.id} aria-hidden="true"></span>
+                <span>{layout.label}</span>
+                {layout.key && <kbd class="sb-seg-key">{layout.key}</kbd>}
+              </span>
+            </label>
+          ))}
+        </div>
+        <p class="sb-note">In Crit, <kbd>Ctrl+Shift+L</kbd> cycles all three.</p>
+      </fieldset>
+    </div>
+
+    <div class="sb-stage">
+      <div class="sb-window" role="group" aria-label="Illustrative Crit workspace for a project called harbor">
+        <div class="sb-tabs" aria-hidden="true">
+          <span class="sb-project" data-current>harbor</span>
+          {lanes.map((lane, index) => (
+            <span class="sb-tab" data-tab={lane.id} data-selected={lane.id === initialLane ? '' : undefined}>{` ${index + 1} ${lane.branch} `}<span class="sb-mark" data-state={laneState(lane)}>{MARK[laneState(lane)]}</span></span>
+          ))}
+          <span class="sb-divider">│</span>
+          <span class="sb-project">site</span>
+          <span class="sb-tab">{' 1 main '}<span class="sb-mark" data-state="idle">·</span></span>
+        </div>
+        <div class="sb-screen" data-screen role="group" aria-label="Workspace panes">
+          <div class="sb-panes">
+            {lanes.map((lane) => {
+              const focused = lane.id === initialLane;
+              return (
+                <div class="sb-pane" role="group" aria-label={`${lane.branch} workspace`} data-pane={lane.id} data-slot={focused ? 'primary' : undefined} data-focused={focused ? '' : undefined} hidden={!focused}>
+                  <div class="sb-head">
+                    <span class="sb-label">{lane.branch}</span>
+                    {lane.sessions.map((session, index) => (
+                      <span class="sb-chip" data-chip={index} data-state={session.state} data-active={index === 0 ? '' : undefined} hidden={session.closed}>{`${session.kind} ${index + 1} · ${session.state}`}</span>
+                    ))}
+                  </div>
+                  {lane.sessions.map((session, index) => (
+                    <div class="sb-body" data-body={index} hidden={index !== 0}>
+                      {session.lines.map((line) => (
+                        <p class="sb-line" data-kind={line.kind}>{GLYPH[line.kind] && <span class="sb-glyph" aria-hidden="true">{`${GLYPH[line.kind]} `}</span>}{line.text}{line.kind === 'prompt' && <span class="sb-cursor" aria-hidden="true"></span>}</p>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="sb-foot">
+    <p class="sb-status" role="status" data-status>{startStatus}</p>
+    <button type="button" class="sb-reset" data-key="reset">Reset</button>
+  </div>
+</figure>
+
+<style>
+  .sb {
+    --sb-ink: var(--pl-ink, #13122e);
+    --sb-ink-2: var(--pl-ink-2, #45446b);
+    --sb-paper: var(--pl-paper, #f4f3ea);
+    --sb-paper-2: var(--pl-paper-2, #e8e6d8);
+    --sb-blue: var(--pl-blue, #3935ed);
+    --sb-lime: var(--pl-lime, #d5fc64);
+    --sb-sky: var(--pl-sky, #90bfff);
+    --sb-on-blue-2: var(--pl-on-blue-2, #d9d8ff);
+    /* The window itself uses Crit's own TUI palette. */
+    --sb-term: #0c1019;
+    --sb-fg: #e0e4e8;
+    --sb-out: #c3cad3;
+    --sb-muted: #9aa5b4;
+    --sb-border: #333e4d;
+    --sb-accent: #90bfff;
+    --sb-green: #a5d6b3;
+    --sb-amber: #e8bc80;
+    margin: 0;
+    border: 3px solid var(--sb-ink);
+    background: var(--sb-paper);
+    color: var(--sb-ink);
+    box-shadow: 8px 8px 0 var(--sb-blue);
+  }
+  .sb kbd { font-family: var(--font-mono); }
+
+  .sb-caption {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    gap: 4px 24px;
+    padding: 11px clamp(14px, 2.4vw, 26px);
+    background: var(--sb-ink);
+    color: var(--sb-paper);
+    font: 11.5px/1.5 var(--font-mono);
+    letter-spacing: .07em;
+    text-transform: uppercase;
+  }
+  .sb-honest { color: var(--sb-lime); }
+
+  .sb-grid { display: grid; gap: 26px; padding: clamp(16px, 2.6vw, 30px); }
+  .sb-controls { display: grid; gap: 22px; align-content: start; min-width: 0; }
+  .sb-set { min-width: 0; margin: 0; padding: 0; border: 0; }
+  .sb-legend { margin: 0 0 10px; padding: 0; color: var(--sb-ink-2); font: 12px/1.4 var(--font-mono); letter-spacing: .1em; text-transform: uppercase; }
+
+  /* worktree lanes */
+  .sb-lane-list { position: relative; display: grid; gap: 8px; padding-left: 44px; }
+  .sb-junction { position: absolute; top: 0; left: 0; width: 44px; height: 100%; overflow: visible; }
+  .sb-junction path { fill: none; vector-effect: non-scaling-stroke; }
+  .sb-junction-base path { stroke: var(--sb-ink); stroke-width: 2.5; }
+  .sb-route { stroke: var(--sb-blue); stroke-width: 6; opacity: 0; transition: opacity .2s ease; }
+  .sb-route[data-on] { opacity: 1; }
+  .sb-lane { position: relative; display: block; }
+  .sb-lane[data-tone='paper'] { --tone: var(--sb-paper); }
+  .sb-lane[data-tone='lime'] { --tone: var(--sb-lime); }
+  .sb-lane[data-tone='sky'] { --tone: var(--sb-sky); }
+  .sb-lane input, .sb-seg-opt input { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+  .sb-lane-bar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    height: 60px;
+    padding: 0 14px 0 12px;
+    border: 2px solid var(--sb-ink);
+    background: var(--sb-paper);
+    transition: background .15s ease, color .15s ease, border-color .15s ease;
+  }
+  .sb-lane input:hover + .sb-lane-bar { background: var(--sb-paper-2); }
+  .sb-lane input:checked + .sb-lane-bar { border-color: var(--sb-blue); background: var(--sb-blue); color: var(--sb-paper); }
+  .sb-lane input:focus-visible + .sb-lane-bar { outline: 3px solid var(--sb-ink); outline-offset: 3px; }
+  .sb-lane-dot { flex: none; width: 16px; height: 16px; border: 3px solid var(--sb-ink); border-radius: 50%; background: var(--tone); }
+  .sb-lane input:checked + .sb-lane-bar .sb-lane-dot { border-color: var(--sb-paper); }
+  .sb-lane-num { flex: none; font: 13px/1 var(--font-mono); }
+  .sb-lane-text { display: grid; gap: 3px; min-width: 0; }
+  .sb-lane-name { overflow: hidden; font: 700 16px/1.2 var(--font-sans); letter-spacing: -.01em; white-space: nowrap; text-overflow: ellipsis; }
+  .sb-lane-mark { margin-left: .45em; font-family: var(--font-mono); font-weight: 400; }
+  .sb-lane-mark[data-state='working'] { animation: sb-pulse 1.6s ease-in-out infinite; }
+  .sb-lane-sum { overflow: hidden; color: var(--sb-ink-2); font: 12px/1.2 var(--font-mono); white-space: nowrap; text-overflow: ellipsis; }
+  .sb-lane-sum > span + span::before { content: ' + '; }
+  .sb-lane input:checked + .sb-lane-bar .sb-lane-sum { color: var(--sb-on-blue-2); }
+
+  /* session keys */
+  .sb-keys { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+  .sb-key {
+    display: grid;
+    align-content: start;
+    justify-items: start;
+    gap: 9px;
+    min-height: 82px;
+    padding: 12px 14px;
+    border: 2px solid var(--sb-ink);
+    background: var(--sb-paper);
+    color: var(--sb-ink);
+    font: 650 14px/1.25 var(--font-sans);
+    text-align: left;
+    transition: background .15s ease;
+  }
+  .sb-key:hover { background: var(--sb-lime); }
+  .sb-key:focus-visible, .sb-reset:focus-visible { outline: 3px solid var(--sb-ink); outline-offset: 3px; }
+  .sb-key[aria-disabled='true'] { border-style: dashed; background: transparent; color: var(--sb-ink-2); }
+  .sb-key[aria-disabled='true']:hover { background: var(--sb-paper-2); }
+  .sb-caps { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; font: 12px/1 var(--font-mono); }
+  .sb-caps kbd { min-width: 26px; padding: 4px 6px 3px; border: 1.5px solid currentColor; border-bottom-width: 3px; border-radius: 5px; font-size: 12px; line-height: 1.2; text-align: center; }
+
+  /* layout */
+  .sb-seg { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border: 2px solid var(--sb-ink); }
+  .sb-seg-opt { position: relative; }
+  .sb-seg-opt + .sb-seg-opt { border-left: 2px solid var(--sb-ink); }
+  .sb-seg-face { display: grid; justify-items: center; align-content: center; gap: 7px; height: 100%; min-height: 72px; padding: 10px 6px; font: 650 13.5px/1.2 var(--font-sans); text-align: center; transition: background .15s ease; }
+  .sb-seg-opt input:hover:not(:checked) + .sb-seg-face { background: var(--sb-paper-2); }
+  .sb-seg-opt input:checked + .sb-seg-face { background: var(--sb-blue); color: var(--sb-paper); }
+  .sb-seg-opt input:focus-visible + .sb-seg-face { outline: 3px solid currentColor; outline-offset: -7px; }
+  .sb-seg-icon { width: 30px; height: 20px; border: 2px solid currentColor; }
+  .sb-seg-icon[data-icon='vertical'] { background: linear-gradient(currentColor, currentColor) center / 2px 100% no-repeat; }
+  .sb-seg-icon[data-icon='horizontal'] { background: linear-gradient(currentColor, currentColor) center / 100% 2px no-repeat; }
+  .sb-seg-key { display: none; font-size: 11px; font-weight: 400; }
+  .sb-note { margin: 10px 0 0; color: var(--sb-ink-2); font-size: 13.5px; }
+  .sb-note kbd { padding: 1px 6px; border: 1.5px solid currentColor; border-bottom-width: 2.5px; border-radius: 4px; font-size: 12px; white-space: nowrap; }
+
+  /* the window */
+  .sb-stage { min-width: 0; }
+  .sb-window { border: 2px solid var(--sb-ink); background: var(--sb-term); color: var(--sb-fg); font: 12px/1.55 var(--font-mono); }
+  .sb-tabs { display: flex; flex-wrap: wrap; align-items: center; padding: 6px 6px; border-bottom: 1px solid var(--sb-border); color: var(--sb-muted); white-space: pre; }
+  .sb-project { padding: 0 1ch; }
+  .sb-project[data-current] { color: var(--sb-fg); }
+  .sb-tab[data-selected] { color: var(--sb-accent); }
+  .sb-tab .sb-mark { margin-right: 1ch; }
+  .sb-mark[data-state='working'] { color: var(--sb-green); animation: sb-pulse 1.6s ease-in-out infinite; }
+  .sb-mark[data-state='input'] { color: var(--sb-amber); }
+  .sb-divider { color: var(--sb-border); }
+  .sb-screen { overflow-x: auto; overscroll-behavior-x: contain; }
+  .sb-screen:focus-visible { outline: 3px solid var(--sb-accent); outline-offset: -3px; }
+  .sb-panes { display: grid; height: 24rem; }
+  .sb[data-layout='vertical'] .sb-panes { grid-template-columns: repeat(2, minmax(0, 1fr)); min-width: 34rem; }
+  .sb[data-layout='horizontal'] .sb-panes { grid-template-rows: repeat(2, minmax(0, 1fr)); }
+  .sb-pane { min-width: 0; min-height: 0; overflow: hidden; }
+  .sb-pane[data-slot='secondary'] { order: 2; }
+  .sb[data-layout='vertical'] .sb-pane[data-slot='secondary'] { border-left: 1px solid var(--sb-border); }
+  .sb[data-layout='horizontal'] .sb-pane[data-slot='secondary'] { border-top: 1px solid var(--sb-border); }
+  .sb-head { display: flex; flex-wrap: wrap; padding: 6px; margin-bottom: 6px; border-bottom: 1px solid var(--sb-fg); color: var(--sb-muted); white-space: pre; }
+  .sb-label { padding: 0 1ch; color: var(--sb-fg); }
+  .sb-pane[data-focused] .sb-label { color: var(--sb-accent); }
+  .sb-pane[data-focused] .sb-label::before { content: '› '; }
+  .sb-chip { padding: 0 1ch; }
+  .sb-chip[data-active]::before { content: '['; }
+  .sb-chip[data-active]::after { content: ']'; }
+  .sb-chip[data-active][data-state='working'] { color: var(--sb-green); }
+  .sb-chip[data-active][data-state='input'] { color: var(--sb-amber); }
+  .sb-body { padding: 0 2ch 12px; }
+  .sb-line { margin: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+  .sb-line[data-kind='out'] { color: var(--sb-out); }
+  .sb-line[data-kind='choice'] { padding-left: 2ch; color: var(--sb-muted); }
+  .sb-line[data-kind='busy'] { color: var(--sb-green); }
+  .sb-glyph { color: var(--sb-muted); }
+  .sb-line[data-kind='cmd'] .sb-glyph, .sb-line[data-kind='prompt'] .sb-glyph { color: var(--sb-green); }
+  .sb-line[data-kind='agent'] .sb-glyph { color: var(--sb-accent); }
+  .sb-line[data-kind='busy'] .sb-glyph { animation: sb-pulse 1.2s ease-in-out infinite; }
+  .sb-line[data-kind='ask'] .sb-glyph { color: var(--sb-amber); }
+  .sb-cursor { display: inline-block; width: .62em; height: 1.15em; vertical-align: -.22em; background: var(--sb-fg); animation: sb-blink 1.1s steps(1) infinite; }
+
+  .sb-foot { display: flex; align-items: flex-start; justify-content: space-between; gap: 14px 24px; padding: 14px clamp(16px, 2.6vw, 30px) 16px; border-top: 2px solid var(--sb-ink); }
+  .sb-status { min-height: 4.5em; margin: 0; max-width: 62rem; font: 13px/1.5 var(--font-mono); }
+  .sb-reset { flex: none; padding: 9px 16px; border: 2px solid var(--sb-ink); background: transparent; color: var(--sb-ink); font: 650 14px/1 var(--font-sans); transition: background .15s ease; }
+  .sb-reset:hover { background: var(--sb-lime); }
+
+  @keyframes sb-pulse { 50% { opacity: .35; } }
+  @keyframes sb-blink { 50% { opacity: 0; } }
+
+  @media (min-width: 560px) {
+    .sb-seg-key { display: block; }
+    .sb-status { min-height: 3em; }
+  }
+  @media (min-width: 720px) {
+    .sb { box-shadow: 12px 12px 0 var(--sb-blue); }
+    .sb-controls { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: 28px; }
+    .sb-set-lanes { grid-row: span 2; }
+    .sb-window { font-size: 13px; }
+    .sb-panes { height: 22rem; }
+  }
+  @media (min-width: 1100px) {
+    .sb-grid { grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 34px; }
+    .sb-controls { grid-template-columns: minmax(0, 1fr); }
+    .sb-set-lanes { grid-row: auto; }
+    /* Let the window grow to the height of the controls column. */
+    .sb-stage { display: grid; }
+    .sb-window { display: grid; grid-template-rows: auto minmax(22rem, 1fr); }
+    .sb-panes { height: 100%; }
+  }
+  @media (forced-colors: active) {
+    .sb-lane input:checked + .sb-lane-bar, .sb-seg-opt input:checked + .sb-seg-face { outline: 3px solid Highlight; outline-offset: -6px; }
+    .sb-key[aria-disabled='true'] { color: GrayText; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .sb-lane-mark[data-state='working'], .sb-mark[data-state='working'], .sb-line[data-kind='busy'] .sb-glyph, .sb-cursor { animation: none; }
+  }
+</style>
+
+<script>
+  type Kind = 'omp' | 'opencode' | 'shell';
+  type State = 'working' | 'input' | 'idle';
+  type Layout = 'full' | 'vertical' | 'horizontal';
+  interface LaneInfo { id: string; branch: string; sessions: { kind: Kind; state: State; closed: boolean }[] }
+
+  const STATE_TEXT: Record<State, string> = { working: 'is working', input: 'is waiting for input', idle: 'is idle' };
+  const STILL_TEXT: Record<State, string> = { working: 'is still working', input: 'is still waiting for input', idle: 'is still idle' };
+
+  function setup(board: HTMLElement) {
+    const lanes: LaneInfo[] = JSON.parse(board.dataset.lanes ?? '[]');
+    if (lanes.length === 0) return;
+    const initialLane = board.dataset.initialLane ?? lanes[0].id;
+    const laneRadios = Array.from(board.querySelectorAll<HTMLInputElement>('input[name="sb-lane"]'));
+    const layoutRadios = Array.from(board.querySelectorAll<HTMLInputElement>('input[name="sb-layout"]'));
+    const panes = Array.from(board.querySelectorAll<HTMLElement>('[data-pane]'));
+    const tabs = Array.from(board.querySelectorAll<HTMLElement>('[data-tab]'));
+    const routes = Array.from(board.querySelectorAll<SVGPathElement>('[data-route]'));
+    const summaries = Array.from(board.querySelectorAll<HTMLElement>('[data-lane-session]'));
+    const screen = board.querySelector<HTMLElement>('[data-screen]');
+    const shellKey = board.querySelector<HTMLButtonElement>('[data-key="shell"]');
+    const firstKey = board.querySelector<HTMLButtonElement>('[data-key="first"]');
+    const resetKey = board.querySelector<HTMLButtonElement>('[data-key="reset"]');
+    const status = board.querySelector<HTMLElement>('[data-status]');
+
+    let lane = laneRadios.find((radio) => radio.checked)?.value ?? initialLane;
+    let layout = (layoutRadios.find((radio) => radio.checked)?.value ?? 'full') as Layout;
+    const active = new Map<string, number>();
+    const opened = new Set<string>();
+
+    const find = (id: string) => lanes.find((entry) => entry.id === id) ?? lanes[0];
+    const isOpen = (entry: LaneInfo, index: number) => !entry.sessions[index].closed || opened.has(`${entry.id}:${index}`);
+    const label = (entry: LaneInfo, index: number) => `${entry.sessions[index].kind} ${index + 1}`;
+    const selected = (entry: LaneInfo) => active.get(entry.id) ?? 0;
+    const partner = () => lanes[(lanes.findIndex((entry) => entry.id === lane) + 1) % lanes.length];
+    const announce = (message: string) => {
+      if (status) status.textContent = message;
+    };
+
+    const describeLane = () => {
+      const entry = find(lane);
+      const sessions = entry.sessions.flatMap((session, index) => (isOpen(entry, index) ? [`${label(entry, index)} ${STATE_TEXT[session.state]}`] : []));
+      const second = layout === 'full' ? '' : ` ${partner().branch} is in the second pane.`;
+      return `${entry.branch} is focused, showing ${label(entry, selected(entry))}. In this worktree, ${sessions.join('; ')}.${second}`;
+    };
+    const describeLayout = () => {
+      const entry = find(lane);
+      const second = partner();
+      if (layout === 'vertical') return `Side by side: ${second.branch} opens in the second pane, next to ${entry.branch}. In Crit you name the branch for that pane.`;
+      if (layout === 'horizontal') return `Top and bottom: ${second.branch} sits below ${entry.branch}. In Crit you name the branch for that pane.`;
+      return `Full width: ${entry.branch} fills the screen again. The other tabs keep their sessions running.`;
+    };
+
+    // The pane area only scrolls sideways in a narrow side-by-side split; make it focusable only then.
+    const syncScroll = () => {
+      if (!screen) return;
+      if (screen.scrollWidth > screen.clientWidth + 1) screen.setAttribute('tabindex', '0');
+      else screen.removeAttribute('tabindex');
+    };
+
+    const render = () => {
+      const focused = find(lane);
+      const second = partner();
+      board.dataset.layout = layout;
+      for (const pane of panes) {
+        const entry = find(pane.dataset.pane ?? '');
+        const slot = entry.id === lane ? 'primary' : layout !== 'full' && entry.id === second.id ? 'secondary' : '';
+        pane.hidden = slot === '';
+        if (slot) pane.dataset.slot = slot;
+        else delete pane.dataset.slot;
+        pane.toggleAttribute('data-focused', entry.id === lane);
+        const current = selected(entry);
+        for (const chip of pane.querySelectorAll<HTMLElement>('[data-chip]')) {
+          const index = Number(chip.dataset.chip);
+          chip.hidden = !isOpen(entry, index);
+          chip.toggleAttribute('data-active', index === current);
+        }
+        for (const body of pane.querySelectorAll<HTMLElement>('[data-body]')) body.hidden = Number(body.dataset.body) !== current;
+      }
+      for (const tab of tabs) tab.toggleAttribute('data-selected', tab.dataset.tab === lane);
+      for (const path of routes) path.toggleAttribute('data-on', path.dataset.route === lane);
+      for (const item of summaries) {
+        const [id, index] = (item.dataset.laneSession ?? '').split(':');
+        item.hidden = !isOpen(find(id), Number(index));
+      }
+      for (const radio of laneRadios) radio.checked = radio.value === lane;
+      for (const radio of layoutRadios) radio.checked = radio.value === layout;
+      const current = selected(focused);
+      shellKey?.setAttribute('aria-disabled', String(focused.sessions[current].kind === 'shell'));
+      firstKey?.setAttribute('aria-disabled', String(current === 0));
+      syncScroll();
+    };
+
+    for (const radio of laneRadios) {
+      radio.addEventListener('change', () => {
+        if (!radio.checked) return;
+        lane = radio.value;
+        render();
+        announce(describeLane());
+      });
+    }
+    for (const radio of layoutRadios) {
+      radio.addEventListener('change', () => {
+        if (!radio.checked) return;
+        layout = radio.value as Layout;
+        render();
+        announce(describeLayout());
+      });
+    }
+
+    shellKey?.addEventListener('click', () => {
+      const entry = find(lane);
+      const from = selected(entry);
+      const session = entry.sessions[from];
+      if (session.kind === 'shell') {
+        const agent = entry.sessions.findIndex((candidate) => candidate.kind !== 'shell');
+        announce(
+          agent === -1
+            ? `${entry.branch} only has a shell. In a shell, Ctrl+D is end-of-input for the shell itself; Crit doesn’t intercept it.`
+            : `${label(entry, from)} is already selected. In a shell, Ctrl+D is end-of-input for the shell, not a switch back. Ctrl+Shift+1 returns to ${label(entry, agent)}.`,
+        );
+        return;
+      }
+      const shell = entry.sessions.findIndex((candidate) => candidate.kind === 'shell');
+      const wasOpen = isOpen(entry, shell);
+      if (!wasOpen) opened.add(`${entry.id}:${shell}`);
+      active.set(entry.id, shell);
+      render();
+      announce(`Ctrl+D ${wasOpen ? 'selected' : 'opened'} ${label(entry, shell)} in ${entry.branch}, and ${label(entry, from)} ${STILL_TEXT[session.state]}.`);
+    });
+
+    firstKey?.addEventListener('click', () => {
+      const entry = find(lane);
+      const from = selected(entry);
+      if (from === 0) {
+        announce(`${label(entry, 0)} is already the selected session in ${entry.branch}.`);
+        return;
+      }
+      active.set(entry.id, 0);
+      render();
+      announce(`Ctrl+Shift+1 selected ${label(entry, 0)} in ${entry.branch}; ${label(entry, from)} stays open beside it.`);
+    });
+
+    resetKey?.addEventListener('click', () => {
+      lane = initialLane;
+      layout = 'full';
+      active.clear();
+      opened.clear();
+      render();
+      const entry = find(lane);
+      announce(`Back to the start: ${entry.branch}, ${label(entry, 0)}, full width.`);
+    });
+
+    if (screen && 'ResizeObserver' in window) new ResizeObserver(syncScroll).observe(screen);
+    render();
+    // A browser may restore radio state on reload; keep the status line truthful without announcing it.
+    if (lane !== initialLane || layout !== 'full') announce(describeLane());
+  }
+
+  const board = document.querySelector<HTMLElement>('[data-switchboard]');
+  if (board) setup(board);
+</script>

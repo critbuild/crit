@@ -1,0 +1,91 @@
+---
+/**
+ * The Parallel hero graphic: a main line forking into two parallel lanes, each
+ * ending at a station labelled like a Crit tab (` 2 feat/csv-export * `) and its
+ * selected session (`[omp 1 · working]`). The fork is a fixed-ratio SVG and the
+ * long runs are CSS bars, so stroke weight and labels stay crisp at any width.
+ * The whole graphic is one labelled image; the parts are decorative.
+ */
+const lanes = [
+  { n: 1, branch: 'main', mark: '·', session: '[shell 1 · idle]', tone: 'paper' },
+  { n: 2, branch: 'feat/csv-export', mark: '*', session: '[omp 1 · working]', tone: 'lime' },
+  { n: 3, branch: 'fix/date-parsing', mark: '!', session: '[opencode 1 · input]', tone: 'sky' },
+];
+---
+<div
+  class="lanes"
+  role="img"
+  aria-label="Illustration: the main line forks into two parallel lanes. feat/csv-export has an OMP session working and fix/date-parsing has OpenCode waiting for input, each in its own worktree beside main."
+>
+  <svg class="lanes-fork" viewBox="0 0 140 150" aria-hidden="true" focusable="false">
+    <path class="lanes-sky" d="M10 25L110 125H143" />
+    <path class="lanes-lime" d="M46 25L96 75H143" />
+    <path class="lanes-paper" d="M-4 25H143" />
+  </svg>
+  {lanes.map((lane) => (
+    <div class="lanes-row" data-tone={lane.tone}>
+      <span class="lanes-run"></span>
+      <span class="lanes-stop"><i></i><b>{lane.n}</b><span>{lane.branch}</span><em>{lane.mark}</em></span>
+      <span class="lanes-session">{lane.session}</span>
+    </div>
+  ))}
+</div>
+
+<style>
+  .lanes {
+    --row: 34px;
+    display: grid;
+    grid-template-columns: calc(var(--row) * 2.8) minmax(0, 1fr);
+    grid-template-rows: repeat(3, var(--row));
+    animation: lanes-draw 1.25s cubic-bezier(.2, .7, .1, 1) .15s both;
+  }
+  .lanes-fork { grid-column: 1; grid-row: 1 / -1; display: block; width: 100%; height: 100%; overflow: visible; }
+  .lanes-fork path { fill: none; stroke-width: 18; stroke-linejoin: round; }
+  .lanes-paper { stroke: var(--pl-paper, #f4f3ea); }
+  .lanes-lime { stroke: var(--pl-lime, #d5fc64); }
+  .lanes-sky { stroke: var(--pl-sky, #90bfff); }
+  .lanes-row { grid-column: 2; display: flex; align-items: center; min-width: 0; }
+  .lanes-row[data-tone='paper'] { --tone: var(--pl-paper, #f4f3ea); }
+  .lanes-row[data-tone='lime'] { --tone: var(--pl-lime, #d5fc64); }
+  .lanes-row[data-tone='sky'] { --tone: var(--pl-sky, #90bfff); }
+  .lanes-run { flex: 1 1 auto; min-width: 16px; height: calc(var(--row) * .36); background: var(--tone); }
+  .lanes-stop {
+    flex: none;
+    display: inline-flex;
+    align-items: center;
+    gap: .6em;
+    height: calc(var(--row) * .78);
+    margin-left: -2px;
+    padding: 0 1em 0 .45em;
+    border-radius: 999px;
+    background: var(--tone);
+    color: var(--pl-ink, #13122e);
+    font: 11px/1 var(--font-mono);
+    white-space: nowrap;
+  }
+  .lanes-stop i { width: calc(var(--row) * .34); height: calc(var(--row) * .34); flex: none; border-radius: 50%; background: var(--pl-ink, #13122e); }
+  .lanes-stop b { font-weight: 400; }
+  .lanes-stop em { font-style: normal; }
+  .lanes-session { display: none; flex: none; width: 13.5rem; padding-left: 1.1rem; color: var(--pl-on-blue-2, #d9d8ff); font: 13px/1 var(--font-mono); white-space: nowrap; }
+  @keyframes lanes-draw {
+    from { clip-path: inset(0 100% 0 0); }
+    to { clip-path: inset(0 0 0 0); }
+  }
+  @media (min-width: 480px) {
+    .lanes { --row: 40px; }
+    .lanes-stop { font-size: 12px; }
+  }
+  @media (min-width: 720px) {
+    .lanes { --row: 50px; }
+    .lanes-stop { font-size: 13px; }
+    .lanes-session { display: block; }
+  }
+  @media (min-width: 1280px) {
+    .lanes { --row: 60px; }
+    .lanes-stop { font-size: 14px; }
+    .lanes-session { font-size: 14px; width: 14.5rem; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .lanes { animation: none; }
+  }
+</style>

@@ -4,7 +4,7 @@ use crate::{
     integration::{self, AgentState},
     intent::{self, Agent as AgentKind, Command as IntentCommand, Plan},
     keys::{self, Action},
-    kitty,
+    kitty, restore,
     terminal::Session,
     ui, updates,
     worktree::{self, Worktree},
@@ -13,8 +13,8 @@ use anyhow::{Context, Result};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-        PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
+        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen},
@@ -22,6 +22,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use std::{
     collections::VecDeque,
+    fmt::Write as _,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
     sync::{
@@ -55,11 +56,12 @@ pub struct ProjectPicker {
     pub selected: usize,
     pub searching: bool,
     pub pending: bool,
+    request: u64,
     search_text: Vec<String>,
     matches: Vec<usize>,
 }
 impl ProjectPicker {
-    fn new(base: PathBuf, jobs: &SyncSender<Job>) -> Result<Self> {
+    fn new(base: PathBuf, jobs: &SyncSender<Job>, request: u64) -> Result<Self> {
         jobs.try_send(Job::Projects(base.clone()))
             .context("command queue is busy")?;
         Ok(Self {
@@ -70,6 +72,7 @@ impl ProjectPicker {
             selected: 0,
             searching: true,
             pending: false,
+            request,
             search_text: Vec::new(),
             matches: Vec::new(),
         })
@@ -153,8 +156,12 @@ impl ProjectPicker {
                     }
                 };
                 if let Some(path) = path {
-                    jobs.try_send(Job::OpenProject { path, agent: None })
-                        .context("command queue is busy")?;
+                    jobs.try_send(Job::OpenProject {
+                        request: self.request,
+                        path,
+                        agent: None,
+                    })
+                    .context("command queue is busy")?;
                     self.pending = true;
                 }
             }
@@ -261,12 +268,23 @@ pub enum Modal {
     Commands {
         selected: usize,
     },
+    NewTab {
+        choices: Vec<(String, IntentCommand)>,
+        selected: usize,
+    },
     OpenProject(ProjectPicker),
+    Loading {
+        request: u64,
+        message: &'static str,
+        retry: Option<IntentDialog>,
+    },
     SwitchProject {
         selected: usize,
     },
     NewWorktree {
         input: String,
+        /// When set, the created worktree opens as the second pane of this layout.
+        split: Option<LayoutMode>,
     },
     NewSession {
         selected: usize,
@@ -275,6 +293,7 @@ pub enum Modal {
         trees: Vec<Worktree>,
         selected: usize,
     },
+    /// `selected == 0` is "new worktree"; `selected - 1` indexes `workspaces`.
     Split {
         layout: LayoutMode,
         selected: usize,
@@ -288,6 +307,7 @@ pub enum Modal {
 
 pub struct Workspace {
     pub tree: Worktree,
+    pub source: Option<PathBuf>,
     pub sessions: Vec<Session>,
     pub selected: usize,
     pub environment: Option<compose::Environment>,
@@ -297,6 +317,7 @@ impl Workspace {
     fn new(tree: Worktree) -> Self {
         Self {
             tree,
+            source: None,
             sessions: Vec::new(),
             selected: 0,
             environment: None,
@@ -326,6 +347,34 @@ impl Workspace {
 pub struct Pane {
     pub workspace: usize,
     pub body: Rect,
+    pub scrollbar: Option<Scrollbar>,
+}
+
+#[derive(Clone, Copy)]
+pub struct Scrollbar {
+    pub track: Rect,
+    pub thumb: Rect,
+    pub max_offset: usize,
+}
+
+impl Scrollbar {
+    fn offset_at(self, row: u16, grab: u16) -> usize {
+        let travel = self.track.height.saturating_sub(self.thumb.height);
+        let position = row
+            .saturating_sub(self.track.y)
+            .saturating_sub(grab)
+            .min(travel);
+        self.max_offset - self.max_offset * usize::from(position) / usize::from(travel.max(1))
+    }
+}
+
+/// A clickable cell in the tab bar: a project name (`workspace: None`) or one
+/// of its worktrees. `project: None` is the current project; `Some(i)` indexes
+/// `App::saved_projects`.
+pub struct TabHit {
+    pub area: Rect,
+    pub project: Option<usize>,
+    pub workspace: Option<usize>,
 }
 
 pub struct Project {
@@ -336,12 +385,28 @@ pub struct Project {
     pub secondary: Option<usize>,
     pub focus_secondary: bool,
     pub layout: LayoutMode,
+    /// Opening sequence; the tab bar lists projects in this order regardless
+    /// of which one is current. `App::saved_projects` stays sorted by it.
+    pub order: u64,
 }
 impl Project {
+    /// Direct start: `path` must be inside a Git repository.
     fn load(path: &Path) -> Result<Self> {
-        let path = path.canonicalize().context("resolve project folder")?;
-        anyhow::ensure!(path.is_dir(), "choose a project folder, not a file");
+        let path = folder(path)?;
         let repository = worktree::discover(&path)?;
+        Self::from_repository(path, repository)
+    }
+
+    /// Picked in-app: a Git project, or a terminal-only project for any other folder.
+    fn open(path: &Path) -> Result<Self> {
+        let path = folder(path)?;
+        match worktree::discover_optional(&path)? {
+            Some(repository) => Self::from_repository(path, repository),
+            None => Self::terminal(&path),
+        }
+    }
+
+    fn from_repository(path: PathBuf, repository: worktree::Repository) -> Result<Self> {
         let mut trees = worktree::list(&repository)?;
         let active = trees
             .iter()
@@ -350,14 +415,7 @@ impl Project {
             .max_by_key(|(_, tree)| tree.path.components().count())
             .map(|(index, _)| index)
             .context("folder is not inside a checked-out worktree")?;
-        let name = trees[0]
-            .path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .chars()
-            .filter(|c| !c.is_control())
-            .collect();
+        let name = folder_name(&trees[0].path);
         let tree = trees.swap_remove(active);
         Ok(Self {
             repository: Some(repository),
@@ -367,12 +425,16 @@ impl Project {
             secondary: None,
             focus_secondary: false,
             layout: LayoutMode::Full,
+            order: 0,
         })
     }
 
     fn terminal(path: &Path) -> Result<Self> {
-        let path = path.canonicalize().context("resolve terminal folder")?;
-        anyhow::ensure!(path.is_dir(), "choose a terminal folder, not a file");
+        let path = folder(path)?;
+        let mut name = folder_name(&path);
+        if name.is_empty() {
+            name.push_str("Terminal");
+        }
         let tree = Worktree {
             id: format!("terminal:{}", path.display()),
             path,
@@ -383,12 +445,13 @@ impl Project {
         };
         Ok(Self {
             repository: None,
-            name: "Terminal".into(),
+            name,
             workspaces: vec![Workspace::new(tree)],
             active: 0,
             secondary: None,
             focus_secondary: false,
             layout: LayoutMode::Full,
+            order: 0,
         })
     }
 
@@ -441,11 +504,15 @@ pub struct App {
     pub modal: Option<Modal>,
     pub notice: Option<String>,
     pub panes: Vec<Pane>,
-    pub tab_hits: Vec<(Rect, usize)>,
+    scroll_drag: Option<(u64, u16)>,
+    pub tab_hits: Vec<TabHit>,
+    pub interaction_visible: bool,
     pub should_quit: bool,
     default_agent: String,
     next_session: u64,
-    next_intent: u64,
+    next_request: u64,
+    pending_creations: VecDeque<(PathBuf, String, Modal)>,
+    state_dirty: bool,
     socket: PathBuf,
     tx: SyncSender<Event>,
     jobs: SyncSender<Job>,
@@ -454,6 +521,7 @@ pub struct App {
 
 enum Job {
     OpenProject {
+        request: u64,
         path: PathBuf,
         agent: Option<AgentKind>,
     },
@@ -469,11 +537,16 @@ enum Job {
         branch: String,
         base: Option<String>,
         agent: Option<AgentKind>,
+        split: Option<LayoutMode>,
     },
-    List(worktree::Repository),
+    List {
+        request: u64,
+        repository: worktree::Repository,
+    },
     Environment {
         tree: Worktree,
         operation: EnvironmentOp,
+        source: Option<PathBuf>,
     },
     Remove {
         repository: worktree::Repository,
@@ -481,14 +554,137 @@ enum Job {
     },
 }
 #[derive(Clone, Copy)]
-enum EnvironmentOp {
+pub enum EnvironmentOp {
     Up,
     Down,
     Restart,
+    /// Explicit refresh: the outcome is reported in the notice line.
     Status,
+    /// Background check on open: fills `Workspace::environment` silently.
+    Probe,
+}
+
+/// Open projects in opening order, pairing each with its `saved_projects`
+/// index (`None` for the current project). Relies on `saved` being sorted.
+pub fn project_slots<'a>(
+    current: &'a Project,
+    saved: &'a [Project],
+) -> impl Iterator<Item = (Option<usize>, &'a Project)> {
+    let position = saved.partition_point(|project| project.order < current.order);
+    (0..=saved.len()).map(move |slot| match slot.cmp(&position) {
+        std::cmp::Ordering::Less => (Some(slot), &saved[slot]),
+        std::cmp::Ordering::Equal => (None, current),
+        std::cmp::Ordering::Greater => (Some(slot - 1), &saved[slot - 1]),
+    })
+}
+
+/// One-line Compose status for the notice row, e.g. `main: + web :8080 · ! db`.
+fn environment_summary(label: &str, environment: &compose::Environment) -> String {
+    let mut summary = format!("{label}: ");
+    if environment.services.is_empty() {
+        summary.push_str("stack stopped");
+    }
+    for (index, service) in environment.services.iter().enumerate() {
+        let healthy = service.state == "running" && service.health != "unhealthy";
+        if index > 0 {
+            summary.push_str(" · ");
+        }
+        summary.push_str(if healthy { "+ " } else { "! " });
+        summary.push_str(&service.name);
+        for port in &service.ports {
+            let _ = write!(summary, " :{}", port.host);
+        }
+    }
+    summary
 }
 
 impl App {
+    fn workspace_changed(&mut self) {
+        // Hit targets belong to the last frame, not the newly selected topology.
+        self.panes.clear();
+        self.scroll_drag = None;
+        self.tab_hits.clear();
+        self.state_dirty = true;
+    }
+
+    fn snapshot(&self) -> restore::Snapshot {
+        let mut active_project = 0;
+        let projects = project_slots(&self.project, &self.saved_projects)
+            .filter(|(_, project)| !project.workspaces.is_empty())
+            .enumerate()
+            .map(|(index, (slot, project))| {
+                if slot.is_none() {
+                    active_project = index;
+                }
+                restore::SavedProject {
+                    workspaces: project
+                        .workspaces
+                        .iter()
+                        .map(|workspace| {
+                            let mut selected = 0;
+                            let sessions = workspace
+                                .sessions
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, session)| {
+                                    matches!(session.kind.as_str(), "omp" | "opencode" | "shell")
+                                })
+                                .enumerate()
+                                .map(|(saved_index, (index, session))| {
+                                    if index == workspace.selected {
+                                        selected = saved_index;
+                                    }
+                                    restore::SavedSession {
+                                        kind: session.kind.clone(),
+                                        resume: session.resume.clone(),
+                                    }
+                                })
+                                .collect();
+                            restore::SavedWorkspace {
+                                path: workspace.tree.path.clone(),
+                                source: workspace.source.clone(),
+                                sessions,
+                                selected,
+                            }
+                        })
+                        .collect(),
+                    active: project.active,
+                    secondary: project.secondary,
+                    focus_secondary: project.focus_secondary,
+                    layout: match project.layout {
+                        LayoutMode::Full => restore::SavedLayout::Full,
+                        LayoutMode::Vertical => restore::SavedLayout::Vertical,
+                        LayoutMode::Horizontal => restore::SavedLayout::Horizontal,
+                    },
+                }
+            })
+            .collect();
+        restore::Snapshot {
+            version: restore::VERSION,
+            projects,
+            active_project,
+            native_keys: self.native_keys,
+        }
+    }
+
+    fn checkpoint(&mut self, store: &mut Option<restore::Store>) -> bool {
+        if !self.state_dirty {
+            return false;
+        }
+        self.state_dirty = false;
+        let Some(owner) = store.as_ref() else {
+            return false;
+        };
+        if let Err(error) = owner.save(&self.snapshot()) {
+            self.set_notice(format!(
+                "Workspace could not be saved: {error:#}. Saving disabled for this window."
+            ));
+            *store = None;
+            return true;
+        }
+        false
+    }
+
     pub fn focused_index(&self) -> usize {
         if self.project.layout != LayoutMode::Full && self.project.focus_secondary {
             self.project.secondary.unwrap_or(self.project.active)
@@ -526,24 +722,54 @@ impl App {
             .flat_map(|project| project.workspaces.iter_mut())
     }
 
-    fn switch_project(&mut self, index: usize) -> Result<()> {
+    /// Worktree tabs across all open projects, in tab-bar order.
+    fn tabs(&self) -> impl Iterator<Item = (Option<usize>, usize)> + '_ {
+        project_slots(&self.project, &self.saved_projects)
+            .flat_map(|(slot, project)| (0..project.workspaces.len()).map(move |w| (slot, w)))
+    }
+
+    fn swap_project(&mut self, index: usize) {
+        self.workspace_changed();
         std::mem::swap(&mut self.project, &mut self.saved_projects[index]);
+        self.saved_projects
+            .sort_unstable_by_key(|project| project.order);
+    }
+
+    fn switch_project(&mut self, index: usize, workspace: Option<usize>) -> Result<()> {
+        self.swap_project(index);
         self.modal = None;
         self.notice = None;
-        self.select_workspace(self.focused_index(), None)
+        let workspace = workspace.unwrap_or_else(|| self.focused_index());
+        self.select_workspace(workspace, None)
+    }
+
+    fn focus_tab(&mut self, slot: Option<usize>, workspace: usize) -> Result<()> {
+        match slot {
+            Some(index) => self.switch_project(index, Some(workspace)),
+            None => self.select_workspace(workspace, None),
+        }
     }
 
     fn open_project(&mut self, mut project: Project, agent: Option<AgentKind>) -> Result<()> {
+        self.workspace_changed();
         if !self.project.same_project(&project) {
             if let Some(index) = self
                 .saved_projects
                 .iter()
                 .position(|saved| saved.same_project(&project))
             {
-                std::mem::swap(&mut self.project, &mut self.saved_projects[index]);
+                self.swap_project(index);
             } else {
+                project.order = self
+                    .saved_projects
+                    .last()
+                    .map_or(0, |saved| saved.order)
+                    .max(self.project.order)
+                    + 1;
                 let previous = std::mem::replace(&mut self.project, project);
                 self.saved_projects.push(previous);
+                self.saved_projects
+                    .sort_unstable_by_key(|project| project.order);
                 self.modal = None;
                 self.notice = None;
                 return self.select_workspace(self.focused_index(), agent);
@@ -580,6 +806,7 @@ impl App {
         let session = Session::spawn(
             self.next_session,
             kind,
+            None,
             &self.project.workspaces[index].tree.path,
             &self.socket,
             self.tx.clone(),
@@ -591,6 +818,7 @@ impl App {
         let workspace = &mut self.project.workspaces[index];
         workspace.sessions.push(session);
         workspace.selected = workspace.sessions.len() - 1;
+        self.state_dirty = true;
         Ok(())
     }
     fn select_shell(&mut self) -> Result<()> {
@@ -602,6 +830,7 @@ impl App {
             .position(|session| session.kind == "shell" && session.alive.load(Ordering::Acquire))
         {
             workspace.selected = selected;
+            self.state_dirty = true;
             Ok(())
         } else {
             self.spawn(index, "shell", None)
@@ -621,6 +850,7 @@ impl App {
         if index >= self.project.workspaces.len() {
             return Ok(());
         }
+        self.workspace_changed();
         if self.project.layout != LayoutMode::Full && self.project.secondary == Some(index) {
             self.project.focus_secondary = true;
         } else if self.project.active == index {
@@ -649,7 +879,7 @@ impl App {
             && !self.project.workspaces[index].pending
             && compose::has_config(&self.project.workspaces[index].tree)
         {
-            self.env(index, EnvironmentOp::Status)?;
+            self.env(index, EnvironmentOp::Probe)?;
         }
         Ok(())
     }
@@ -661,32 +891,91 @@ impl App {
         }
         let tree = self.project.workspaces[index].tree.clone();
         self.jobs
-            .try_send(Job::Environment { tree, operation })
+            .try_send(Job::Environment {
+                tree,
+                operation,
+                source: self.project.workspaces[index].source.clone(),
+            })
             .context("command queue is busy")?;
         self.project.workspaces[index].pending = true;
         Ok(())
     }
-    fn split(&mut self, layout: LayoutMode) {
-        if self.project.workspaces.len() < 2 {
-            self.set_notice("Create or open a second worktree first. F1 → describe what you need.");
-            return;
-        }
+    fn full_width(&mut self) {
+        self.workspace_changed();
+        self.project.active = self.focused_index();
+        self.project.layout = LayoutMode::Full;
+        self.project.secondary = None;
+        self.project.focus_secondary = false;
+    }
+
+    fn split(&mut self, layout: LayoutMode) -> Result<()> {
         if self.project.layout == layout {
-            self.project.layout = LayoutMode::Full;
-            self.project.focus_secondary = false;
-        } else {
-            self.modal = Some(Modal::Split {
-                layout,
-                selected: (self.focused_index() + 1) % self.project.workspaces.len(),
-            });
+            self.full_width();
+            return Ok(());
         }
+        self.git_repository()?;
+        self.modal = Some(if self.project.workspaces.len() < 2 {
+            Modal::NewWorktree {
+                input: String::new(),
+                split: Some(layout),
+            }
+        } else {
+            Modal::Split {
+                layout,
+                selected: 0,
+            }
+        });
+        Ok(())
+    }
+    /// Shows `index` next to the focused worktree; `focus_new` moves focus into it.
+    fn split_with(&mut self, layout: LayoutMode, index: usize, focus_new: bool) -> Result<()> {
+        self.workspace_changed();
+        self.project.active = self.focused_index();
+        self.project.secondary = Some(index);
+        self.project.focus_secondary = focus_new;
+        self.project.layout = layout;
+        self.ensure_session(index)?;
+        let workspace = &self.project.workspaces[index];
+        if workspace.environment.is_none()
+            && !workspace.pending
+            && compose::has_config(&workspace.tree)
+        {
+            self.env(index, EnvironmentOp::Probe)?;
+        }
+        Ok(())
+    }
+    fn new_tab_choices(&self) -> Vec<(String, IntentCommand)> {
+        let mut choices = Vec::with_capacity(4);
+        if self.project.repository.is_some() {
+            choices.push((
+                format!("New branch / worktree in {}", self.project.name),
+                IntentCommand::NewWorktree,
+            ));
+            choices.push((
+                format!("Open existing worktree of {}", self.project.name),
+                IntentCommand::OpenWorktree,
+            ));
+        }
+        choices.push((
+            "Open another folder (Git project or plain terminal)".to_owned(),
+            IntentCommand::OpenProject,
+        ));
+        if !self.saved_projects.is_empty() {
+            choices.push((
+                format!("Switch to an open project ({})", self.saved_projects.len()),
+                IntentCommand::SwitchProject,
+            ));
+        }
+        choices
     }
     fn close_workspace(&mut self) {
+        self.workspace_changed();
         let index = self.focused_index();
         if self.project.workspaces.len() == 1 {
             if let Some(project) = self.saved_projects.pop() {
                 self.project = project;
             } else {
+                self.project.workspaces.clear();
                 self.should_quit = true;
                 return;
             }
@@ -695,9 +984,27 @@ impl App {
         }
         self.set_notice("Tab closed; any checkout and Docker environment retained.");
     }
+    fn new_request(&mut self) -> u64 {
+        let request = self.next_request;
+        self.next_request += 1;
+        request
+    }
+
+    fn navigation_error(&mut self, error: String) {
+        if let Some(Modal::Loading {
+            retry: Some(mut dialog),
+            ..
+        }) = self.modal.take()
+        {
+            Arc::make_mut(&mut dialog.conversation).pop();
+            dialog.error = Some(error.clone());
+            self.modal = Some(Modal::Intent(dialog));
+        }
+        self.set_notice(error);
+    }
+
     fn open_intent(&mut self) -> Result<()> {
-        let request = self.next_intent;
-        self.next_intent += 1;
+        let request = self.new_request();
         let repository = self
             .project
             .repository
@@ -815,6 +1122,7 @@ impl App {
                         branch,
                         base,
                         agent,
+                        split: None,
                     })
                     .context("command queue is busy")?;
             }
@@ -823,13 +1131,19 @@ impl App {
                     .iter()
                     .find(|candidate| candidate.id == target)
                     .context("The interpreter selected an unknown project or worktree")?;
+                let request = self.new_request();
                 self.jobs
                     .try_send(Job::OpenProject {
+                        request,
                         path: target.path.clone(),
                         agent,
                     })
                     .context("command queue is busy")?;
-                self.set_notice(format!("Opening {}...", target.name));
+                self.modal = Some(Modal::Loading {
+                    request,
+                    message: "Opening project...",
+                    retry: None,
+                });
             }
             Plan::Session { agent } => self.spawn(self.focused_index(), agent.as_str(), None)?,
             Plan::Command { command } => self.run_command(command)?,
@@ -856,16 +1170,26 @@ impl App {
         }
         match command {
             OpenProject => {
+                let request = self.new_request();
                 self.modal = Some(Modal::OpenProject(ProjectPicker::new(
                     self.focused().tree.path.clone(),
                     &self.jobs,
+                    request,
                 )?))
             }
             OpenWorktree => {
+                let request = self.new_request();
                 self.jobs
-                    .try_send(Job::List(self.git_repository()?.clone()))
+                    .try_send(Job::List {
+                        request,
+                        repository: self.git_repository()?.clone(),
+                    })
                     .context("command queue is busy")?;
-                self.set_notice("Reading worktrees...");
+                self.modal = Some(Modal::Loading {
+                    request,
+                    message: "Reading worktrees...",
+                    retry: None,
+                });
             }
             SwitchProject => {
                 if self.saved_projects.is_empty() {
@@ -874,14 +1198,16 @@ impl App {
                     self.modal = Some(Modal::SwitchProject { selected: 0 });
                 }
             }
-            NewWorktree => self.action(Action::NewWorktree)?,
-            NewSession => self.action(Action::NewSession)?,
-            SplitVertical => self.split(LayoutMode::Vertical),
-            SplitHorizontal => self.split(LayoutMode::Horizontal),
-            FullWidth => {
-                self.project.layout = LayoutMode::Full;
-                self.project.focus_secondary = false;
+            NewWorktree => {
+                self.modal = Some(Modal::NewWorktree {
+                    input: String::new(),
+                    split: None,
+                })
             }
+            NewSession => self.action(Action::NewSession)?,
+            SplitVertical => self.split(LayoutMode::Vertical)?,
+            SplitHorizontal => self.split(LayoutMode::Horizontal)?,
+            FullWidth => self.full_width(),
             StartEnvironment => self.env(index, EnvironmentOp::Up)?,
             StopEnvironment => self.modal = Some(Modal::Confirm(Confirm::StopEnvironment)),
             RestartEnvironment => self.env(index, EnvironmentOp::Restart)?,
@@ -935,6 +1261,7 @@ impl App {
         match action {
             Action::ToggleNative => {
                 self.native_keys = !self.native_keys;
+                self.state_dirty = true;
                 self.modal = None;
                 if self.use_kitty {
                     kitty::set_native(&mut io::stdout(), self.native_keys)?;
@@ -942,25 +1269,31 @@ impl App {
             }
             Action::Launcher => self.open_intent()?,
             Action::Quit => self.modal = Some(Modal::Confirm(Confirm::Quit)),
-            Action::NewWorktree => {
-                self.git_repository()?;
-                self.modal = Some(Modal::NewWorktree {
-                    input: String::new(),
+            Action::NewTab => {
+                self.modal = Some(Modal::NewTab {
+                    choices: self.new_tab_choices(),
+                    selected: 0,
                 })
             }
             Action::CloseWorktree => self.modal = Some(Modal::Confirm(Confirm::CloseWorktree)),
             Action::NewSession => self.modal = Some(Modal::NewSession { selected: 0 }),
             Action::CloseSession => self.modal = Some(Modal::Confirm(Confirm::CloseSession)),
             Action::NextWorktree | Action::PreviousWorktree => {
-                let current = self.focused_index();
-                let next = if action == Action::NextWorktree {
-                    (current + 1) % self.project.workspaces.len()
+                let current = (None, self.focused_index());
+                let count = self.tabs().count();
+                let position = self.tabs().position(|tab| tab == current).unwrap_or(0);
+                let target = if action == Action::NextWorktree {
+                    (position + 1) % count
                 } else {
-                    (current + self.project.workspaces.len() - 1) % self.project.workspaces.len()
+                    (position + count - 1) % count
                 };
-                self.select_workspace(next, None)?;
+                let target = self.tabs().nth(target);
+                if let Some((slot, workspace)) = target {
+                    self.focus_tab(slot, workspace)?;
+                }
             }
             Action::NextSession | Action::PreviousSession => {
+                self.workspace_changed();
                 if self.project.layout != LayoutMode::Full {
                     self.project.focus_secondary = !self.project.focus_secondary;
                 } else {
@@ -979,17 +1312,18 @@ impl App {
                 let focused = self.focused_index();
                 if index < self.project.workspaces[focused].sessions.len() {
                     self.project.workspaces[focused].selected = index;
+                    self.state_dirty = true;
                 }
             }
-            Action::SplitVertical => self.split(LayoutMode::Vertical),
-            Action::SplitHorizontal => self.split(LayoutMode::Horizontal),
+            Action::SplitVertical => self.split(LayoutMode::Vertical)?,
+            Action::SplitHorizontal => self.split(LayoutMode::Horizontal)?,
             Action::CycleLayout => match self.project.layout {
-                LayoutMode::Full => self.split(LayoutMode::Vertical),
-                LayoutMode::Vertical => self.project.layout = LayoutMode::Horizontal,
-                LayoutMode::Horizontal => {
-                    self.project.layout = LayoutMode::Full;
-                    self.project.focus_secondary = false;
+                LayoutMode::Full => self.split(LayoutMode::Vertical)?,
+                LayoutMode::Vertical => {
+                    self.workspace_changed();
+                    self.project.layout = LayoutMode::Horizontal;
                 }
+                LayoutMode::Horizontal => self.full_width(),
             },
         }
         Ok(())
@@ -1003,191 +1337,217 @@ impl App {
             return Ok(());
         }
         let mut retain = true;
-        match &mut modal {
-            Modal::Intent(dialog) => match key.code {
-                KeyCode::F(1) => retain = false,
-                KeyCode::F(2) => {
-                    self.modal = Some(Modal::Commands { selected: 0 });
-                    retain = false;
-                }
-                KeyCode::Enter
-                    if !dialog.pending && !dialog.stale && !dialog.input.trim().is_empty() =>
-                {
-                    dialog.submitted = true;
-                    Self::start_intent(dialog, &self.tx);
-                }
-                _ if !dialog.pending && !dialog.submitted => {
-                    edit_input(key, &mut dialog.input, 4096);
-                }
-                _ => {}
-            },
-            Modal::Commands { selected } => {
-                navigate(key, selected, COMMANDS.len());
-                if key.code == KeyCode::Enter {
-                    self.run_command(COMMANDS[*selected].1)?;
-                    retain = false;
-                }
-                if key.code == KeyCode::F(1) {
-                    self.open_intent()?;
-                    retain = false;
-                }
-            }
-            Modal::OpenProject(picker) => {
-                if let Err(error) = picker.key(key, &self.jobs) {
-                    self.set_notice(format!("{error:#}"));
-                }
-            }
-            Modal::SwitchProject { selected } => {
-                navigate(key, selected, self.saved_projects.len());
-                if key.code == KeyCode::Enter && *selected < self.saved_projects.len() {
-                    self.switch_project(*selected)?;
-                    retain = false;
-                }
-            }
-            Modal::NewWorktree { input } => match key.code {
-                KeyCode::Enter if !input.trim().is_empty() => {
-                    self.jobs
-                        .try_send(Job::Create {
-                            branch: input.trim().to_owned(),
-                            base: None,
-                            agent: None,
-                            repository: self.focused_repository()?,
-                        })
-                        .context("command queue is busy")?;
-                    self.set_notice(format!("Creating {}...", input.trim()));
-                    retain = false;
-                }
-                _ => edit_input(key, input, 256),
-            },
-            Modal::NewSession { selected } => {
-                navigate(key, selected, 3);
-                if key.code == KeyCode::Enter {
-                    self.spawn(
-                        self.focused_index(),
-                        ["omp", "opencode", "shell"][*selected],
-                        None,
-                    )?;
-                    retain = false;
-                }
-            }
-            Modal::OpenWorktree { trees, selected } => {
-                navigate(key, selected, trees.len());
-                if key.code == KeyCode::Enter {
-                    if let Some(tree) = trees.get(*selected) {
-                        let index = if let Some(index) = self
-                            .project
-                            .workspaces
-                            .iter()
-                            .position(|w| w.tree.id == tree.id)
-                        {
-                            index
-                        } else {
-                            self.project.workspaces.push(Workspace::new(tree.clone()));
-                            self.project.workspaces.len() - 1
-                        };
-                        self.select_workspace(index, None)?;
+        let result = (|| -> Result<()> {
+            match &mut modal {
+                Modal::Loading { .. } => {}
+                Modal::Intent(dialog) => match key.code {
+                    KeyCode::F(1) => retain = false,
+                    KeyCode::F(2) => {
+                        self.modal = Some(Modal::Commands { selected: 0 });
+                        retain = false;
                     }
-                    retain = false;
+                    KeyCode::Enter
+                        if !dialog.pending && !dialog.stale && !dialog.input.trim().is_empty() =>
+                    {
+                        dialog.submitted = true;
+                        Self::start_intent(dialog, &self.tx);
+                    }
+                    _ if !dialog.pending && !dialog.submitted => {
+                        edit_input(key, &mut dialog.input, 4096);
+                    }
+                    _ => {}
+                },
+                Modal::Commands { selected } => {
+                    navigate(key, selected, COMMANDS.len());
+                    if key.code == KeyCode::Enter {
+                        self.run_command(COMMANDS[*selected].1)?;
+                        retain = false;
+                    }
+                    if key.code == KeyCode::F(1) {
+                        self.open_intent()?;
+                        retain = false;
+                    }
                 }
-            }
-            Modal::Split { layout, selected } => {
-                navigate(key, selected, self.project.workspaces.len());
-                if key.code == KeyCode::Enter {
-                    let primary = self.focused_index();
-                    if *selected != primary {
-                        self.project.active = primary;
-                        self.project.secondary = Some(*selected);
-                        self.project.focus_secondary = false;
-                        self.project.layout = *layout;
-                        self.ensure_session(*selected)?;
-                        if self.project.workspaces[*selected].environment.is_none()
-                            && compose::has_config(&self.project.workspaces[*selected].tree)
-                        {
-                            self.env(*selected, EnvironmentOp::Status)?;
+                Modal::NewTab { choices, selected } => {
+                    navigate(key, selected, choices.len());
+                    if key.code == KeyCode::Enter {
+                        if let Some(&(_, command)) = choices.get(*selected) {
+                            self.run_command(command)?;
                         }
                         retain = false;
-                    } else {
-                        self.set_notice("Choose a different worktree for the second pane.");
                     }
                 }
-            }
-            Modal::Preview { urls, selected } => {
-                navigate(key, selected, urls.len());
-                if key.code == KeyCode::Enter {
-                    if let Some((_, url)) = urls.get(*selected) {
-                        let url = url.clone();
-                        let tx = self.tx.clone();
-                        std::thread::spawn(move || {
-                            match std::process::Command::new("xdg-open")
-                                .arg(&url)
-                                .stdout(std::process::Stdio::null())
-                                .stderr(std::process::Stdio::null())
-                                .status()
-                            {
-                                Ok(status) if status.success() => {}
-                                Ok(status) => {
-                                    let _ = tx.send(Event::Error(format!(
-                                        "Opening {url} failed: {status}"
-                                    )));
-                                }
-                                Err(error) => {
-                                    let _ =
-                                        tx.send(Event::Error(format!("Opening {url}: {error}")));
-                                }
-                            }
-                        });
+                Modal::OpenProject(picker) => {
+                    if let Err(error) = picker.key(key, &self.jobs) {
+                        self.set_notice(format!("{error:#}"));
                     }
-                    retain = false;
                 }
-            }
-            Modal::Confirm(confirm) => {
-                if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
-                    let index = self.focused_index();
-                    match confirm {
-                        Confirm::Quit => self.should_quit = true,
-                        Confirm::CloseWorktree => {
-                            self.close_workspace();
-                            if !self.should_quit {
-                                self.ensure_session(self.focused_index())?;
-                            }
-                        }
-                        Confirm::CloseSession => {
-                            let workspace = &mut self.project.workspaces[index];
-                            if !workspace.sessions.is_empty() {
-                                workspace.sessions.remove(workspace.selected);
-                                workspace.selected = workspace
-                                    .selected
-                                    .min(workspace.sessions.len().saturating_sub(1));
-                            }
-                        }
-                        Confirm::StopEnvironment => self.env(index, EnvironmentOp::Down)?,
-                        Confirm::RemoveWorktree => {
-                            let workspace = self.focused();
-                            if workspace.pending
-                                || workspace
-                                    .environment
-                                    .as_ref()
-                                    .is_some_and(|e| !e.services.is_empty())
+                Modal::SwitchProject { selected } => {
+                    navigate(key, selected, self.saved_projects.len());
+                    if key.code == KeyCode::Enter && *selected < self.saved_projects.len() {
+                        self.switch_project(*selected, None)?;
+                        retain = false;
+                    }
+                }
+                Modal::NewWorktree { input, split } => match key.code {
+                    KeyCode::Enter if !input.trim().is_empty() => {
+                        self.jobs
+                            .try_send(Job::Create {
+                                branch: input.trim().to_owned(),
+                                base: None,
+                                agent: None,
+                                split: *split,
+                                repository: self.focused_repository()?,
+                            })
+                            .context("command queue is busy")?;
+                        self.set_notice(format!("Creating {}...", input.trim()));
+                        retain = false;
+                    }
+                    _ => edit_input(key, input, 256),
+                },
+                Modal::NewSession { selected } => {
+                    navigate(key, selected, 3);
+                    if key.code == KeyCode::Enter {
+                        self.spawn(
+                            self.focused_index(),
+                            ["omp", "opencode", "shell"][*selected],
+                            None,
+                        )?;
+                        retain = false;
+                    }
+                }
+                Modal::OpenWorktree { trees, selected } => {
+                    navigate(key, selected, trees.len());
+                    if key.code == KeyCode::Enter {
+                        if let Some(tree) = trees.get(*selected) {
+                            let index = if let Some(index) = self
+                                .project
+                                .workspaces
+                                .iter()
+                                .position(|w| w.tree.id == tree.id)
                             {
-                                self.set_notice(
-                                    "Stop this environment before removing its checkout.",
-                                );
+                                index
                             } else {
-                                self.jobs
-                                    .try_send(Job::Remove {
-                                        repository: self.git_repository()?.clone(),
-                                        tree: workspace.tree.clone(),
-                                    })
-                                    .context("command queue is busy")?;
-                                self.set_notice("Checking and removing worktree...");
-                            }
+                                self.project.workspaces.push(Workspace::new(tree.clone()));
+                                self.project.workspaces.len() - 1
+                            };
+                            self.select_workspace(index, None)?;
+                        }
+                        retain = false;
+                    }
+                }
+                Modal::Split { layout, selected } => {
+                    navigate(key, selected, self.project.workspaces.len() + 1);
+                    if key.code == KeyCode::Enter {
+                        if *selected == 0 {
+                            self.modal = Some(Modal::NewWorktree {
+                                input: String::new(),
+                                split: Some(*layout),
+                            });
+                            retain = false;
+                        } else if *selected - 1 != self.focused_index() {
+                            self.split_with(*layout, *selected - 1, false)?;
+                            retain = false;
+                        } else {
+                            self.set_notice("Choose a different worktree for the second pane.");
                         }
                     }
-                    retain = false;
-                } else if matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N')) {
-                    retain = false;
+                }
+                Modal::Preview { urls, selected } => {
+                    navigate(key, selected, urls.len());
+                    if key.code == KeyCode::Enter {
+                        if let Some((_, url)) = urls.get(*selected) {
+                            let url = url.clone();
+                            let tx = self.tx.clone();
+                            std::thread::spawn(move || {
+                                match std::process::Command::new("xdg-open")
+                                    .arg(&url)
+                                    .stdout(std::process::Stdio::null())
+                                    .stderr(std::process::Stdio::null())
+                                    .status()
+                                {
+                                    Ok(status) if status.success() => {}
+                                    Ok(status) => {
+                                        let _ = tx.send(Event::Error(format!(
+                                            "Opening {url} failed: {status}"
+                                        )));
+                                    }
+                                    Err(error) => {
+                                        let _ = tx
+                                            .send(Event::Error(format!("Opening {url}: {error}")));
+                                    }
+                                }
+                            });
+                        }
+                        retain = false;
+                    }
+                }
+                Modal::Confirm(confirm) => {
+                    if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                        let index = self.focused_index();
+                        match confirm {
+                            Confirm::Quit => self.should_quit = true,
+                            Confirm::CloseWorktree => {
+                                retain = false;
+                                self.close_workspace();
+                                if !self.should_quit {
+                                    self.ensure_session(self.focused_index())?;
+                                }
+                            }
+                            Confirm::CloseSession => {
+                                let workspace = &mut self.project.workspaces[index];
+                                if !workspace.sessions.is_empty() {
+                                    workspace.sessions.remove(workspace.selected);
+                                    workspace.selected = workspace
+                                        .selected
+                                        .min(workspace.sessions.len().saturating_sub(1));
+                                }
+                                self.state_dirty = true;
+                            }
+                            Confirm::StopEnvironment => self.env(index, EnvironmentOp::Down)?,
+                            Confirm::RemoveWorktree => {
+                                let workspace = self.focused();
+                                if workspace.pending
+                                    || workspace
+                                        .environment
+                                        .as_ref()
+                                        .is_some_and(|e| !e.services.is_empty())
+                                {
+                                    self.set_notice(
+                                        "Stop this environment before removing its checkout.",
+                                    );
+                                } else {
+                                    self.jobs
+                                        .try_send(Job::Remove {
+                                            repository: self.git_repository()?.clone(),
+                                            tree: workspace.tree.clone(),
+                                        })
+                                        .context("command queue is busy")?;
+                                    self.set_notice("Checking and removing worktree...");
+                                }
+                            }
+                        }
+                        retain = false;
+                    } else if matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N')) {
+                        retain = false;
+                    }
                 }
             }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            if retain && self.modal.is_none() {
+                self.modal = Some(modal);
+            }
+            return Err(error);
+        }
+        if !retain && matches!(&modal, Modal::NewWorktree { .. }) {
+            self.pending_creations.push_back((
+                self.git_repository()?.common_dir.clone(),
+                self.focused().tree.id.clone(),
+                modal,
+            ));
+            return Ok(());
         }
         if retain {
             self.modal = Some(modal);
@@ -1196,8 +1556,27 @@ impl App {
     }
 
     fn handle(&mut self, event: Event) -> Result<bool> {
+        if self.should_quit {
+            return Ok(false);
+        }
+        if !self.interaction_visible {
+            match &event {
+                Event::Input(crossterm::event::Event::Key(key))
+                    if keys::action(*key) == Some(Action::ToggleNative) => {}
+                Event::Input(crossterm::event::Event::Key(key))
+                    if key.code == KeyCode::Esc && key.kind != KeyEventKind::Release =>
+                {
+                    self.modal = None;
+                    return Ok(true);
+                }
+                Event::Input(crossterm::event::Event::Resize(_, _)) => {}
+                Event::Input(_) => return Ok(false),
+                _ => {}
+            }
+        }
         match event {
             Event::Input(crossterm::event::Event::Key(key)) => {
+                self.scroll_drag = None;
                 if key.kind == KeyEventKind::Release {
                     return Ok(false);
                 }
@@ -1231,7 +1610,7 @@ impl App {
                 Some(Modal::Intent(dialog)) if !dialog.pending && !dialog.submitted => {
                     paste_input(&mut dialog.input, &text, 4096);
                 }
-                Some(Modal::NewWorktree { input }) => paste_input(input, &text, 256),
+                Some(Modal::NewWorktree { input, .. }) => paste_input(input, &text, 256),
                 Some(Modal::OpenProject(picker)) => picker.paste(&text),
                 None => {
                     if let Some(session) = self.focused_session() {
@@ -1241,29 +1620,82 @@ impl App {
                 _ => {}
             },
             Event::Input(crossterm::event::Event::Mouse(mouse)) if self.modal.is_none() => {
-                if let Some((_, index)) = self
+                if let Some((id, grab)) = self.scroll_drag {
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::Drag(MouseButton::Left)
+                            | MouseEventKind::Up(MouseButton::Left)
+                    ) {
+                        if let Some((session, bar)) = self.panes.iter().find_map(|pane| {
+                            let workspace = self.project.workspaces.get(pane.workspace)?;
+                            let session = workspace.sessions.get(workspace.selected)?;
+                            (session.id == id).then_some((session, pane.scrollbar?))
+                        }) {
+                            session.scroll_to(bar.offset_at(mouse.row, grab));
+                        }
+                        if matches!(mouse.kind, MouseEventKind::Up(_)) {
+                            self.scroll_drag = None;
+                        }
+                        return Ok(true);
+                    }
+                }
+                if let Some(hit) = self
                     .tab_hits
                     .iter()
-                    .find(|(rect, _)| rect.contains((mouse.column, mouse.row).into()))
+                    .find(|hit| hit.area.contains((mouse.column, mouse.row).into()))
                 {
                     if matches!(mouse.kind, crossterm::event::MouseEventKind::Down(_)) {
-                        self.select_workspace(*index, None)?;
+                        match (hit.project, hit.workspace) {
+                            (slot, Some(workspace)) => self.focus_tab(slot, workspace)?,
+                            (Some(index), None) => self.switch_project(index, None)?,
+                            (None, None) => {}
+                        }
                     }
-                } else if let Some(pane) = self
-                    .panes
-                    .iter()
-                    .find(|p| p.body.contains((mouse.column, mouse.row).into()))
-                {
-                    let (index, body) = (pane.workspace, pane.body);
+                } else if let Some(pane) = self.panes.iter().find(|p| {
+                    p.body.contains((mouse.column, mouse.row).into())
+                        || p.scrollbar
+                            .is_some_and(|bar| bar.track.contains((mouse.column, mouse.row).into()))
+                }) {
+                    let (index, body, scrollbar) = (pane.workspace, pane.body, pane.scrollbar);
                     if matches!(mouse.kind, crossterm::event::MouseEventKind::Down(_)) {
                         self.project.focus_secondary = self.project.secondary == Some(index)
                             && self.project.layout != LayoutMode::Full;
+                        self.state_dirty = true;
                     }
                     let workspace = &self.project.workspaces[index];
                     if let Some(session) = workspace.sessions.get(workspace.selected) {
-                        session.mouse(mouse, mouse.column - body.x, mouse.row - body.y)?;
+                        if let Some(bar) = scrollbar
+                            .filter(|bar| bar.track.contains((mouse.column, mouse.row).into()))
+                        {
+                            match mouse.kind {
+                                MouseEventKind::Down(MouseButton::Left) => {
+                                    let grab =
+                                        if bar.thumb.contains((mouse.column, mouse.row).into()) {
+                                            mouse.row - bar.thumb.y
+                                        } else {
+                                            bar.thumb.height / 2
+                                        };
+                                    self.scroll_drag = Some((session.id, grab));
+                                    session.scroll_to(bar.offset_at(mouse.row, grab));
+                                }
+                                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                                    let mut scroll = mouse;
+                                    scroll.modifiers |= KeyModifiers::SHIFT;
+                                    session.mouse(scroll, 0, mouse.row - body.y)?;
+                                }
+                                _ => {}
+                            }
+                        } else {
+                            session.mouse(mouse, mouse.column - body.x, mouse.row - body.y)?;
+                        }
                     }
                 }
+            }
+            Event::Input(crossterm::event::Event::Resize(cols, rows)) => {
+                self.interaction_visible = cols >= 30 && rows >= 10;
+                self.panes.clear();
+                self.scroll_drag = None;
+                self.tab_hits.clear();
             }
             Event::Input(_) => {}
             Event::Dirty(id) => {
@@ -1284,6 +1716,7 @@ impl App {
                 }
             }
             Event::Agent(update) => {
+                let mut identity_changed = false;
                 for workspace in self.all_workspaces_mut() {
                     if let Some(session) = workspace
                         .sessions
@@ -1291,12 +1724,24 @@ impl App {
                         .find(|s| s.id == update.session)
                     {
                         if session.alive.load(Ordering::Acquire) {
+                            let resume = match update.resume {
+                                integration::ResumeUpdate::Unknown => None,
+                                integration::ResumeUpdate::Clear => Some(None),
+                                integration::ResumeUpdate::Selected(identity) => {
+                                    Some(Some(identity))
+                                }
+                            };
+                            if let Some(resume) = resume {
+                                identity_changed = session.resume != resume;
+                                session.resume = resume;
+                            }
                             session.state = update.state;
                             session.message = update.message;
                         }
                         break;
                     }
                 }
+                self.state_dirty |= identity_changed;
             }
             Event::IntentTargets { request, result } => {
                 if let Some(Modal::Intent(dialog)) = &mut self.modal {
@@ -1358,10 +1803,19 @@ impl App {
                         self.modal = Some(Modal::Intent(dialog));
                     }
                     Ok(plan) => {
+                        let creates_worktree = matches!(&plan, Plan::CreateWorktree { .. });
                         if let Err(error) = self.execute_intent(plan, &dialog.targets) {
                             dialog.error = Some(format!("{error:#}"));
                             Arc::make_mut(&mut dialog.conversation).pop();
                             self.modal = Some(Modal::Intent(dialog));
+                        } else if creates_worktree {
+                            self.pending_creations.push_back((
+                                self.git_repository()?.common_dir.clone(),
+                                self.focused().tree.id.clone(),
+                                Modal::Intent(dialog),
+                            ));
+                        } else if let Some(Modal::Loading { retry, .. }) = &mut self.modal {
+                            *retry = Some(dialog);
                         }
                     }
                     Err(error) => {
@@ -1378,110 +1832,193 @@ impl App {
                     }
                 }
             }
-            Event::ProjectOpened { result, agent } => match result {
-                Ok(project) => self.open_project(project, agent)?,
-                Err(error) => {
-                    if let Some(Modal::OpenProject(picker)) = &mut self.modal {
-                        picker.pending = false;
-                    }
-                    self.set_notice(error);
-                }
-            },
-            Event::Created {
-                project,
+            Event::ProjectOpened {
+                request,
                 result,
                 agent,
-            } => match result {
-                Ok(tree) => {
-                    let has_compose = compose::has_config(&tree);
-                    if self.project.common_dir() != Some(project.as_path()) {
-                        if let Some(saved) = self
-                            .saved_projects
-                            .iter_mut()
-                            .find(|saved| saved.common_dir() == Some(project.as_path()))
-                        {
-                            let mut workspace = Workspace::new(tree);
-                            if has_compose {
-                                self.jobs
-                                    .try_send(Job::Environment {
-                                        tree: workspace.tree.clone(),
-                                        operation: EnvironmentOp::Up,
-                                    })
-                                    .context("command queue is busy")?;
-                                workspace.pending = true;
-                            }
-                            saved.workspaces.push(workspace);
-                        }
-                        return Ok(false);
-                    }
-                    if let Some(index) = self
-                        .project
-                        .workspaces
-                        .iter()
-                        .position(|w| w.tree.id == tree.id)
-                    {
-                        self.select_workspace(index, agent)?;
-                    } else {
-                        self.project.workspaces.push(Workspace::new(tree));
-                        let index = self.project.workspaces.len() - 1;
-                        // Creation owns the initial start; do not enqueue a redundant status query.
-                        if has_compose {
-                            self.env(index, EnvironmentOp::Up)?;
-                        }
-                        self.select_workspace(index, agent)?;
-                    }
-                    self.set_notice(if has_compose {
-                        "Worktree created; starting its isolated Docker environment."
-                    } else {
-                        "Worktree created. No Compose config found; terminal is ready."
-                    });
-                }
-                Err(error) => self.set_notice(error),
-            },
-            Event::Environment { tree, result } => {
-                let active = self.project.workspaces.iter().any(|w| w.tree.id == tree);
-                let error = if let Some(workspace) =
-                    self.all_workspaces_mut().find(|w| w.tree.id == tree)
-                {
-                    workspace.pending = false;
-                    match result {
-                        Ok(environment) => {
-                            workspace.environment = Some(environment);
-                            None
-                        }
-                        Err(error) => Some(error),
-                    }
-                } else {
-                    None
+            } => {
+                let expected = match &self.modal {
+                    Some(Modal::OpenProject(picker)) => picker.pending && picker.request == request,
+                    Some(Modal::Loading {
+                        request: pending, ..
+                    }) => *pending == request,
+                    _ => false,
                 };
-                if let Some(error) = error {
-                    self.set_notice(error);
-                } else if active {
-                    self.notice = None;
+                if !expected {
+                    return Ok(false);
+                }
+                match result {
+                    Ok(project) => self.open_project(project, agent)?,
+                    Err(error) => {
+                        if let Some(Modal::OpenProject(picker)) = &mut self.modal {
+                            picker.pending = false;
+                            self.set_notice(error);
+                        } else {
+                            self.navigation_error(error);
+                        }
+                    }
                 }
             }
-            Event::Worktrees { project, result } => {
-                if self.project.common_dir() == Some(project.as_path()) {
+            Event::Created {
+                project,
+                source,
+                preparation_error,
+                result,
+                agent,
+                split,
+            } => {
+                let pending = self
+                    .pending_creations
+                    .iter()
+                    .position(|(origin, _, _)| origin == &project)
+                    .and_then(|index| self.pending_creations.remove(index));
+                match result {
+                    Ok(tree) => {
+                        self.workspace_changed();
+                        let has_compose = compose::has_config(&tree);
+                        if self.project.common_dir() != Some(project.as_path()) {
+                            if let Some(saved) = self
+                                .saved_projects
+                                .iter_mut()
+                                .find(|saved| saved.common_dir() == Some(project.as_path()))
+                            {
+                                let mut workspace = Workspace::new(tree);
+                                workspace.source =
+                                    preparation_error.as_ref().map(|_| source.clone());
+                                if has_compose && preparation_error.is_none() {
+                                    self.jobs
+                                        .try_send(Job::Environment {
+                                            tree: workspace.tree.clone(),
+                                            operation: EnvironmentOp::Up,
+                                            source: workspace.source.clone(),
+                                        })
+                                        .context("command queue is busy")?;
+                                    workspace.pending = true;
+                                }
+                                saved.workspaces.push(workspace);
+                            }
+                            if let Some(error) = preparation_error {
+                                self.set_notice(format!("Worktree created; local environment preparation failed: {error}"));
+                            }
+                            return Ok(true);
+                        }
+                        let index = if let Some(index) = self
+                            .project
+                            .workspaces
+                            .iter()
+                            .position(|w| w.tree.id == tree.id)
+                        {
+                            index
+                        } else {
+                            self.project.workspaces.push(Workspace::new(tree));
+                            self.project.workspaces.last_mut().unwrap().source =
+                                preparation_error.as_ref().map(|_| source);
+                            let index = self.project.workspaces.len() - 1;
+                            // Creation owns the initial start; do not enqueue a redundant status query.
+                            if has_compose && preparation_error.is_none() {
+                                self.env(index, EnvironmentOp::Up)?;
+                            }
+                            index
+                        };
+                        // A newer dialog describes the current focus; do not retarget it.
+                        if self.modal.is_none() {
+                            match split {
+                                Some(layout) if index != self.focused_index() => {
+                                    self.split_with(layout, index, true)?;
+                                }
+                                _ => self.select_workspace(index, agent)?,
+                            }
+                        } else if let Some(agent) = agent {
+                            self.spawn(index, agent.as_str(), None)?;
+                        }
+                        if let Some(error) = preparation_error {
+                            self.set_notice(format!("Worktree created; local environment preparation failed: {error}. Fix the files, then start its environment again."));
+                        } else {
+                            self.set_notice(if has_compose {
+                                "Worktree created; starting its isolated Docker environment."
+                            } else {
+                                "Worktree created. No Compose config found; terminal is ready."
+                            });
+                        }
+                    }
+                    Err(error) => {
+                        if self.modal.is_none()
+                            && self.project.common_dir() == Some(project.as_path())
+                            && let Some((_, workspace, mut modal)) = pending
+                            && self.focused().tree.id == workspace
+                        {
+                            if let Modal::Intent(dialog) = &mut modal {
+                                Arc::make_mut(&mut dialog.conversation).pop();
+                                dialog.error = Some(error.clone());
+                            }
+                            self.modal = Some(modal);
+                        }
+                        self.set_notice(error);
+                    }
+                }
+            }
+            Event::Environment {
+                tree,
+                operation,
+                prepared,
+                result,
+            } => {
+                let active = self.project.workspaces.iter().any(|w| w.tree.id == tree);
+                let Some(workspace) = self.all_workspaces_mut().find(|w| w.tree.id == tree) else {
+                    return Ok(false);
+                };
+                workspace.pending = false;
+                let source_changed = prepared && workspace.source.take().is_some();
+                match result {
+                    Ok(environment) => {
+                        let summary = (!matches!(operation, EnvironmentOp::Probe))
+                            .then(|| environment_summary(workspace.label(), &environment));
+                        workspace.environment = Some(environment);
+                        if !active {
+                        } else if let Some(summary) = summary {
+                            self.set_notice(summary);
+                        } else {
+                            self.notice = None;
+                        }
+                    }
+                    Err(error) => self.set_notice(error),
+                }
+                self.state_dirty |= source_changed;
+            }
+            Event::Worktrees {
+                request,
+                project,
+                result,
+            } => {
+                if self.project.common_dir() == Some(project.as_path())
+                    && matches!(&self.modal, Some(Modal::Loading { request: pending, .. }) if *pending == request)
+                {
                     match result {
                         Ok(trees) => self.modal = Some(Modal::OpenWorktree { trees, selected: 0 }),
-                        Err(error) => self.set_notice(error),
+                        Err(error) => self.navigation_error(error),
                     }
                 }
             }
             Event::Removed { tree, result } => match result {
                 Ok(()) => {
+                    self.workspace_changed();
                     if let Some(index) = self
                         .project
                         .workspaces
                         .iter()
                         .position(|w| w.tree.id == tree)
                     {
-                        self.project.layout = LayoutMode::Full;
-                        self.project.focus_secondary = false;
-                        self.project.active = index;
-                        self.close_workspace();
-                        if !self.should_quit {
-                            self.ensure_session(self.project.active)?;
+                        let removed_focus = index == self.focused_index();
+                        if removed_focus {
+                            self.modal = None;
+                        }
+                        if self.project.workspaces.len() == 1 {
+                            self.close_workspace();
+                        } else {
+                            self.project.close_workspace(index);
+                        }
+                        if removed_focus && !self.should_quit {
+                            self.ensure_session(self.focused_index())?;
                         }
                     } else if let Some((project, index)) = self
                         .saved_projects
@@ -1519,6 +2056,23 @@ fn project_path(input: &str, base: &Path) -> Result<PathBuf> {
     } else {
         Ok(base.join(input))
     }
+}
+
+/// Canonical existing directory, or an error naming the problem.
+fn folder(path: &Path) -> Result<PathBuf> {
+    let path = path.canonicalize().context("resolve folder")?;
+    anyhow::ensure!(path.is_dir(), "choose a folder, not a file");
+    Ok(path)
+}
+
+/// Last path component with control characters removed; empty for `/`.
+fn folder_name(path: &Path) -> String {
+    path.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
 }
 
 fn edit_input(key: KeyEvent, input: &mut String, limit: usize) {
@@ -1602,6 +2156,12 @@ fn intent_targets(
     Ok(targets)
 }
 
+fn prepare_local_environment(source: &Path, target: &Worktree) -> Result<()> {
+    let repository = worktree::discover(source)?;
+    let source = crate::selected_tree(&repository, source)?;
+    compose::prepare_local_files(&source, target)
+}
+
 fn start_worker(tx: SyncSender<Event>) -> Result<SyncSender<Job>> {
     let (jobs, rx) = mpsc::sync_channel(16);
     std::thread::Builder::new()
@@ -1624,8 +2184,13 @@ fn start_worker(tx: SyncSender<Event>) -> Result<SyncSender<Job>> {
                         result: intent_targets(&base, repository.as_ref(), &known_projects)
                             .map_err(|error| format!("{error:#}")),
                     },
-                    Job::OpenProject { path, agent } => Event::ProjectOpened {
-                        result: Project::load(&path).map_err(|e| format!("{e:#}")),
+                    Job::OpenProject {
+                        request,
+                        path,
+                        agent,
+                    } => Event::ProjectOpened {
+                        request,
+                        result: Project::open(&path).map_err(|e| format!("{e:#}")),
                         agent,
                     },
                     Job::Create {
@@ -1633,13 +2198,29 @@ fn start_worker(tx: SyncSender<Event>) -> Result<SyncSender<Job>> {
                         branch,
                         base,
                         agent,
-                    } => Event::Created {
-                        result: worktree::create(&repository, &branch, base.as_deref())
-                            .map_err(|e| format!("{e:#}")),
-                        project: repository.common_dir,
-                        agent,
-                    },
-                    Job::List(repository) => Event::Worktrees {
+                        split,
+                    } => {
+                        let result = worktree::create(&repository, &branch, base.as_deref())
+                            .map_err(|error| format!("{error:#}"));
+                        let preparation_error = result.as_ref().ok().and_then(|tree| {
+                            prepare_local_environment(&repository.root, tree)
+                                .err()
+                                .map(|error| format!("{error:#}"))
+                        });
+                        Event::Created {
+                            result,
+                            preparation_error,
+                            source: repository.root,
+                            project: repository.common_dir,
+                            agent,
+                            split,
+                        }
+                    }
+                    Job::List {
+                        request,
+                        repository,
+                    } => Event::Worktrees {
+                        request,
                         result: worktree::list(&repository).map_err(|e| format!("{e:#}")),
                         project: repository.common_dir,
                     },
@@ -1659,15 +2240,32 @@ fn start_worker(tx: SyncSender<Event>) -> Result<SyncSender<Job>> {
                             result: result.map_err(|e| format!("{e:#}")),
                         }
                     }
-                    Job::Environment { tree, operation } => {
-                        let result = match operation {
-                            EnvironmentOp::Up => compose::up(&tree),
-                            EnvironmentOp::Down => compose::down(&tree),
-                            EnvironmentOp::Restart => compose::restart(&tree),
-                            EnvironmentOp::Status => compose::status(&tree),
-                        };
+                    Job::Environment {
+                        tree,
+                        operation,
+                        source,
+                    } => {
+                        let mut prepared = false;
+                        let result = (|| {
+                            if matches!(operation, EnvironmentOp::Up | EnvironmentOp::Restart)
+                                && let Some(source) = source
+                            {
+                                prepare_local_environment(&source, &tree)?;
+                                prepared = true;
+                            }
+                            match operation {
+                                EnvironmentOp::Up => compose::up(&tree),
+                                EnvironmentOp::Down => compose::down(&tree),
+                                EnvironmentOp::Restart => compose::restart(&tree),
+                                EnvironmentOp::Status | EnvironmentOp::Probe => {
+                                    compose::status(&tree)
+                                }
+                            }
+                        })();
                         Event::Environment {
                             tree: tree.id,
+                            operation,
+                            prepared,
                             result: result.map_err(|e| format!("{e:#}")),
                         }
                     }
@@ -1739,13 +2337,16 @@ fn choose_project(
     } else if let Some(notice) = update_notice {
         notice.to_owned()
     } else {
-        "Choose New terminal for a shell here, or open a Git project.".into()
+        "Choose New terminal for a shell here, or open a project or any folder.".into()
     };
-    let mut picker = ProjectPicker::new(base, jobs)?;
+    let mut picker = ProjectPicker::new(base, jobs, 0)?;
     picker.terminal_path = Some(launch_path.clone());
     let mut native_keys = false;
+    let mut interaction_visible = true;
     loop {
         terminal.draw(|frame| {
+            let bounds = frame.area();
+            interaction_visible = bounds.width >= 30 && bounds.height >= 10;
             ui::draw_project_chooser(frame, &picker, &notice, native_keys);
         })?;
         match pending.pop_front().map_or_else(|| rx.recv(), Ok)? {
@@ -1765,6 +2366,7 @@ fn choose_project(
                             }
                         }
                     }
+                    _ if !interaction_visible => {}
                     _ => match picker.key(key, jobs) {
                         Ok(true) => {
                             return Ok(Some((Project::terminal(&launch_path)?, native_keys)));
@@ -1774,20 +2376,21 @@ fn choose_project(
                     },
                 }
             }
-            Event::Input(crossterm::event::Event::Paste(text)) => picker.paste(&text),
+            Event::Input(crossterm::event::Event::Paste(text)) if interaction_visible => {
+                picker.paste(&text);
+            }
             Event::Projects { base, projects } if picker.base == base => {
                 picker.set_projects(projects);
             }
             Event::ProjectOpened {
-                result: Ok(project),
-                ..
-            } => return Ok(Some((project, native_keys))),
-            Event::ProjectOpened {
-                result: Err(error), ..
-            } => {
-                picker.pending = false;
-                notice = error;
-            }
+                request, result, ..
+            } if picker.request == request => match result {
+                Ok(project) => return Ok(Some((project, native_keys))),
+                Err(error) => {
+                    picker.pending = false;
+                    notice = error;
+                }
+            },
             Event::Error(error) => notice = error,
             Event::Shutdown => return Ok(None),
             _ => {}
@@ -1795,7 +2398,81 @@ fn choose_project(
     }
 }
 
-pub fn run(path: &Path, agent: &str, use_kitty: bool, direct_start: bool) -> Result<()> {
+fn restore_projects(
+    snapshot: &restore::Snapshot,
+    socket: &Path,
+    tx: &SyncSender<Event>,
+    size: ratatui::layout::Size,
+    next_session: &mut u64,
+) -> Result<(Project, Vec<Project>)> {
+    let mut projects = Vec::with_capacity(snapshot.projects.len());
+    for (order, saved) in snapshot.projects.iter().enumerate() {
+        let mut project = Project::open(&saved.workspaces[0].path)
+            .with_context(|| format!("restore project {}", saved.workspaces[0].path.display()))?;
+        for (index, saved_workspace) in saved.workspaces.iter().enumerate() {
+            let tree = if index == 0 {
+                project.workspaces.remove(0).tree
+            } else {
+                let mut candidate = Project::open(&saved_workspace.path).with_context(|| {
+                    format!("restore worktree {}", saved_workspace.path.display())
+                })?;
+                anyhow::ensure!(
+                    project.same_project(&candidate),
+                    "saved worktree {} no longer belongs to its project",
+                    saved_workspace.path.display()
+                );
+                candidate.workspaces.remove(0).tree
+            };
+            let mut workspace = Workspace::new(tree);
+            workspace.source = saved_workspace.source.clone();
+            for saved_session in &saved_workspace.sessions {
+                let id = *next_session;
+                *next_session += 1;
+                let session = Session::spawn(
+                    id,
+                    &saved_session.kind,
+                    saved_session.resume.as_deref(),
+                    &workspace.tree.path,
+                    socket,
+                    tx.clone(),
+                    size.height.saturating_sub(4),
+                    size.width.saturating_sub(2),
+                    None,
+                )
+                .with_context(|| {
+                    format!(
+                        "restore {} session in {}",
+                        saved_session.kind,
+                        workspace.tree.path.display()
+                    )
+                })?;
+                workspace.sessions.push(session);
+            }
+            workspace.selected = saved_workspace.selected;
+            project.workspaces.push(workspace);
+        }
+        project.active = saved.active;
+        project.secondary = saved.secondary;
+        project.focus_secondary = saved.focus_secondary;
+        project.layout = match saved.layout {
+            restore::SavedLayout::Full => LayoutMode::Full,
+            restore::SavedLayout::Vertical => LayoutMode::Vertical,
+            restore::SavedLayout::Horizontal => LayoutMode::Horizontal,
+        };
+        project.order = order as u64;
+        projects.push(project);
+    }
+    let current = projects.remove(snapshot.active_project);
+    Ok((current, projects))
+}
+
+pub fn run(
+    path: &Path,
+    agent: &str,
+    use_kitty: bool,
+    direct_start: bool,
+    fresh: bool,
+) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         anyhow::bail!("Crit needs an interactive terminal; use --help for noninteractive commands");
     }
@@ -1835,7 +2512,7 @@ pub fn run(path: &Path, agent: &str, use_kitty: bool, direct_start: bool) -> Res
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let startup = updates::run(&mut terminal, &rx);
     let updates::Startup {
-        notice: update_notice,
+        notice: mut update_notice,
         mut pending,
     } = match startup {
         Ok(Some(startup)) => startup,
@@ -1844,58 +2521,119 @@ pub fn run(path: &Path, agent: &str, use_kitty: bool, direct_start: bool) -> Res
             return result.map(|_| ());
         }
     };
-    let selection = match direct_start.then(|| Project::load(path)) {
-        Some(Ok(project)) => Ok(Some((project, false))),
-        result => choose_project(
-            &mut terminal,
-            &rx,
-            &mut pending,
-            &jobs,
-            path,
-            result.and_then(Result::err),
-            update_notice.as_deref(),
-            use_kitty,
-        ),
-    };
-    let (project, native_keys) = match selection {
-        Ok(Some(selection)) => selection,
-        result => {
-            signal_handle.close();
-            return result.map(|_| ());
+    let mut store = match restore::Store::open() {
+        Ok(store) => Some(store),
+        Err(error) => {
+            update_notice = Some(format!(
+                "Workspace restoration/saving unavailable: {error:#}. This window will not replace the saved workspace."
+            ));
+            None
         }
     };
-    let active = project.active;
+    let snapshot = if fresh {
+        None
+    } else {
+        match store.as_ref().map(restore::Store::load).transpose() {
+            Ok(snapshot) => snapshot
+                .flatten()
+                .filter(|snapshot| !snapshot.projects.is_empty()),
+            Err(error) => {
+                update_notice = Some(format!(
+                    "Saved workspace could not be loaded: {error:#}. Original state retained; saving disabled. Use --fresh to replace it."
+                ));
+                store = None;
+                None
+            }
+        }
+    };
     let server = integration::start(tx.clone())?;
+    let mut next_session = 1;
+    let restored = match snapshot
+        .as_ref()
+        .map(|snapshot| {
+            restore_projects(
+                snapshot,
+                &server.socket_path,
+                &tx,
+                terminal.size()?,
+                &mut next_session,
+            )
+        })
+        .transpose()
+    {
+        Ok(restored) => restored,
+        Err(error) => {
+            update_notice = Some(format!(
+                "Saved workspace could not be restored: {error:#}. Original state retained; saving disabled. Fix the cause and restart, or use --fresh."
+            ));
+            store = None;
+            None
+        }
+    };
+    let was_restored = restored.is_some();
+    let (project, saved_projects, native_keys) = if let Some((project, saved)) = restored {
+        (project, saved, snapshot.as_ref().unwrap().native_keys)
+    } else {
+        let selection = match direct_start.then(|| Project::load(path)) {
+            Some(Ok(project)) => Ok(Some((project, false))),
+            result => choose_project(
+                &mut terminal,
+                &rx,
+                &mut pending,
+                &jobs,
+                path,
+                result.and_then(Result::err),
+                update_notice.as_deref(),
+                use_kitty,
+            ),
+        };
+        match selection {
+            Ok(Some((project, native_keys))) => (project, Vec::new(), native_keys),
+            result => {
+                signal_handle.close();
+                return result.map(|_| ());
+            }
+        }
+    };
+    if use_kitty && native_keys {
+        kitty::set_native(&mut io::stdout(), true)?;
+    }
+    let active = project.active;
     let mut app = App {
         project,
-        saved_projects: Vec::new(),
+        saved_projects,
         native_keys,
         modal: None,
         notice: update_notice,
         panes: Vec::with_capacity(2),
+        scroll_drag: None,
         tab_hits: Vec::new(),
+        interaction_visible: true,
         should_quit: false,
         default_agent: agent.into(),
-        next_session: 1,
-        next_intent: 1,
+        next_session,
+        next_request: 1,
+        pending_creations: VecDeque::new(),
+        state_dirty: true,
         socket: server.socket_path.clone(),
         tx: tx.clone(),
         jobs,
         use_kitty,
     };
-    if let Err(error) = app.ensure_session(active) {
+    if !was_restored && let Err(error) = app.ensure_session(active) {
         app.set_notice(format!(
             "{error:#}. F1 → ask to start another agent or shell."
         ));
     }
     if app.project.repository.is_some() && compose::has_config(&app.project.workspaces[active].tree)
     {
-        app.env(active, EnvironmentOp::Status)?;
+        app.env(active, EnvironmentOp::Probe)?;
     }
     let frame_interval = Duration::from_millis(16);
     let mut last_draw = Instant::now() - frame_interval;
     let mut redraw = true;
     while !app.should_quit {
+        redraw |= app.checkpoint(&mut store);
         if redraw && last_draw.elapsed() >= frame_interval {
             ui::resize_sessions(&mut app, terminal.size()?)?;
             terminal.draw(|frame| ui::draw(frame, &mut app))?;
@@ -1938,6 +2676,7 @@ pub fn run(path: &Path, agent: &str, use_kitty: bool, direct_start: bool) -> Res
             }
         }
     }
+    app.checkpoint(&mut store);
     signal_handle.close();
     drop(app);
     drop(server);
@@ -1948,9 +2687,634 @@ pub fn run(path: &Path, agent: &str, use_kitty: bool, direct_start: bool) -> Res
 mod tests {
     use super::*;
 
+    #[test]
+    fn completed_local_preparation_releases_source_even_when_docker_fails() {
+        let (mut app, _queued, _events) = interaction_app();
+        let source = PathBuf::from("/interaction-fixture/source");
+        app.project.workspaces[0].source = Some(source.clone());
+        app.handle(Event::Environment {
+            tree: "main".into(),
+            operation: EnvironmentOp::Up,
+            prepared: false,
+            result: Err("missing local input".into()),
+        })
+        .unwrap();
+        assert_eq!(
+            app.snapshot().projects[0].workspaces[0].source,
+            Some(source)
+        );
+        app.handle(Event::Environment {
+            tree: "main".into(),
+            operation: EnvironmentOp::Up,
+            prepared: true,
+            result: Err("Docker daemon unavailable".into()),
+        })
+        .unwrap();
+        assert_eq!(app.snapshot().projects[0].workspaces[0].source, None);
+        assert!(app.project.workspaces[0].environment.is_none());
+        assert!(!app.project.workspaces[0].pending);
+    }
+
+    #[test]
+    fn scrollbar_click_and_drag_reach_history_and_live_output() {
+        use crossterm::event::MouseEvent;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let session = Session::spawn(
+            1,
+            "shell",
+            None,
+            directory.path(),
+            &directory.path().join("unused.sock"),
+            app.tx.clone(),
+            12,
+            38,
+            Some((
+                "/bin/sh".into(),
+                vec!["-c".into(), "IFS= read -r line".into()],
+            )),
+        )
+        .unwrap();
+        {
+            let mut parser = session.parser.lock();
+            for row in 0..60 {
+                parser.process(format!("row-{row:02}\r\n").as_bytes());
+            }
+        }
+        app.project.workspaces[0].sessions.push(session);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 14)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let bar = app.panes[0].scrollbar.unwrap();
+        assert_eq!(app.panes[0].body.bottom(), 14);
+        assert_eq!(bar.thumb.bottom(), bar.track.bottom());
+        let mouse = |kind, column, row| {
+            Event::Input(crossterm::event::Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }))
+        };
+        app.handle(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            bar.track.x,
+            bar.track.y,
+        ))
+        .unwrap();
+        assert!(
+            app.focused_session()
+                .unwrap()
+                .parser
+                .lock()
+                .screen()
+                .contents()
+                .starts_with("row-00")
+        );
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        // A drag remains captured even after the pointer leaves the narrow gutter.
+        app.handle(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            0,
+            bar.track.bottom() - 1,
+        ))
+        .unwrap();
+        app.handle(mouse(
+            MouseEventKind::Up(MouseButton::Left),
+            0,
+            bar.track.bottom() - 1,
+        ))
+        .unwrap();
+        let parser = app.focused_session().unwrap().parser.lock();
+        assert_eq!(parser.screen().scrollback(), 0);
+        assert!(parser.screen().contents().contains("row-59"));
+        drop(parser);
+        assert!(app.scroll_drag.is_none());
+        app.notice = Some("Environment ready".into());
+        ui::resize_sessions(&mut app, ratatui::layout::Size::new(40, 14)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(app.panes[0].body.bottom(), 13);
+        app.notice = None;
+        ui::resize_sessions(&mut app, ratatui::layout::Size::new(40, 14)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(app.panes[0].body.bottom(), 14);
+    }
+
+    #[test]
+    fn queued_mouse_and_output_cannot_use_a_closed_split_pane() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _queued, _events) = interaction_app();
+        app.project.layout = LayoutMode::Vertical;
+        app.project.secondary = Some(1);
+        app.project.focus_secondary = true;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let old_body = app.panes[1].body;
+        app.close_workspace();
+        app.handle(Event::Input(crossterm::event::Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: old_body.x,
+            row: old_body.y,
+            modifiers: KeyModifiers::NONE,
+        })))
+        .unwrap();
+        assert!(!app.handle(Event::Dirty(99)).unwrap());
+        assert_eq!(app.focused().tree.id, "main");
+        assert_eq!(app.project.workspaces.len(), 1);
+        assert!(!app.project.focus_secondary);
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        assert_eq!(app.panes.len(), 1);
+        assert_eq!(app.panes[0].workspace, 0);
+    }
+
+    #[test]
+    fn closing_last_workspace_forgets_it_but_quit_preserves_open_tabs() {
+        let (mut app, _queued, _events) = interaction_app();
+        app.project.active = 1;
+        app.action(Action::Quit).unwrap();
+        app.modal_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .unwrap();
+        let saved = app.snapshot();
+        assert_eq!(saved.projects[0].workspaces.len(), 2);
+        assert_eq!(saved.projects[0].active, 1);
+        app.should_quit = false;
+        app.close_workspace();
+        assert_eq!(
+            app.snapshot().projects[0].workspaces[0].path,
+            PathBuf::from("/interaction-fixture/main")
+        );
+        app.close_workspace();
+        assert!(app.should_quit);
+        assert!(app.snapshot().projects.is_empty());
+    }
+
+    fn interaction_app() -> (App, mpsc::Receiver<Job>, mpsc::Receiver<Event>) {
+        let (tx, events) = mpsc::sync_channel(8);
+        let (jobs, queued) = mpsc::sync_channel(1);
+        let root = PathBuf::from("/interaction-fixture");
+        let app = App {
+            project: Project {
+                repository: Some(worktree::Repository {
+                    root: root.clone(),
+                    common_dir: root.join(".git"),
+                }),
+                name: "fixture".into(),
+                workspaces: ["main", "other"]
+                    .into_iter()
+                    .map(|branch| {
+                        Workspace::new(Worktree {
+                            id: branch.into(),
+                            path: root.join(branch),
+                            branch: branch.into(),
+                            head: String::new(),
+                            is_main: branch == "main",
+                            locked: false,
+                        })
+                    })
+                    .collect(),
+                active: 0,
+                secondary: None,
+                focus_secondary: false,
+                layout: LayoutMode::Full,
+                order: 0,
+            },
+            saved_projects: Vec::new(),
+            native_keys: false,
+            modal: None,
+            notice: None,
+            panes: Vec::new(),
+            scroll_drag: None,
+            tab_hits: Vec::new(),
+            interaction_visible: true,
+            should_quit: false,
+            default_agent: "shell".into(),
+            next_session: 1,
+            next_request: 1,
+            pending_creations: VecDeque::new(),
+            state_dirty: false,
+            socket: root.join("agent.sock"),
+            tx,
+            jobs,
+            use_kitty: false,
+        };
+        (app, queued, events)
+    }
+
+    #[test]
+    fn canceled_worktree_listing_cannot_replace_a_newer_dialog() {
+        let (mut app, queued, _events) = interaction_app();
+        app.run_command(IntentCommand::OpenWorktree).unwrap();
+        let Job::List {
+            request,
+            repository,
+        } = queued.recv().unwrap()
+        else {
+            panic!("expected worktree listing");
+        };
+        app.modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        app.modal = Some(Modal::Confirm(Confirm::Quit));
+        let tree = app.project.workspaces[1].tree.clone();
+        app.handle(Event::Worktrees {
+            request,
+            project: repository.common_dir.clone(),
+            result: Ok(vec![tree.clone()]),
+        })
+        .unwrap();
+        assert!(matches!(app.modal, Some(Modal::Confirm(Confirm::Quit))));
+        assert!(!app.should_quit);
+
+        app.run_command(IntentCommand::OpenWorktree).unwrap();
+        let Job::List {
+            request: current, ..
+        } = queued.recv().unwrap()
+        else {
+            panic!("expected replacement listing");
+        };
+        app.handle(Event::Worktrees {
+            request,
+            project: repository.common_dir.clone(),
+            result: Err("stale failure".into()),
+        })
+        .unwrap();
+        assert!(matches!(app.modal, Some(Modal::Loading { request, .. }) if request == current));
+        app.handle(Event::Worktrees {
+            request: current,
+            project: repository.common_dir,
+            result: Ok(vec![tree]),
+        })
+        .unwrap();
+        assert!(
+            matches!(&app.modal, Some(Modal::OpenWorktree { trees, .. }) if trees[0].id == "other")
+        );
+    }
+
+    #[test]
+    fn canceled_project_open_cannot_complete_a_replacement_picker() {
+        let (mut app, queued, _events) = interaction_app();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let mut requests = Vec::new();
+        for path in ["/cancelled", "/replacement"] {
+            app.run_command(IntentCommand::OpenProject).unwrap();
+            queued.recv().unwrap();
+            let Some(Modal::OpenProject(picker)) = &mut app.modal else {
+                panic!("expected project picker");
+            };
+            picker.input = path.into();
+            app.modal_key(enter).unwrap();
+            let Job::OpenProject { request, .. } = queued.recv().unwrap() else {
+                panic!("expected project opening");
+            };
+            requests.push(request);
+            if path == "/cancelled" {
+                app.modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                    .unwrap();
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            !app.handle(Event::ProjectOpened {
+                request: requests[0],
+                agent: None,
+                result: Ok(Project::terminal(directory.path()).unwrap()),
+            })
+            .unwrap()
+        );
+        assert_eq!(app.project.name, "fixture");
+        assert!(app.saved_projects.is_empty());
+        assert!(
+            matches!(&app.modal, Some(Modal::OpenProject(picker)) if picker.pending && picker.input == "/replacement")
+        );
+        app.handle(Event::ProjectOpened {
+            request: requests[1],
+            agent: None,
+            result: Err("replacement unavailable".into()),
+        })
+        .unwrap();
+        assert!(
+            matches!(&app.modal, Some(Modal::OpenProject(picker)) if !picker.pending && picker.input == "/replacement")
+        );
+        assert_eq!(app.notice.as_deref(), Some("replacement unavailable"));
+    }
+
+    #[test]
+    fn failed_interpreted_navigation_restores_the_editable_request() {
+        let (mut app, queued, _events) = interaction_app();
+        app.open_intent().unwrap();
+        queued.recv().unwrap();
+        let Some(Modal::Intent(dialog)) = &mut app.modal else {
+            panic!("expected interpreter dialog");
+        };
+        dialog.input = "open gone".into();
+        dialog.loading = false;
+        dialog.pending = true;
+        dialog.targets.push(IntentTarget {
+            id: 0,
+            kind: "project",
+            name: "gone".into(),
+            path: PathBuf::from("/gone"),
+            branch: None,
+        });
+        Arc::make_mut(&mut dialog.conversation).push(serde_json::json!({
+            "role": "user", "content": dialog.input,
+        }));
+        let request = dialog.request;
+        app.handle(Event::IntentResolved {
+            request,
+            result: Ok(Plan::Open {
+                target: 0,
+                agent: None,
+            }),
+        })
+        .unwrap();
+        let Job::OpenProject { request, .. } = queued.recv().unwrap() else {
+            panic!("expected project opening");
+        };
+        app.handle(Event::ProjectOpened {
+            request,
+            agent: None,
+            result: Err("folder disappeared".into()),
+        })
+        .unwrap();
+        let Some(Modal::Intent(dialog)) = &app.modal else {
+            panic!("failed navigation discarded the request");
+        };
+        assert_eq!(dialog.input, "open gone");
+        assert_eq!(dialog.error.as_deref(), Some("folder disappeared"));
+        assert!(!dialog.pending);
+        assert!(dialog.conversation.is_empty());
+    }
+
+    #[test]
+    fn modal_errors_preserve_selection_input_and_confirmation_for_retry() {
+        let (mut app, queued, _events) = interaction_app();
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let repository = app.project.repository.take();
+        let selected = COMMANDS
+            .iter()
+            .position(|(_, command)| *command == IntentCommand::NewWorktree)
+            .unwrap();
+        app.modal = Some(Modal::Commands { selected });
+        assert!(app.modal_key(enter).is_err());
+        assert!(
+            matches!(app.modal, Some(Modal::Commands { selected: actual }) if actual == selected)
+        );
+        app.project.repository = repository;
+        app.jobs.try_send(Job::Projects(PathBuf::new())).unwrap();
+        app.modal = Some(Modal::NewWorktree {
+            input: "typed-branch".into(),
+            split: Some(LayoutMode::Vertical),
+        });
+        assert!(app.modal_key(enter).is_err());
+        assert!(
+            matches!(&app.modal, Some(Modal::NewWorktree { input, split: Some(LayoutMode::Vertical) }) if input == "typed-branch")
+        );
+        assert!(app.pending_creations.is_empty());
+        queued.recv().unwrap();
+        app.modal_key(enter).unwrap();
+        assert!(
+            matches!(queued.recv().unwrap(), Job::Create { branch, .. } if branch == "typed-branch")
+        );
+        assert!(app.modal.is_none());
+        app.jobs.try_send(Job::Projects(PathBuf::new())).unwrap();
+        app.modal = Some(Modal::Confirm(Confirm::StopEnvironment));
+        assert!(
+            app.modal_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+                .is_err()
+        );
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Confirm(Confirm::StopEnvironment))
+        ));
+        app.modal_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.modal.is_none());
+        assert!(!app.project.workspaces[0].pending);
+    }
+
+    #[test]
+    fn failed_creation_restores_branch_and_split_without_overwriting_new_dialogs() {
+        let (mut app, queued, _events) = interaction_app();
+        let submit = |app: &mut App| {
+            app.modal = Some(Modal::NewWorktree {
+                input: "existing-branch".into(),
+                split: Some(LayoutMode::Horizontal),
+            });
+            app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+        };
+        let failed = || Event::Created {
+            project: PathBuf::from("/interaction-fixture/.git"),
+            source: PathBuf::from("/interaction-fixture/main"),
+            preparation_error: None,
+            result: Err("branch already checked out".into()),
+            agent: None,
+            split: Some(LayoutMode::Horizontal),
+        };
+        submit(&mut app);
+        queued.recv().unwrap();
+        app.handle(failed()).unwrap();
+        assert!(app.pending_creations.is_empty());
+        assert!(
+            matches!(&app.modal, Some(Modal::NewWorktree { input, split: Some(LayoutMode::Horizontal) }) if input == "existing-branch")
+        );
+        app.modal_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            matches!(&app.modal, Some(Modal::NewWorktree { input, .. }) if input == "existing-branc")
+        );
+        submit(&mut app);
+        queued.recv().unwrap();
+        app.modal = Some(Modal::Confirm(Confirm::Quit));
+        app.handle(failed()).unwrap();
+        assert!(matches!(app.modal, Some(Modal::Confirm(Confirm::Quit))));
+        assert!(app.pending_creations.is_empty());
+        submit(&mut app);
+        queued.recv().unwrap();
+        app.project.active = 1;
+        app.handle(failed()).unwrap();
+        assert!(
+            app.modal.is_none(),
+            "do not restore a dialog onto a different worktree"
+        );
+    }
+
+    #[test]
+    fn creation_completion_does_not_retarget_an_open_confirmation() {
+        let (mut app, _queued, _events) = interaction_app();
+        app.modal = Some(Modal::Confirm(Confirm::CloseWorktree));
+        let mut tree = app.project.workspaces[1].tree.clone();
+        tree.id = "created".into();
+        app.handle(Event::Created {
+            project: PathBuf::from("/interaction-fixture/.git"),
+            source: PathBuf::from("/interaction-fixture/main"),
+            preparation_error: None,
+            result: Ok(tree),
+            agent: None,
+            split: Some(LayoutMode::Vertical),
+        })
+        .unwrap();
+        assert_eq!(app.focused().tree.id, "main");
+        assert!(app.project.layout == LayoutMode::Full);
+        assert_eq!(app.project.workspaces.len(), 3);
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Confirm(Confirm::CloseWorktree))
+        ));
+        app.modal_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.project.workspaces.len(), 3);
+    }
+
+    #[test]
+    fn collapsing_split_keeps_the_focused_worktree_for_every_entry_point() {
+        let (mut app, _queued, _events) = interaction_app();
+        for entry in 0..3 {
+            app.project.active = 0;
+            app.project.secondary = Some(1);
+            app.project.focus_secondary = true;
+            app.project.layout = if entry == 2 {
+                LayoutMode::Horizontal
+            } else {
+                LayoutMode::Vertical
+            };
+            match entry {
+                0 => app.split(LayoutMode::Vertical).unwrap(),
+                1 => app.run_command(IntentCommand::FullWidth).unwrap(),
+                _ => app.action(Action::CycleLayout).unwrap(),
+            }
+            assert!(app.project.layout == LayoutMode::Full);
+            assert_eq!(app.focused().tree.id, "other");
+            assert_eq!(app.project.active, 1);
+            assert!(app.project.secondary.is_none());
+            assert!(!app.project.focus_secondary);
+        }
+    }
+
+    #[test]
+    fn hidden_ui_rejects_confirmation_and_input_but_keeps_escape_and_shutdown() {
+        let (mut app, queued, _events) = interaction_app();
+        let input = |code| {
+            Event::Input(crossterm::event::Event::Key(KeyEvent::new(
+                code,
+                KeyModifiers::NONE,
+            )))
+        };
+        app.handle(Event::Input(crossterm::event::Event::Resize(29, 9)))
+            .unwrap();
+        assert!(!app.interaction_visible);
+        app.modal = Some(Modal::Confirm(Confirm::Quit));
+        assert!(!app.handle(input(KeyCode::Char('y'))).unwrap());
+        assert!(!app.should_quit);
+        assert!(matches!(app.modal, Some(Modal::Confirm(Confirm::Quit))));
+        app.handle(input(KeyCode::Esc)).unwrap();
+        assert!(app.modal.is_none());
+        app.handle(input(KeyCode::F(10))).unwrap();
+        assert!(
+            app.modal.is_none(),
+            "hidden shortcuts must not open invisible dialogs"
+        );
+        app.modal = Some(Modal::NewWorktree {
+            input: "kept".into(),
+            split: None,
+        });
+        app.handle(input(KeyCode::Char('x'))).unwrap();
+        app.handle(Event::Input(crossterm::event::Event::Paste(
+            "hidden".into(),
+        )))
+        .unwrap();
+        app.handle(input(KeyCode::Enter)).unwrap();
+        assert!(matches!(&app.modal, Some(Modal::NewWorktree { input, .. }) if input == "kept"));
+        assert!(queued.try_recv().is_err());
+        app.handle(input(KeyCode::F(12))).unwrap();
+        assert!(app.native_keys);
+        assert!(
+            app.handle(Event::Input(crossterm::event::Event::Resize(80, 24)))
+                .unwrap()
+        );
+        assert!(app.interaction_visible);
+        app.handle(Event::Shutdown).unwrap();
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn failed_interpreted_creation_restores_editable_request_and_error() {
+        let (mut app, queued, _events) = interaction_app();
+        app.open_intent().unwrap();
+        queued.recv().unwrap();
+        let Some(Modal::Intent(dialog)) = &mut app.modal else {
+            panic!("expected interpreter dialog");
+        };
+        dialog.input = "Create branch taken".into();
+        dialog.loading = false;
+        dialog.pending = true;
+        Arc::make_mut(&mut dialog.conversation).push(serde_json::json!({
+            "role": "user", "content": dialog.input,
+        }));
+        let request = dialog.request;
+        app.handle(Event::IntentResolved {
+            request,
+            result: Ok(Plan::CreateWorktree {
+                branch: "taken".into(),
+                base: None,
+                agent: None,
+            }),
+        })
+        .unwrap();
+        assert!(app.modal.is_none());
+        assert!(matches!(queued.recv().unwrap(), Job::Create { branch, .. } if branch == "taken"));
+        app.handle(Event::Created {
+            project: PathBuf::from("/interaction-fixture/.git"),
+            source: PathBuf::from("/interaction-fixture/main"),
+            preparation_error: None,
+            result: Err("branch is already checked out".into()),
+            agent: None,
+            split: None,
+        })
+        .unwrap();
+        let Some(Modal::Intent(dialog)) = &app.modal else {
+            panic!("failed creation must restore the original request");
+        };
+        assert_eq!(dialog.input, "Create branch taken");
+        assert_eq!(
+            dialog.error.as_deref(),
+            Some("branch is already checked out")
+        );
+        assert!(dialog.conversation.is_empty());
+        assert!(!dialog.pending);
+        app.modal_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            matches!(&app.modal, Some(Modal::Intent(dialog)) if dialog.input == "Create branch take")
+        );
+    }
+
+    #[test]
+    fn removing_an_unfocused_checkout_preserves_confirmation_target_and_split() {
+        let (mut app, _queued, _events) = interaction_app();
+        let mut third = app.project.workspaces[1].tree.clone();
+        third.id = "third".into();
+        app.project.workspaces.push(Workspace::new(third));
+        app.project.secondary = Some(2);
+        app.project.focus_secondary = true;
+        app.project.layout = LayoutMode::Vertical;
+        app.modal = Some(Modal::Confirm(Confirm::CloseWorktree));
+        app.handle(Event::Removed {
+            tree: "other".into(),
+            result: Ok(()),
+        })
+        .unwrap();
+        assert_eq!(app.focused().tree.id, "third");
+        assert!(app.project.layout == LayoutMode::Vertical);
+        assert_eq!(app.project.secondary, Some(1));
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Confirm(Confirm::CloseWorktree))
+        ));
+    }
+
     fn picker(base: &Path) -> (ProjectPicker, SyncSender<Job>, mpsc::Receiver<Job>) {
         let (tx, rx) = mpsc::sync_channel(16);
-        let picker = ProjectPicker::new(base.to_path_buf(), &tx).unwrap();
+        let picker = ProjectPicker::new(base.to_path_buf(), &tx, 0).unwrap();
         rx.recv().unwrap();
         (picker, tx, rx)
     }
@@ -2011,6 +3375,56 @@ mod tests {
     }
 
     #[test]
+    fn plain_folders_open_as_terminal_tabs_named_after_the_folder() {
+        let parent = tempfile::tempdir().unwrap();
+        let home = parent.path().join("jyq");
+        std::fs::create_dir(&home).unwrap();
+        // Direct start keeps requiring a Git project; the picker does not.
+        let Err(error) = Project::load(&home) else {
+            panic!("direct start must not open a plain folder");
+        };
+        assert!(error.to_string().contains("not inside a Git repository"));
+        let project = Project::open(&home).unwrap();
+        assert!(project.repository.is_none());
+        assert_eq!(project.name, "jyq");
+        assert_eq!(project.path(), home.canonicalize().unwrap());
+        assert!(!home.join(".git").exists());
+
+        // Opening the same folder again lands on the existing tab, not a duplicate.
+        let (tx, _events) = mpsc::sync_channel(8);
+        let (jobs, _queued) = mpsc::sync_channel(8);
+        let mut app = App {
+            project: Project::terminal(parent.path()).unwrap(),
+            saved_projects: Vec::new(),
+            native_keys: false,
+            modal: None,
+            notice: None,
+            panes: Vec::new(),
+            scroll_drag: None,
+            tab_hits: Vec::new(),
+            interaction_visible: true,
+            should_quit: false,
+            default_agent: "shell".into(),
+            next_session: 1,
+            next_request: 1,
+            pending_creations: VecDeque::new(),
+            state_dirty: false,
+            socket: parent.path().join("agent.sock"),
+            tx,
+            jobs,
+            use_kitty: false,
+        };
+        app.open_project(project, None).unwrap();
+        assert_eq!(app.project.name, "jyq");
+        assert_eq!(app.saved_projects.len(), 1);
+        app.open_project(Project::open(&home).unwrap(), None)
+            .unwrap();
+        assert_eq!(app.project.name, "jyq");
+        assert_eq!(app.project.workspaces.len(), 1);
+        assert_eq!(app.saved_projects.len(), 1);
+    }
+
+    #[test]
     fn terminal_workspace_guards_git_actions_and_keeps_launcher_available() {
         let directory = tempfile::tempdir().unwrap();
         let (tx, _events) = mpsc::sync_channel(8);
@@ -2022,11 +3436,15 @@ mod tests {
             modal: None,
             notice: None,
             panes: Vec::new(),
+            scroll_drag: None,
             tab_hits: Vec::new(),
+            interaction_visible: true,
             should_quit: false,
             default_agent: "omp".into(),
             next_session: 1,
-            next_intent: 1,
+            next_request: 1,
+            pending_creations: VecDeque::new(),
+            state_dirty: false,
             socket: directory.path().join("agent.sock"),
             tx,
             jobs,
@@ -2050,7 +3468,14 @@ mod tests {
                     .contains("Open a Git project")
             );
         }
-        assert!(app.action(Action::NewWorktree).is_err());
+        assert!(app.split(LayoutMode::Vertical).is_err());
+        app.action(Action::NewTab).unwrap();
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::NewTab { choices, selected: 0 })
+                if choices.iter().map(|(_, command)| *command).eq([IntentCommand::OpenProject])
+        ));
+        app.modal = None;
         assert!(app.env(0, EnvironmentOp::Status).is_err());
         assert!(
             app.execute_intent(
@@ -2087,6 +3512,301 @@ mod tests {
     }
 
     #[test]
+    fn split_prompts_for_a_worktree_and_new_tab_offers_projects() {
+        let (tx, _events) = mpsc::sync_channel(8);
+        let (jobs, queued) = mpsc::sync_channel(8);
+        let root = PathBuf::from("/split-fixture");
+        let workspace = |branch: &str| {
+            Workspace::new(Worktree {
+                id: branch.into(),
+                path: root.join(branch),
+                branch: branch.into(),
+                head: String::new(),
+                is_main: branch == "main",
+                locked: false,
+            })
+        };
+        let mut app = App {
+            project: Project {
+                repository: Some(worktree::Repository {
+                    root: root.clone(),
+                    common_dir: root.join(".git"),
+                }),
+                name: "fixture".into(),
+                workspaces: vec![workspace("main")],
+                active: 0,
+                secondary: None,
+                focus_secondary: false,
+                layout: LayoutMode::Full,
+                order: 0,
+            },
+            saved_projects: Vec::new(),
+            native_keys: false,
+            modal: None,
+            notice: None,
+            panes: Vec::new(),
+            scroll_drag: None,
+            tab_hits: Vec::new(),
+            interaction_visible: true,
+            should_quit: false,
+            default_agent: "shell".into(),
+            next_session: 1,
+            next_request: 1,
+            pending_creations: VecDeque::new(),
+            state_dirty: false,
+            socket: root.join("agent.sock"),
+            tx,
+            jobs,
+            use_kitty: false,
+        };
+        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
+
+        // One worktree: the split shortcut goes straight to naming a new one.
+        app.action(Action::SplitVertical).unwrap();
+        assert!(matches!(
+            app.modal,
+            Some(Modal::NewWorktree {
+                split: Some(LayoutMode::Vertical),
+                ..
+            })
+        ));
+        for c in "login-fix".chars() {
+            app.modal_key(press(KeyCode::Char(c))).unwrap();
+        }
+        app.modal_key(press(KeyCode::Enter)).unwrap();
+        assert!(app.modal.is_none());
+        assert!(matches!(
+            queued.recv().unwrap(),
+            Job::Create {
+                branch,
+                base: None,
+                agent: None,
+                split: Some(LayoutMode::Vertical),
+                ..
+            } if branch == "login-fix"
+        ));
+
+        // Two worktrees: the chooser leads with "new worktree" and keeps the
+        // existing ones selectable; the current one is rejected.
+        app.project.workspaces.push(workspace("other"));
+        app.action(Action::SplitHorizontal).unwrap();
+        assert!(matches!(
+            app.modal,
+            Some(Modal::Split {
+                layout: LayoutMode::Horizontal,
+                selected: 0
+            })
+        ));
+        app.modal_key(press(KeyCode::Down)).unwrap();
+        app.modal_key(press(KeyCode::Enter)).unwrap();
+        assert!(matches!(app.modal, Some(Modal::Split { selected: 1, .. })));
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("different worktree")
+        );
+        app.modal_key(press(KeyCode::Up)).unwrap();
+        app.modal_key(press(KeyCode::Enter)).unwrap();
+        assert!(matches!(
+            app.modal,
+            Some(Modal::NewWorktree {
+                split: Some(LayoutMode::Horizontal),
+                ..
+            })
+        ));
+        app.modal = None;
+        assert!(queued.try_recv().is_err());
+
+        // A split that is already showing toggles back to full width.
+        app.project.layout = LayoutMode::Vertical;
+        app.project.secondary = Some(1);
+        app.project.focus_secondary = true;
+        app.action(Action::SplitVertical).unwrap();
+        assert!(app.modal.is_none());
+        assert!(app.project.layout == LayoutMode::Full && !app.project.focus_secondary);
+
+        // The manual command still opens a plain worktree tab, never a split.
+        app.run_command(IntentCommand::NewWorktree).unwrap();
+        assert!(matches!(
+            app.modal,
+            Some(Modal::NewWorktree { split: None, .. })
+        ));
+
+        // New tab lists worktree actions for Git projects and other projects.
+        app.action(Action::NewTab).unwrap();
+        let Some(Modal::NewTab {
+            choices,
+            selected: 0,
+        }) = &app.modal
+        else {
+            panic!("expected new tab chooser");
+        };
+        assert_eq!(
+            choices
+                .iter()
+                .map(|(_, command)| *command)
+                .collect::<Vec<_>>(),
+            [
+                IntentCommand::NewWorktree,
+                IntentCommand::OpenWorktree,
+                IntentCommand::OpenProject,
+            ]
+        );
+        assert!(choices[0].0.contains("fixture"));
+        app.saved_projects.push(Project {
+            repository: None,
+            name: "Terminal".into(),
+            workspaces: vec![workspace("terminal")],
+            active: 0,
+            secondary: None,
+            focus_secondary: false,
+            layout: LayoutMode::Full,
+            order: 1,
+        });
+        app.action(Action::NewTab).unwrap();
+        let Some(Modal::NewTab { choices, .. }) = &app.modal else {
+            panic!("expected new tab chooser");
+        };
+        assert_eq!(choices.last().unwrap().1, IntentCommand::SwitchProject);
+        for _ in 0..3 {
+            app.modal_key(press(KeyCode::Down)).unwrap();
+        }
+        app.modal_key(press(KeyCode::Enter)).unwrap();
+        assert!(matches!(
+            app.modal,
+            Some(Modal::SwitchProject { selected: 0 })
+        ));
+    }
+
+    #[test]
+    fn tab_bar_lists_every_open_project_in_opening_order_and_tabs_wrap_across_them() {
+        let (tx, _events) = mpsc::sync_channel(8);
+        let (jobs, queued) = mpsc::sync_channel(8);
+        let project = |name: &str, order: u64, branches: &[&str]| Project {
+            repository: None,
+            name: name.into(),
+            workspaces: branches
+                .iter()
+                .map(|branch| {
+                    Workspace::new(Worktree {
+                        id: format!("{name}:{branch}"),
+                        path: PathBuf::from(format!("/{name}/{branch}")),
+                        branch: (*branch).into(),
+                        head: String::new(),
+                        is_main: false,
+                        locked: false,
+                    })
+                })
+                .collect(),
+            active: 0,
+            secondary: None,
+            focus_secondary: false,
+            layout: LayoutMode::Full,
+            order,
+        };
+        let mut app = App {
+            project: project("alpha", 0, &["main", "dev"]),
+            saved_projects: vec![project("beta", 1, &["main"])],
+            native_keys: false,
+            modal: None,
+            notice: None,
+            panes: Vec::new(),
+            scroll_drag: None,
+            tab_hits: Vec::new(),
+            interaction_visible: true,
+            should_quit: false,
+            default_agent: "shell".into(),
+            next_session: 1,
+            next_request: 1,
+            pending_creations: VecDeque::new(),
+            state_dirty: false,
+            socket: PathBuf::from("/tabs-fixture/agent.sock"),
+            tx,
+            jobs,
+            use_kitty: false,
+        };
+        let names = |app: &App| {
+            project_slots(&app.project, &app.saved_projects)
+                .map(|(_, project)| project.name.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&app), ["alpha", "beta"]);
+        assert_eq!(
+            app.tabs().collect::<Vec<_>>(),
+            [(None, 0), (None, 1), (Some(0), 0)]
+        );
+
+        // Ctrl+Tab from alpha's last tab lands on beta without reordering the bar.
+        app.project.active = 1;
+        app.action(Action::NextWorktree).unwrap();
+        assert_eq!(app.project.name, "beta");
+        assert_eq!(app.focused_index(), 0);
+        assert_eq!(names(&app), ["alpha", "beta"]);
+        assert_eq!(
+            app.tabs().collect::<Vec<_>>(),
+            [(Some(0), 0), (Some(0), 1), (None, 0)]
+        );
+        app.action(Action::NextWorktree).unwrap();
+        assert_eq!(
+            (app.project.name.as_str(), app.focused_index()),
+            ("alpha", 0)
+        );
+        app.action(Action::PreviousWorktree).unwrap();
+        assert_eq!(
+            (app.project.name.as_str(), app.focused_index()),
+            ("beta", 0)
+        );
+
+        // The bar renders both projects; clicking another project's tab switches to it.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let row: String = terminal.backend().buffer().content[..100]
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        for expected in ["alpha", "1 main", "2 dev", "beta"] {
+            assert!(row.contains(expected), "{expected:?} missing from {row:?}");
+        }
+        let dev = app
+            .tab_hits
+            .iter()
+            .find(|hit| hit.project == Some(0) && hit.workspace == Some(1))
+            .map(|hit| hit.area)
+            .expect("alpha's dev tab is clickable");
+        let click = |column, row| {
+            Event::Input(crossterm::event::Event::Mouse(
+                crossterm::event::MouseEvent {
+                    kind: crossterm::event::MouseEventKind::Down(
+                        crossterm::event::MouseButton::Left,
+                    ),
+                    column,
+                    row,
+                    modifiers: KeyModifiers::NONE,
+                },
+            ))
+        };
+        app.handle(click(dev.x + 1, dev.y)).unwrap();
+        assert_eq!(
+            (app.project.name.as_str(), app.focused_index()),
+            ("alpha", 1)
+        );
+        assert_eq!(names(&app), ["alpha", "beta"]);
+
+        // Clicking a project name switches to that project's focused worktree.
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let beta = app
+            .tab_hits
+            .iter()
+            .find(|hit| hit.project == Some(0) && hit.workspace.is_none())
+            .map(|hit| hit.area)
+            .expect("beta's name is clickable");
+        app.handle(click(beta.x + 1, beta.y)).unwrap();
+        assert_eq!(app.project.name, "beta");
+        assert!(queued.try_recv().is_err());
+    }
+
+    #[test]
     fn intent_results_require_the_live_request_and_workspace_and_keep_confirmations() {
         let (tx, _events) = mpsc::sync_channel(8);
         let (jobs, queued) = mpsc::sync_channel(8);
@@ -2115,17 +3835,22 @@ mod tests {
                 secondary: None,
                 focus_secondary: false,
                 layout: LayoutMode::Full,
+                order: 0,
             },
             saved_projects: Vec::new(),
             native_keys: false,
             modal: None,
             notice: None,
             panes: Vec::new(),
+            scroll_drag: None,
             tab_hits: Vec::new(),
+            interaction_visible: true,
             should_quit: false,
             default_agent: "shell".into(),
             next_session: 1,
-            next_intent: 1,
+            next_request: 1,
+            pending_creations: VecDeque::new(),
+            state_dirty: false,
             socket: root.join("agent.sock"),
             tx,
             jobs,
