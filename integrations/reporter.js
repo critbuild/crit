@@ -43,6 +43,7 @@ export function createReporter() {
   }
 
   async function drain() {
+    let failures = 0;
     while (pending) {
       const next = pending;
       pending = undefined;
@@ -55,7 +56,15 @@ export function createReporter() {
       if (await send(next)) {
         previous = next;
         resume = next.resume;
-      } else previous = undefined;
+        failures = 0;
+      } else {
+        previous = undefined;
+        // A host stall can outlast Crit's handshake deadline; retry the latest state briefly.
+        if (!pending && next.current() && ++failures <= 3) {
+          pending = next;
+          await new Promise((resolve) => setTimeout(resolve, 100 * failures).unref?.());
+        }
+      }
     }
   }
 
@@ -63,7 +72,10 @@ export function createReporter() {
   // Keep the guard third for existing asynchronous lifecycle callers.
   function report(state, message, current = () => true, identity) {
     if (!current()) return Promise.resolve();
-    pending = { state, message: typeof message === "string" ? message.slice(0, 512) : null, current, identity };
+    // Crit's strict JSON parser rejects lone surrogates, so never cut a pair in half.
+    let text = typeof message === "string" ? message.toWellFormed() : null;
+    if (text?.length > 512) text = text.slice(0, /[\uD800-\uDBFF]/.test(text[511]) ? 511 : 512);
+    pending = { state, message: text, current, identity };
     if (!draining) {
       draining = drain().finally(() => {
         draining = undefined;

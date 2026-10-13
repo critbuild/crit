@@ -12,6 +12,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Environment {
@@ -24,6 +25,8 @@ pub struct Service {
     pub name: String,
     pub state: String,
     pub health: String,
+    #[serde(default)]
+    pub exit_code: i64,
     pub ports: Vec<Port>,
 }
 
@@ -239,6 +242,10 @@ fn checked(command: &mut Command, operation: &str) -> Result<Output> {
     let output = command
         .output()
         .with_context(|| format!("{operation}: could not run Docker Compose"))?;
+    succeeded(output, operation)
+}
+
+fn succeeded(output: Output, operation: &str) -> Result<Output> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -250,6 +257,66 @@ fn checked(command: &mut Command, operation: &str) -> Result<Output> {
         );
     }
     Ok(output)
+}
+
+/// `checked` for commands that must answer promptly: a wedged Docker daemon never
+/// does. Past `deadline` the command and its whole process group (the Compose
+/// plugin is a child of `docker`) are killed.
+fn output_within(command: &mut Command, operation: &str, deadline: Duration) -> Result<Output> {
+    use std::io::Read;
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    }
+
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .with_context(|| format!("{operation}: could not run Docker Compose"))?;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("{operation}: could not wait for Docker Compose"))?
+        {
+            break Some(status);
+        }
+        if started.elapsed() >= deadline {
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    let Some(status) = status else {
+        bail!(
+            "{operation}: Docker did not answer within {}s",
+            deadline.as_secs_f64()
+        );
+    };
+    succeeded(
+        Output {
+            status,
+            stdout,
+            stderr,
+        },
+        operation,
+    )
 }
 
 /// Prepare ignored Compose inputs using an explicit checkout of the same repository.
@@ -639,6 +706,19 @@ fn isolate(config: &mut Value, project: &str, directory: &Path) -> Result<()> {
         !services.is_empty(),
         "Compose configuration has no services"
     );
+    let built_image = |name: &str| format!("{project}:build-{:x}", Sha256::digest(name.as_bytes()));
+    // A service that reuses an image another service builds must run that
+    // service's isolated build, not pull or reuse the shared name.
+    let mut built = BTreeMap::new();
+    for (name, service) in services.iter() {
+        if service.get("build").is_some()
+            && let Some(image) = service.get("image").and_then(Value::as_str)
+        {
+            built
+                .entry(image.to_owned())
+                .or_insert_with(|| built_image(name));
+        }
+    }
     for (name, service) in services {
         let service = object_mut(service, &format!("service {name}"))?;
         ensure!(
@@ -686,8 +766,14 @@ fn isolate(config: &mut Value, project: &str, directory: &Path) -> Result<()> {
             }
             // Explicit build image names must not make two worktrees reuse or
             // overwrite one another's build outputs.
-            let image = format!("{project}:build-{:x}", Sha256::digest(name.as_bytes()));
+            let image = built_image(name);
             service.insert("image".to_owned(), Value::String(image));
+        } else if let Some(image) = service
+            .get("image")
+            .and_then(Value::as_str)
+            .and_then(|image| built.get(image))
+        {
+            service.insert("image".to_owned(), Value::String(image.clone()));
         }
         if let Some(volumes) = service.get_mut("volumes") {
             for volume in volumes
@@ -926,9 +1012,10 @@ fn command(worktree: &Worktree, manifest: &Manifest) -> Command {
 }
 
 fn read_status(worktree: &Worktree, manifest: &Manifest) -> Result<Environment> {
-    let output = checked(
+    let output = output_within(
         command(worktree, manifest).args(["ps", "--all", "--format", "json"]),
         "read Compose environment status",
+        Duration::from_secs(30),
     )?;
     parse_status(&manifest.project, &output.stdout)
 }
@@ -962,10 +1049,12 @@ fn parse_status(project: &str, bytes: &[u8]) -> Result<Environment> {
             .context("Docker Compose status row has no Service name")?;
         let state = row.get("State").and_then(Value::as_str).unwrap_or("");
         let health = row.get("Health").and_then(Value::as_str).unwrap_or("");
+        let exit_code = row.get("ExitCode").and_then(Value::as_i64).unwrap_or(0);
         let service = services.entry(name.to_owned()).or_insert_with(|| Service {
             name: name.to_owned(),
             state: state.to_owned(),
             health: health.to_owned(),
+            exit_code,
             ports: Vec::new(),
         });
         if service.state != state {
@@ -973,6 +1062,9 @@ fn parse_status(project: &str, bytes: &[u8]) -> Result<Environment> {
         }
         if service.health != health {
             service.health = "mixed".to_owned();
+        }
+        if service.exit_code == 0 {
+            service.exit_code = exit_code;
         }
         if let Some(publishers) = row.get("Publishers").filter(|value| !value.is_null()) {
             for publisher in publishers
@@ -1117,6 +1209,16 @@ pub fn status(worktree: &Worktree) -> Result<Environment> {
     read_status(worktree, &ensure_manifest(worktree)?)
 }
 
+/// Status of an environment Crit has started, without running Docker for one it has not:
+/// `up` saves the manifest before it starts any container, so no manifest means none exist.
+pub fn existing_status(worktree: &Worktree) -> Result<Option<Environment>> {
+    let manifest = manifest(worktree)?;
+    if !manifest.path.try_exists()? {
+        return Ok(None);
+    }
+    read_status(worktree, &manifest).map(Some)
+}
+
 pub fn down(worktree: &Worktree) -> Result<Environment> {
     let manifest = ensure_manifest(worktree)?;
     // No --volumes, --rmi, --remove-orphans, or prune: project data survives down.
@@ -1133,11 +1235,19 @@ pub fn restart(worktree: &Worktree) -> Result<Environment> {
         command(worktree, &manifest).arg("restart"),
         "restart Compose environment",
     )?;
+    // Restarted containers get new ephemeral host ports; `up` re-wires link targets.
+    if !settings(worktree)?.links.is_empty() {
+        return up(worktree);
+    }
     read_status(worktree, &manifest)
 }
 
 pub fn logs_args(worktree: &Worktree) -> Result<Vec<String>> {
-    let manifest = ensure_manifest(worktree)?;
+    let manifest = manifest(worktree)?;
+    ensure!(
+        manifest.path.try_exists()?,
+        "This worktree's Docker environment has not been started yet; start or refresh it first."
+    );
     Ok(vec![
         "compose".to_owned(),
         "--project-name".to_owned(),
@@ -1417,6 +1527,20 @@ mod tests {
     }
 
     #[test]
+    fn isolation_rewrites_images_built_by_another_service() {
+        let mut config = json!({"services": {
+            "web": {"build": {"context": "/repo"}, "image": "myapp"},
+            "worker": {"image": "myapp"},
+            "db": {"image": "postgres:17"}
+        }});
+        isolate(&mut config, "crit-tree", Path::new("/repo")).unwrap();
+        let image = |name: &str| config["services"][name]["image"].as_str().unwrap();
+        assert!(image("web").starts_with("crit-tree:build-"));
+        assert_eq!(image("worker"), image("web"));
+        assert_eq!(image("db"), "postgres:17");
+    }
+
+    #[test]
     fn shared_external_resources_and_host_networking_are_rejected() {
         for kind in ["networks", "volumes"] {
             for external in [json!(true), json!({"name": "shared"})] {
@@ -1445,7 +1569,7 @@ mod tests {
             {"TargetPort": 8000, "PublishedPort": 32100, "Protocol": "tcp"},
             {"TargetPort": 9000, "PublishedPort": 0, "Protocol": "tcp"}
         ]});
-        let second = json!({"Service": "web", "State": "exited", "Health": "", "Publishers": null});
+        let second = json!({"Service": "web", "State": "exited", "Health": "", "ExitCode": 3, "Publishers": null});
         let array = serde_json::to_vec(&json!([first, second])).unwrap();
         let lines = format!("{first}\n{second}\n");
         let from_array = parse_status("crit-one", &array).unwrap();
@@ -1463,6 +1587,7 @@ mod tests {
             }]
         );
         assert_eq!(from_array.services[1].state, "exited");
+        assert_eq!(from_array.services[1].exit_code, 3);
         assert!(parse_status("crit-one", b"not json").is_err());
     }
 
@@ -1498,6 +1623,7 @@ mod tests {
                 name: "api".to_owned(),
                 state: "running".to_owned(),
                 health: String::new(),
+                exit_code: 0,
                 ports: vec![Port {
                     host: 32123,
                     container: 8000,
@@ -1581,6 +1707,8 @@ mod tests {
             head: String::new(),
             is_main: true,
             locked: false,
+            bare: false,
+            prunable: false,
         };
         let settings = settings(&worktree).unwrap();
         assert!(has_config(&worktree));
@@ -1618,5 +1746,74 @@ mod tests {
             fs::metadata(&manifest.path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn existing_status_without_manifest_skips_docker() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("compose.yaml"), "services: {}\n").unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // A fresh id has no manifest in the state directory.
+        let worktree = Worktree {
+            id: format!("existing-status-{}-{nanos}", std::process::id()),
+            path: directory.path().to_owned(),
+            branch: "main".to_owned(),
+            head: String::new(),
+            is_main: false,
+            locked: false,
+            bare: false,
+            prunable: false,
+        };
+        assert!(has_config(&worktree));
+        // `status` would resolve the Compose file through Docker and write a manifest first.
+        assert!(existing_status(&worktree).unwrap().is_none());
+        assert!(!manifest(&worktree).unwrap().path.exists());
+    }
+
+    #[test]
+    fn logs_need_a_started_environment() {
+        let directory = tempfile::tempdir().unwrap();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        // A fresh id has no manifest in the state directory.
+        let worktree = Worktree {
+            id: format!("logs-need-start-{}-{nanos}", std::process::id()),
+            path: directory.path().to_owned(),
+            branch: "main".to_owned(),
+            head: String::new(),
+            is_main: false,
+            locked: false,
+            bare: false,
+            prunable: false,
+        };
+        let error = logs_args(&worktree).unwrap_err().to_string();
+        assert!(error.contains("not been started"), "{error}");
+        assert!(!manifest(&worktree).unwrap().path.exists());
+    }
+
+    #[test]
+    fn output_within_kills_hung_commands() {
+        let started = Instant::now();
+        let error = output_within(
+            Command::new("sh").args(["-c", "sleep 5"]),
+            "hung command",
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error.to_string().contains("did not answer"), "{error}");
+        let output = output_within(
+            Command::new("sh").args(["-c", "echo ok; echo warn >&2"]),
+            "quick command",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(output.stdout, b"ok\n");
+        assert_eq!(output.stderr, b"warn\n");
     }
 }

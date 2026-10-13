@@ -13,7 +13,8 @@ mod ui;
 mod updates;
 mod worktree;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 const HELP: &str = "crit — worktree-first terminals for OMP and OpenCode
@@ -32,8 +33,9 @@ Crit restores your saved workspace on startup. With no saved workspace, choose
 New terminal or any folder. F1 opens Ask Crit. Ctrl+D in an agent opens its
 workspace shell without stopping it;
 Ctrl+D in a shell keeps normal EOF behavior, and native mode passes it through.
-Ctrl+Shift+T then Enter opens your home folder. The menu also offers other
-folders, worktrees, and open projects. Ctrl+Shift+, or . opens a split picker:
+Ctrl+Shift+T then Enter opens a new home tab. The menu also offers other
+folders and worktrees; switch projects from the tab bar, F1, or F2.
+Ctrl+Shift+, or . opens a split picker:
 New worktree creates a separate checkout; Split terminal opens another session
 in the same folder. Existing branch/worktree opens a destination picker.
 Ctrl+Shift+Enter opens a session.
@@ -48,10 +50,12 @@ ASK CRIT
   \"Open portfolio with OpenCode\", or \"Show this workspace's logs\".
   Vague requests ask a follow-up; answer in the same box. New branches use
   separate worktrees, based on the focused checkout's HEAD unless specified.
+  An explicit base applies only to new branches.
   Enter sends; Esc cancels and stops the interpreter; Ctrl+U clears input.
   No model runs while idle. Requests have a 50-second local deadline.
   Crit sends your request history and project/worktree names and paths,
   not source files. Context plus conversation is limited to 64 KiB.
+  Discovered projects beyond about 48 KiB are left out.
   Only supported Crit actions and known destinations can execute, never
   model-generated shell commands. Destructive actions still need confirmation.
   Errors remain visible without executing a guessed action or fallback model.
@@ -73,8 +77,11 @@ APPEARANCE
   The minimum interactive size is 30x10. Below it, typing, paste, mouse input,
   and confirmations pause; Esc and F12 remain available. Enlarge to resume.
   Notices occupy reserved rows, never terminal output. Long notices show
-  their final lines with an overflow marker. Selected sessions stay visible
-  in the workspace header even when other session labels overflow.
+  their final lines with an overflow marker. Notices clear on the next
+  keystroke, paste, or click. Warnings that saving is off, or that saved
+  items were left out at startup, stay until Esc or a Crit shortcut.
+  Selected sessions stay visible in the workspace header even when other
+  session labels overflow.
   A thin scrollbar uses the right gutter when normal-screen history exists.
   Click or drag it to review history or return to live output at the bottom.
   Mouse-aware apps receive the wheel normally; Shift+wheel scrolls Crit's
@@ -96,20 +103,23 @@ COPY, PASTE, AND LINKS
   reload Kitty configuration with Ctrl+Shift+F5. Other Kitty windows are unaffected.
 
 UPDATES
-  Each interactive startup runs omp update and opencode upgrade before
-  launching agents. A blue scan animation shows each tool waiting, checking,
-  or ready; updater banners stay out of the UI. Checks finish without an
-  artificial delay. Ctrl+C cancels startup and stops the updater process group.
+  Each interactive startup runs omp update and opencode upgrade together,
+  before launching agents. A blue scan animation shows each tool checking,
+  ready, skipped, or not installed; updater banners stay out of the UI.
+  Checks finish without an artificial delay. Esc skips updates still running;
+  Ctrl+C cancels startup. Either stops the updater process groups.
   Input typed while checking is kept for the picker or terminal.
   If an update fails, Crit shows its diagnostic and continues with the
-  installed version.
+  installed version. A tool that is not installed is not a failure.
 
 PROJECTS
   Run crit from any folder, including a Git checkout, to choose New terminal
   or a project. New terminal starts your shell in the launch folder; it needs
   no Git repository and does not create one. It is the first, selected row.
   Explicit --repo or --agent can open any existing folder directly, with the
-  requested agent or shell. No Git initialization is required, including for research.
+  requested agent or shell. With a saved workspace, that folder opens as an
+  extra tab after the restore. No Git initialization is required, including
+  for research.
   Crit passes --allow-home to OMP so a home-folder workspace stays in home,
   rather than being automatically relocated to /tmp.
   The picker finds Git projects near the launch folder and under your home.
@@ -126,7 +136,8 @@ PROJECTS
   open when no detected project matches; paths use the displayed base folder.
   A folder outside Git opens as a workspace named after the folder and can run
   OMP, OpenCode, or shells. Home (~) is first and preselected in the new-tab menu.
-  Press Enter to open it without typing; an already-open home session is reused.
+  Each Enter opens a new ~ tab with a fresh session (a fresh session in the
+  existing tab if ~ is a Git checkout).
   Opening a Git folder opens only its checkout, not every branch/worktree.
   Ask to open an existing worktree or switch to a named project.
   Already open projects and shell/agent sessions stay alive when switching.
@@ -149,7 +160,7 @@ PROJECTS
   without checkouts. Up/Down selects; Enter opens; Esc returns to the split menu.
   Existing checkouts keep their files and sessions. An unchecked-out branch gets
   its own worktree at that branch's commit. The original pane keeps its branch,
-  session, and focus. Once opening starts, wait for completion before navigating.
+  session, and focus. Esc hides the opening popup; the checkout then opens as a tab.
   Returning a split to full width keeps the focused session. Saved terminal
   splits reopen both sessions in the same workspace, with their focus and ratio.
   Saved projects, worktrees, splits, focused panes and selected sessions reopen.
@@ -166,9 +177,12 @@ RESTORE
   terminal scrollback are not restored. Docker log followers are not reopened.
   --fresh skips restoration and starts a new saved workspace; use it with
   --repo / --agent to choose a different starting point.
-  Missing worktrees/chats or invalid state show an error and leave the original
-  snapshot untouched; saving is disabled in that window. Fix the cause and
-  restart to retry, or explicitly use --fresh to replace the saved workspace.
+  Saved folders, worktrees, chats or agents that cannot be reopened are left
+  out and listed in a notice; everything else reopens and saving continues.
+  The file as it was is kept as workspace.json.bak next to workspace.json.
+  An unreadable or invalid snapshot is left untouched and saving is disabled
+  in that window; fix it, or use --fresh to replace it.
+  Projects whose folder paths are not valid UTF-8 are not saved.
   Only one Crit window owns the snapshot. Additional windows do not restore or
   overwrite it while the owner is running, and display that limitation.
 
@@ -179,6 +193,8 @@ DOCKER
   Existing target files are preserved; shared links and path escapes are refused.
   A preparation failure leaves the new checkout usable. Fix its local files and
   start its environment again to retry from the remembered source checkout.
+  If that checkout no longer exists, Crit forgets it and uses the files already
+  in place.
   For a checkout created before this support, explicitly supply its source:
     crit env up --repo /path/to/worktree --source /path/to/source-checkout
   Each worktree gets its own project, networks, named volumes, build image,
@@ -202,11 +218,17 @@ Ctrl+Shift+Q offers Yes (close only), Yes, delete worktree, and No.
 Use Up/Down and Enter; No is selected by default. Esc cancels.
 Close-only retains the checkout and Docker stack. Explicit deletion closes the
 tab only after removing a clean, unlocked, non-main worktree; its branch stays.
-Stop its Docker environment first. Ordinary folders are never deleted.
-Deletion stays in a progress popup until it finishes. A refusal stays visible
-with its reason and leaves the tab and checkout intact; Enter returns to the
-confirmation and Esc dismisses the error. Docker state is checked again at deletion,
-so stopping the stack outside Crit does not require reopening the tab.
+Git-ignored files inside it (build output, .env, bind-mounted data) are deleted
+with it; named Docker volumes are kept. Directories you cannot write, often
+created by containers, block deletion instead of leaving a half-deleted checkout.
+Stop its Docker environment first. If Docker cannot be reached, the checkout is
+still removed and the notice names the stack to clean up. Ordinary folders are
+never deleted.
+Deletion shows a progress popup; Esc hides it and the result arrives as a notice.
+A refusal stays visible with its reason and leaves the tab and checkout intact;
+Enter returns to the confirmation and Esc dismisses the error. Docker state is
+checked again at deletion, so stopping the stack outside Crit does not require
+reopening the tab. A checkout whose environment Crit never started needs no Docker.
 Docker down retains volumes.
 Crit owns its agent processes; exiting stops them, not Docker stacks. The next
 launch restores the saved workspace and supported chats, not the old processes.
@@ -214,16 +236,25 @@ Agent hooks are launch-scoped, not global plugins. Crit is not a background daem
 ";
 
 fn main() {
-    if let Err(error) = run() {
+    let result = run();
+    // Dropped sessions are killed by threads that must finish before Crit exits.
+    terminal::join_reapers();
+    if let Err(error) = result {
         eprintln!("crit: {error:#}");
         std::process::exit(1);
     }
 }
 
+fn utf8(option: &str, value: OsString) -> Result<String> {
+    value
+        .into_string()
+        .map_err(|value| anyhow!("{option} must be UTF-8: {}", value.to_string_lossy()))
+}
+
 fn run() -> Result<()> {
-    let mut args = std::env::args().skip(1);
-    let mut positionals = Vec::new();
-    let mut repo = std::env::current_dir()?;
+    let mut args = std::env::args_os().skip(1);
+    let mut positionals: Vec<OsString> = Vec::new();
+    let mut repo = None;
     let mut agent = String::from("omp");
     let mut base = None;
     let mut use_kitty = true;
@@ -231,37 +262,57 @@ fn run() -> Result<()> {
     let mut fresh = false;
     let mut source = None;
     while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--help" | "-h" => {
+        // A non-UTF-8 argument cannot be an option, so it is a positional (a path).
+        match arg.to_str() {
+            Some("--help" | "-h") => {
                 print!("{HELP}");
                 return Ok(());
             }
-            "--version" | "-V" => {
+            Some("--version" | "-V") => {
                 println!("crit {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
-            "--repo" => {
-                repo = PathBuf::from(args.next().context("--repo requires a path")?);
+            Some("--repo") => {
+                repo = Some(PathBuf::from(
+                    args.next().context("--repo requires a path")?,
+                ));
                 direct_start = true;
             }
-            "--agent" => {
+            Some("--agent") => {
                 direct_start = true;
-                agent = args
-                    .next()
-                    .context("--agent requires omp, opencode, or shell")?
+                agent = utf8(
+                    "--agent",
+                    args.next()
+                        .context("--agent requires omp, opencode, or shell")?,
+                )?
             }
-            "--base" => base = Some(args.next().context("--base requires a Git reference")?),
-            "--fresh" => fresh = true,
-            "--source" => {
+            Some("--base") => {
+                base = Some(utf8(
+                    "--base",
+                    args.next().context("--base requires a Git reference")?,
+                )?)
+            }
+            Some("--fresh") => fresh = true,
+            Some("--source") => {
                 source = Some(PathBuf::from(
                     args.next().context("--source requires a checkout path")?,
                 ))
             }
-            "--no-kitty" => use_kitty = false,
-            _ if arg.starts_with('-') => bail!("unknown option {arg}; use --help"),
+            Some("--no-kitty") => use_kitty = false,
+            Some(option) if option.starts_with('-') => {
+                bail!("unknown option {option}; use --help")
+            }
             _ => positionals.push(arg),
         }
     }
+    // The launch folder is only needed by commands that use it, and not at all when --repo
+    // names one: a deleted current folder breaks neither `crit --help` nor `crit keys`.
+    let repo = || match &repo {
+        Some(repo) => Ok(repo.clone()),
+        None => std::env::current_dir().context(
+            "the current folder no longer exists; cd to an existing folder or pass --repo PATH",
+        ),
+    };
     if !matches!(agent.as_str(), "omp" | "opencode" | "shell") {
         bail!("unsupported agent {agent:?}; choose omp, opencode, or shell");
     }
@@ -269,30 +320,35 @@ fn run() -> Result<()> {
         bail!("--fresh is only available when opening Crit");
     }
     if source.is_some()
-        && !(positionals.first().is_some_and(|command| command == "env")
+        && !(positionals
+            .first()
+            .is_some_and(|command| command.to_str() == Some("env"))
             && positionals
                 .get(1)
-                .is_some_and(|operation| matches!(operation.as_str(), "up" | "restart")))
+                .is_some_and(|operation| matches!(operation.to_str(), Some("up" | "restart"))))
     {
         bail!("--source is only available with crit env up|restart");
     }
-    match positionals.first().map(String::as_str) {
-        None => app::run(&repo, &agent, use_kitty, direct_start, fresh),
+    match positionals
+        .first()
+        .map(|command| command.to_str().unwrap_or_default())
+    {
+        None => app::run(&repo()?, &agent, use_kitty, direct_start, fresh),
         Some("keys") if positionals.len() == 1 => {
             print!("{}", keys::HELP);
             Ok(())
         }
         Some("setup") if positionals.len() == 2 => {
-            match positionals[1].as_str() {
-                "kitty" => println!(
+            match positionals[1].to_str() {
+                Some("kitty") => println!(
                     "Installed {}. Reload Kitty config with Ctrl+Shift+F5.",
                     kitty::install()?.display()
                 ),
-                "agents" => {
+                Some("agents") => {
                     integration::install()?;
                     println!("Installed launch-scoped OMP/OpenCode hooks.");
                 }
-                "all" => {
+                Some("all") => {
                     integration::install()?;
                     println!(
                         "Installed agent hooks and {}. Reload Kitty config with Ctrl+Shift+F5.",
@@ -304,15 +360,19 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some("worktree") => {
+            let repo = repo()?;
             let repository = worktree::discover(&repo)?;
-            match positionals.get(1).map(String::as_str) {
+            match positionals.get(1).and_then(|word| word.to_str()) {
                 Some("list") if positionals.len() == 2 => {
                     for tree in worktree::list(&repository)? {
                         println!("{}\t{}\t{}", tree.id, tree.branch, tree.path.display());
                     }
                 }
                 Some("create") if positionals.len() == 3 => {
-                    let tree = worktree::create(&repository, &positionals[2], base.as_deref())?;
+                    let branch = positionals[2]
+                        .to_str()
+                        .context("branch name must be UTF-8")?;
+                    let tree = worktree::create(&repository, branch, base.as_deref())?;
                     println!("{}", tree.path.display());
                     let source = selected_tree(&repository, &repo)?;
                     compose::prepare_local_files(&source, &tree).with_context(|| {
@@ -326,6 +386,23 @@ fn run() -> Result<()> {
                         .into_iter()
                         .find(|t| t.path == path)
                         .context("path is not a worktree in this repository")?;
+                    // The same guard as deleting from the UI: a running stack blocks it, and
+                    // Docker being unreachable only warns.
+                    match compose::existing_status(&tree) {
+                        Ok(Some(environment)) if !environment.services.is_empty() => bail!(
+                            "stop this worktree's Docker environment first: crit env down --repo {}",
+                            tree.path.display()
+                        ),
+                        Ok(_) => {}
+                        Err(error) => {
+                            let reason = format!("{error:#}");
+                            eprintln!(
+                                "crit: Docker could not be checked ({}); if this worktree's stack still exists, run: docker compose -p crit-{} down",
+                                reason.trim_end(),
+                                tree.id
+                            );
+                        }
+                    }
                     worktree::remove(&repository, &tree)?;
                     println!("Removed checkout {}; branch retained.", path.display());
                 }
@@ -334,6 +411,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some("env") if positionals.len() == 2 => {
+            let repo = repo()?;
             let repository = worktree::discover(&repo)?;
             let tree = selected_tree(&repository, &repo)?;
             if let Some(source) = source {
@@ -341,12 +419,12 @@ fn run() -> Result<()> {
                 let source = selected_tree(&source_repository, &source)?;
                 compose::prepare_local_files(&source, &tree)?;
             }
-            let environment = match positionals[1].as_str() {
-                "up" => compose::up(&tree)?,
-                "down" => compose::down(&tree)?,
-                "restart" => compose::restart(&tree)?,
-                "status" => compose::status(&tree)?,
-                "logs" => {
+            let environment = match positionals[1].to_str() {
+                Some("up") => compose::up(&tree)?,
+                Some("down") => compose::down(&tree)?,
+                Some("restart") => compose::restart(&tree)?,
+                Some("status") => compose::status(&tree)?,
+                Some("logs") => {
                     let status = std::process::Command::new("docker")
                         .args(compose::logs_args(&tree)?)
                         .status()?;

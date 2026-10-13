@@ -20,12 +20,15 @@ pub const TOOLS: [(&str, &str, &str); 2] = [
 const FRAME_INTERVAL: Duration = Duration::from_millis(80);
 const DIAGNOSTIC_BYTES: u64 = 4096;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum State {
-    Waiting,
     Checking,
     Ready,
     Failed,
+    /// Esc stopped checking before this updater finished.
+    Skipped,
+    /// The updater program is not installed.
+    Missing,
 }
 
 pub struct Startup {
@@ -42,9 +45,10 @@ struct UpdateProcess {
 }
 
 impl UpdateProcess {
-    fn spawn(program: &str, argument: &str) -> Result<Self> {
+    /// `None` when the program is not installed.
+    fn spawn(program: &str, argument: &str) -> Result<Option<Self>> {
         let output = tempfile::tempfile().context("capture updater output")?;
-        let child = Command::new(program)
+        let child = match Command::new(program)
             .arg(argument)
             .stdin(Stdio::null())
             .stdout(output.try_clone()?)
@@ -52,12 +56,16 @@ impl UpdateProcess {
             .env("NO_COLOR", "1")
             .process_group(0)
             .spawn()
-            .with_context(|| format!("start {program} {argument}"))?;
-        Ok(Self {
+        {
+            Ok(child) => child,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error).with_context(|| format!("start {program} {argument}")),
+        };
+        Ok(Some(Self {
             child,
             output,
             reaped: false,
-        })
+        }))
     }
 
     fn diagnostic(&mut self) -> Result<String> {
@@ -76,6 +84,27 @@ impl UpdateProcess {
             .map(|c| if c.is_control() { ' ' } else { c })
             .collect();
         Ok(message)
+    }
+
+    /// `None` while the updater runs; its outcome once it has exited.
+    fn poll(&mut self) -> Option<Result<(), String>> {
+        let status = match self.child.try_wait() {
+            Ok(None) => return None,
+            Ok(Some(status)) => status,
+            Err(error) => return Some(Err(error.to_string())),
+        };
+        self.reaped = true;
+        if status.success() {
+            return Some(Ok(()));
+        }
+        let detail = self
+            .diagnostic()
+            .unwrap_or_else(|error| format!("could not read updater output: {error}"));
+        Some(Err(if detail.is_empty() {
+            status.to_string()
+        } else {
+            format!("{status}: {detail}")
+        }))
     }
 }
 
@@ -120,79 +149,172 @@ pub fn run(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     events: &Receiver<Event>,
 ) -> Result<Option<Startup>> {
-    let mut states = [State::Waiting; TOOLS.len()];
-    let mut failures = String::new();
+    check(&TOOLS, events, |states, tick| {
+        terminal.draw(|frame| ui::draw_updates(frame, states, tick))?;
+        Ok(())
+    })
+}
+
+/// Runs every updater at once: they share no state, so startup waits for the slowest
+/// rather than the sum. Esc stops waiting for the ones still running; they are terminated
+/// as this returns. `None` means Crit is quitting.
+fn check(
+    tools: &[(&str, &str, &str); TOOLS.len()],
+    events: &Receiver<Event>,
+    mut draw: impl FnMut(&[State; TOOLS.len()], usize) -> Result<()>,
+) -> Result<Option<Startup>> {
+    let mut states = [State::Checking; TOOLS.len()];
+    let mut processes: [Option<UpdateProcess>; TOOLS.len()] = Default::default();
+    let mut failures: [Option<String>; TOOLS.len()] = Default::default();
     let mut pending = VecDeque::new();
     let mut tick = 0;
     let mut last_frame = Instant::now();
-    for (index, (name, program, argument)) in TOOLS.iter().enumerate() {
-        states[index] = State::Checking;
-        terminal.draw(|frame| ui::draw_updates(frame, &states, tick))?;
-        let result = match UpdateProcess::spawn(program, argument) {
-            Err(error) => Err(format!("{error:#}")),
-            Ok(mut process) => loop {
-                match process.child.try_wait() {
-                    Ok(Some(status)) => {
-                        process.reaped = true;
-                        break if status.success() {
-                            Ok(())
-                        } else {
-                            let detail = process.diagnostic().unwrap_or_else(|error| {
-                                format!("could not read updater output: {error}")
-                            });
-                            Err(if detail.is_empty() {
-                                status.to_string()
-                            } else {
-                                format!("{status}: {detail}")
-                            })
-                        };
-                    }
-                    Ok(None) => {}
-                    Err(error) => break Err(error.to_string()),
-                }
-                if last_frame.elapsed() >= FRAME_INTERVAL {
-                    tick = (tick + 1) % 24;
-                    terminal.draw(|frame| ui::draw_updates(frame, &states, tick))?;
-                    last_frame = Instant::now();
-                }
-                match events.recv_timeout(FRAME_INTERVAL.saturating_sub(last_frame.elapsed())) {
-                    Ok(Event::Shutdown) => return Ok(None),
-                    Ok(Event::Input(Input::Key(key)))
-                        if key.kind != KeyEventKind::Release
-                            && key.code == KeyCode::Char('c')
-                            && key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        return Ok(None);
-                    }
-                    Ok(Event::Input(Input::Resize(_, _))) => {
-                        terminal.draw(|frame| ui::draw_updates(frame, &states, tick))?;
-                    }
-                    Ok(Event::Error(error)) => anyhow::bail!("{error}"),
-                    // Input typed during startup belongs to the picker or shell,
-                    // not the updater. Replay it in order when checking finishes.
-                    Ok(event) => pending.push_back(event),
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => return Ok(None),
-                }
-            },
-        };
-        match result {
-            Ok(()) => states[index] = State::Ready,
+    draw(&states, tick)?;
+    for (index, (_, program, argument)) in tools.iter().enumerate() {
+        match UpdateProcess::spawn(program, argument) {
+            Ok(Some(process)) => processes[index] = Some(process),
+            Ok(None) => states[index] = State::Missing,
             Err(error) => {
                 states[index] = State::Failed;
-                if !failures.is_empty() {
-                    failures.push_str("; ");
-                }
-                let _ = write!(
-                    failures,
-                    "{name} update failed: {error}. Continuing with the installed version."
-                );
+                failures[index] = Some(format!("{error:#}"));
             }
         }
     }
-    terminal.draw(|frame| ui::draw_updates(frame, &states, tick))?;
+    loop {
+        for index in 0..TOOLS.len() {
+            let Some(outcome) = processes[index].as_mut().and_then(UpdateProcess::poll) else {
+                continue;
+            };
+            processes[index] = None;
+            match outcome {
+                Ok(()) => states[index] = State::Ready,
+                Err(error) => {
+                    states[index] = State::Failed;
+                    failures[index] = Some(error);
+                }
+            }
+        }
+        if processes.iter().all(Option::is_none) {
+            break;
+        }
+        if last_frame.elapsed() >= FRAME_INTERVAL {
+            tick = (tick + 1) % 24;
+            draw(&states, tick)?;
+            last_frame = Instant::now();
+        }
+        match events.recv_timeout(FRAME_INTERVAL.saturating_sub(last_frame.elapsed())) {
+            Ok(Event::Shutdown) => return Ok(None),
+            Ok(Event::Input(Input::Key(key)))
+                if key.kind != KeyEventKind::Release
+                    && key.code == KeyCode::Char('c')
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                return Ok(None);
+            }
+            Ok(Event::Input(Input::Key(key)))
+                if key.kind != KeyEventKind::Release && key.code == KeyCode::Esc =>
+            {
+                for (state, process) in states.iter_mut().zip(&processes) {
+                    if process.is_some() {
+                        *state = State::Skipped;
+                    }
+                }
+                break;
+            }
+            Ok(Event::Input(Input::Resize(_, _))) => {
+                draw(&states, tick)?;
+            }
+            Ok(Event::Error(error)) => anyhow::bail!("{error}"),
+            // Input typed during startup belongs to the picker or shell,
+            // not the updater. Replay it in order when checking finishes.
+            Ok(event) => pending.push_back(event),
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return Ok(None),
+        }
+    }
+    draw(&states, tick)?;
+    // Report failures in tool order, whichever updater finished first.
+    let mut notice = String::new();
+    for ((name, _, _), failure) in tools.iter().zip(&failures) {
+        let Some(failure) = failure else {
+            continue;
+        };
+        if !notice.is_empty() {
+            notice.push_str("; ");
+        }
+        let _ = write!(
+            notice,
+            "{name} update failed: {failure}. Continuing with the installed version."
+        );
+    }
     Ok(Some(Startup {
-        notice: (!failures.is_empty()).then_some(failures),
+        notice: (!notice.is_empty()).then_some(notice),
         pending,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyEvent;
+    use std::{fs, sync::mpsc};
+
+    fn key(code: KeyCode) -> Event {
+        Event::Input(Input::Key(KeyEvent::new(code, KeyModifiers::NONE)))
+    }
+
+    #[test]
+    fn esc_skips_running_updaters_and_absent_ones_are_not_failures() {
+        let (sender, events) = mpsc::channel();
+        sender.send(key(KeyCode::Esc)).unwrap();
+        let tools = [
+            ("Slow", "/bin/sleep", "60"),
+            ("Absent", "/nonexistent/crit-test-tool", "update"),
+        ];
+        let mut last = [State::Checking; TOOLS.len()];
+        let started = Instant::now();
+        let startup = check(&tools, &events, |states, _| {
+            last = *states;
+            Ok(())
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(last, [State::Skipped, State::Missing]);
+        assert_eq!(startup.notice, None);
+        // The Esc was consumed rather than replayed, and nothing waited out the sleep.
+        assert!(startup.pending.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn updaters_run_concurrently_and_failures_keep_tool_order() {
+        // Each script exits only once the other has started, so running them one
+        // after another would end in "peer never started" instead.
+        let script = r#"d=$(dirname "$0"); : > "$0.started"
+for _ in $(seq 300); do
+    if [ "$(ls "$d"/*.started | wc -l)" -ge 2 ]; then echo "failed: $(basename "$0")" >&2; exit 1; fi
+    sleep 0.01
+done
+echo "peer never started" >&2; exit 9"#;
+        let directory = tempfile::tempdir().unwrap();
+        let [first, second] = ["first.sh", "second.sh"].map(|name| {
+            let path = directory.path().join(name);
+            fs::write(&path, script).unwrap();
+            path.to_str().unwrap().to_owned()
+        });
+        let tools = [
+            ("First", "/bin/sh", first.as_str()),
+            ("Second", "/bin/sh", second.as_str()),
+        ];
+        let (_sender, events) = mpsc::channel();
+        let startup = check(&tools, &events, |_, _| Ok(())).unwrap().unwrap();
+        assert_eq!(
+            startup.notice.as_deref(),
+            Some(
+                "First update failed: exit status: 1: failed: first.sh. Continuing with the \
+                 installed version.; Second update failed: exit status: 1: failed: second.sh. \
+                 Continuing with the installed version."
+            )
+        );
+    }
 }

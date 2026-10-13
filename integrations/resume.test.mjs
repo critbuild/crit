@@ -61,6 +61,13 @@ test("OMP same-directory switches, lazy durability and child isolation", async (
     await rm(file);
     await handlers.get("agent_end")({ willContinue: true }, ctx);
     assert.equal(fixture.reports.at(-1).identity, undefined, "transient disappearance does not erase durable chat");
+    id = "branched";
+    file = path.join(directory, "branched.jsonl");
+    await writeFile(file, "durable-branched");
+    await handlers.get("session_branch")({ reason: "btw" }, ctx);
+    assert.equal(fixture.reports.at(-1).identity, file, "a branch selects the new session file");
+    await handlers.get("agent_start")({}, ctx);
+    assert.equal(fixture.reports.at(-1).state, "working", "the branched session keeps reporting");
     await handlers.get("session_shutdown")({}, ctx);
   } finally {
     if (previousOwner === undefined) delete process.env.OMPCODE;
@@ -191,4 +198,123 @@ test("removed restored chat is cleared before authoritative selection is availab
   await fixture.module.default.tui(api);
   events.get("session.deleted")({ type: "session.deleted", properties: { info: { id: "removed" } } });
   assert.equal(fixture.reports.at(-1).identity, null);
+});
+
+// API-shaped OpenCode TUI host; `events` collects the plugin's event subscriptions.
+function tuiApi(events, route, sessions) {
+  return {
+    route: { current: route },
+    state: { session: { get: (id) => sessions.get(id) } },
+    client: {
+      session: { get: async ({ sessionID }) => ({ data: sessions.get(sessionID) }), status: async () => ({ data: {} }) },
+      permission: { list: async () => ({ data: [] }) }, question: { list: async () => ({ data: [] }) },
+    },
+    event: { on: (name, fn) => { events.set(name, fn); return () => {}; } },
+    lifecycle: { onDispose() {} },
+  };
+}
+
+test("plugin routes keep the selected root", async () => {
+  const fixture = await hook("opencode-tui.js");
+  const events = new Map();
+  const sessions = new Map([["root", { id: "root" }], ["child", { id: "child", parentID: "root" }]]);
+  const api = tuiApi(events, { name: "session", params: { sessionID: "root" } }, sessions);
+  const child = { name: "session", params: { sessionID: "child" } };
+  const go = async (route) => {
+    api.route.current = route;
+    fixture.effects.forEach((fn) => fn());
+    await settle();
+  };
+  await fixture.module.default.tui(api);
+  await settle();
+  await go(child);
+  // OpenCode routes plugin pages, such as the built-in /diff viewer, as { name: <plugin route id>, params }.
+  await go({ name: "diff", params: { mode: "git", sessionID: "child", returnRoute: child } });
+  assert.ok(!fixture.reports.some((r) => r.identity === null), "a plugin route is not Home");
+  events.get("session.status")({ type: "session.status", properties: { sessionID: "child", status: { type: "busy" } } });
+  assert.equal(fixture.reports.at(-1).state, "working", "live state still flows under a plugin route");
+  await go(child);
+  assert.ok(!fixture.reports.some((r) => r.identity === null), "returning is not Home either");
+  assert.equal(fixture.reports.findLast((r) => r.identity)?.identity, "root", "returning keeps the root boundary");
+});
+
+test("OpenCode errors survive the idle published after them", async () => {
+  const error = { name: "APIError", data: { message: "Quota exceeded" } };
+  const stillBlocked = (fixture, since) => {
+    const reports = fixture.reports.slice(since);
+    assert.ok(reports.length > 0 && reports.every((r) => r.state === "blocked" && r.message === "Quota exceeded"),
+      `idle replaced the error: ${JSON.stringify(reports)}`);
+  };
+
+  const tui = await hook("opencode-tui.js");
+  const events = new Map();
+  await tui.module.default.tui(tuiApi(events, { name: "session", params: { sessionID: "root" } },
+    new Map([["root", { id: "root" }]])));
+  await settle();
+  const fire = (type, properties) => events.get(type)({ type, properties: { sessionID: "root", ...properties } });
+  fire("session.status", { status: { type: "busy" } });
+  const tuiSince = tui.reports.length;
+  // OpenCode publishes session.error, then idle, as the failed turn ends.
+  fire("session.error", { error });
+  fire("session.status", { status: { type: "idle" } });
+  fire("session.idle", {});
+  stillBlocked(tui, tuiSince);
+  fire("session.status", { status: { type: "busy" } });
+  assert.equal(tui.reports.at(-1).state, "working");
+  assert.equal(tui.reports.at(-1).message, undefined, "the next turn clears the error");
+
+  const previousArgs = process.argv;
+  process.argv = ["node", "opencode", "run", "hello"];
+  try {
+    const server = await hook("opencode.js");
+    const handlers = await server.module.default.server();
+    const send = (type, properties) => handlers.event({ event: { type, properties: { sessionID: "root", ...properties } } });
+    await handlers.event({ event: { type: "session.created", properties: { info: { id: "root" } } } });
+    await send("session.status", { status: { type: "busy" } });
+    const serverSince = server.reports.length;
+    await send("session.error", { error });
+    await send("session.status", { status: { type: "idle" } });
+    await send("session.idle", {});
+    stillBlocked(server, serverSince);
+    await send("session.status", { status: { type: "busy" } });
+    assert.equal(server.reports.at(-1).state, "working");
+    assert.equal(server.reports.at(-1).message, undefined, "the next turn clears the error");
+  } finally {
+    process.argv = previousArgs;
+  }
+});
+
+test("OpenCode pins the pane owner for child shells", async () => {
+  const keys = ["CRIT_ENV", "CRIT_SESSION", "CRIT_SOCKET", "CRIT_AGENT_PID"];
+  const saved = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const previousArgs = process.argv;
+  const shellEnv = async (hooks) => {
+    const output = { env: {} };
+    await hooks["shell.env"]({ cwd: "/" }, output);
+    return output.env;
+  };
+  try {
+    process.env.CRIT_ENV = "1";
+    // The TUI server worker snapshots process.env before the TUI plugin claims the pane.
+    for (const argv of [["node", "opencode"], ["node", "opencode", "run", "hello"]]) {
+      process.argv = argv;
+      const fixture = await hook("opencode.js");
+      assert.deepEqual(await shellEnv(await fixture.module.default.server()),
+        { CRIT_AGENT_PID: String(process.pid) }, argv.join(" "));
+    }
+    // A nested run cannot claim the pane (no reporter), but its children must not either.
+    Object.assign(process.env, {
+      CRIT_SESSION: "5", CRIT_SOCKET: "/unused/crit.sock", CRIT_AGENT_PID: String(process.pid + 1),
+    });
+    const nested = (await import("./opencode.js")).default;
+    assert.deepEqual(await shellEnv(await nested.server()), { CRIT_AGENT_PID: String(process.pid) });
+    delete process.env.CRIT_ENV;
+    assert.deepEqual(await shellEnv(await nested.server()), {}, "outside Crit nothing is injected");
+  } finally {
+    process.argv = previousArgs;
+    for (const key of keys) {
+      if (saved[key] === undefined) delete process.env[key];
+      else process.env[key] = saved[key];
+    }
+  }
 });

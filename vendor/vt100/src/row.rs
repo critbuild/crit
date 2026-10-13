@@ -9,12 +9,24 @@ pub struct Row {
 impl Row {
     pub fn new(cols: u16) -> Self {
         Self {
-            cells: vec![crate::Cell::new(); usize::from(cols)],
+            cells: std::iter::repeat_with(crate::Cell::new)
+                .take(usize::from(cols))
+                .collect(),
             wrapped: false,
         }
     }
 
-    fn cols(&self) -> u16 {
+    /// Clears the row for reuse at the given width, keeping its allocation.
+    pub fn reset(&mut self, cols: u16) {
+        self.cells.truncate(usize::from(cols));
+        for cell in &mut self.cells {
+            *cell = crate::Cell::new();
+        }
+        self.cells.resize_with(usize::from(cols), crate::Cell::new);
+        self.wrapped = false;
+    }
+
+    pub fn cols(&self) -> u16 {
         self.cells
             .len()
             .try_into()

@@ -18,7 +18,9 @@ async function tui(api) {
 
   function routeID() {
     const route = api.route.current;
-    return route?.name === "session" ? route.params?.sessionID : undefined;
+    if (route?.name === "session") return route.params?.sessionID;
+    // Plugin routes (the built-in /diff viewer) overlay the current chat; only Home clears it.
+    return route?.name === "home" ? undefined : context?.route;
   }
   function current(ctx) {
     return !disposed && context === ctx && routeID() === ctx.route;
@@ -159,7 +161,6 @@ async function tui(api) {
           ctx.errors.delete(id);
         } else if (status === "idle") {
           ctx.statuses.delete(id);
-          ctx.errors.delete(id);
         }
         break;
       }

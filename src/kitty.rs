@@ -129,24 +129,52 @@ fn window_background(socket: &str, window: u64) -> Result<[u8; 3]> {
 /// This does not reload Kitty or enable remote control.
 pub fn install() -> Result<PathBuf> {
     let directory = config_directory(
+        env::var_os("KITTY_CONFIG_DIRECTORY").as_deref(),
         env::var_os("XDG_CONFIG_HOME").as_deref(),
         env::var_os("HOME").as_deref(),
     )?;
     install_in(&directory)
 }
 
-fn config_directory(xdg: Option<&OsStr>, home: Option<&OsStr>) -> Result<PathBuf> {
-    if let Some(xdg) = xdg.filter(|value| !value.is_empty()) {
-        let root = Path::new(xdg);
+/// The directory Kitty reads. `KITTY_CONFIG_DIRECTORY` always wins; otherwise the first of
+/// `$XDG_CONFIG_HOME/kitty` and `~/.config/kitty` holding a `kitty.conf`, so a fresh XDG
+/// directory cannot shadow the user's real configuration. With neither, `$XDG_CONFIG_HOME/kitty`
+/// if set, else `~/.config/kitty`.
+fn config_directory(
+    kitty_env: Option<&OsStr>,
+    xdg: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Result<PathBuf> {
+    if let Some(directory) = kitty_env.filter(|value| !value.is_empty()) {
+        return std::path::absolute(directory).with_context(|| {
+            format!(
+                "Resolving KITTY_CONFIG_DIRECTORY {}",
+                Path::new(directory).display()
+            )
+        });
+    }
+    let xdg = xdg.filter(|value| !value.is_empty()).map(Path::new);
+    let home = home.filter(|value| !value.is_empty()).map(Path::new);
+    let existing = [
+        xdg.filter(|root| root.is_absolute())
+            .map(|root| root.join("kitty")),
+        home.map(|home| home.join(".config/kitty")),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|directory| directory.join("kitty.conf").exists());
+    if let Some(directory) = existing {
+        return Ok(directory);
+    }
+    if let Some(root) = xdg {
         if !root.is_absolute() {
             bail!("XDG_CONFIG_HOME must be an absolute path");
         }
         return Ok(root.join("kitty"));
     }
-    let home = home
-        .filter(|value| !value.is_empty())
-        .context("Neither XDG_CONFIG_HOME nor HOME is set; cannot locate Kitty configuration")?;
-    Ok(Path::new(home).join(".config/kitty"))
+    let home =
+        home.context("Neither XDG_CONFIG_HOME nor HOME is set; cannot locate Kitty configuration")?;
+    Ok(home.join(".config/kitty"))
 }
 
 fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -245,15 +273,70 @@ mod tests {
     fn config_location_honors_xdg_and_empty_fallback_without_mutating_environment() {
         let home = Some(OsStr::new("/home/tester"));
         assert_eq!(
-            config_directory(Some(OsStr::new("/tmp/config")), home).unwrap(),
+            config_directory(None, Some(OsStr::new("/tmp/config")), home).unwrap(),
             Path::new("/tmp/config/kitty")
         );
         assert_eq!(
-            config_directory(Some(OsStr::new("")), home).unwrap(),
+            config_directory(None, Some(OsStr::new("")), home).unwrap(),
             Path::new("/home/tester/.config/kitty")
         );
-        assert!(config_directory(None, None).is_err());
-        assert!(config_directory(Some(OsStr::new("relative")), home).is_err());
+        assert!(config_directory(None, None, None).is_err());
+        assert!(config_directory(None, Some(OsStr::new("relative")), home).is_err());
+    }
+
+    #[test]
+    fn kitty_config_directory_always_wins_and_is_made_absolute() {
+        let temporary = tempfile::tempdir().unwrap();
+        let explicit = temporary.path().join("explicit");
+        let home = temporary.path().join("home");
+        let real = home.join(".config/kitty");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("kitty.conf"), b"font_size 15\n").unwrap();
+        assert_eq!(
+            config_directory(
+                Some(explicit.as_os_str()),
+                Some(temporary.path().as_os_str()),
+                Some(home.as_os_str()),
+            )
+            .unwrap(),
+            explicit
+        );
+        assert_eq!(
+            config_directory(Some(OsStr::new("relative/kitty")), None, None).unwrap(),
+            env::current_dir().unwrap().join("relative/kitty")
+        );
+        // An empty value counts as unset.
+        assert_eq!(
+            config_directory(Some(OsStr::new("")), None, Some(home.as_os_str())).unwrap(),
+            real
+        );
+    }
+
+    #[test]
+    fn existing_kitty_conf_is_not_shadowed_by_an_unused_xdg_directory() {
+        let temporary = tempfile::tempdir().unwrap();
+        let xdg = temporary.path().join("xdg");
+        let home = temporary.path().join("home");
+        let real = home.join(".config/kitty");
+        fs::create_dir_all(&real).unwrap();
+        fs::write(real.join("kitty.conf"), b"font_size 15\n").unwrap();
+        let (xdg_env, home_env) = (Some(xdg.as_os_str()), Some(home.as_os_str()));
+        // Kitty reads the first kitty.conf that exists, which is not in the unused XDG directory.
+        assert_eq!(config_directory(None, xdg_env, home_env).unwrap(), real);
+        // A relative XDG_CONFIG_HOME is invalid, so it cannot win either.
+        assert_eq!(
+            config_directory(None, Some(OsStr::new("relative")), home_env).unwrap(),
+            real
+        );
+        // Once XDG holds a kitty.conf it keeps priority.
+        let chosen = xdg.join("kitty");
+        fs::create_dir_all(&chosen).unwrap();
+        fs::write(chosen.join("kitty.conf"), b"").unwrap();
+        assert_eq!(config_directory(None, xdg_env, home_env).unwrap(), chosen);
+        // With no kitty.conf anywhere, XDG_CONFIG_HOME is still where one is created.
+        fs::remove_file(chosen.join("kitty.conf")).unwrap();
+        fs::remove_file(real.join("kitty.conf")).unwrap();
+        assert_eq!(config_directory(None, xdg_env, home_env).unwrap(), chosen);
     }
 
     #[test]

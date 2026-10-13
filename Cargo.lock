@@ -132,6 +132,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "toml",
+ "unicode-segmentation",
  "unicode-width",
  "vt100",
 ]
@@ -146,6 +147,7 @@ dependencies = [
  "crossterm_winapi",
  "derive_more",
  "document-features",
+ "filedescriptor",
  "mio",
  "parking_lot",
  "rustix",

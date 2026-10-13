@@ -71,6 +71,7 @@ export default function (pi) {
 
   pi.on("session_start", initialize);
   pi.on("session_switch", initialize);
+  pi.on("session_branch", initialize);
   pi.on("agent_start", (_event, ctx) => {
     if (!root(ctx)) return;
     cancelIdle();

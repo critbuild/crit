@@ -2,9 +2,10 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -49,6 +50,8 @@ pub struct IntegrationServer {
     directory: PathBuf,
     stopping: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    /// Dup of the listener; `Drop` shuts it down to wake `accept` without the socket path.
+    waker: Option<UnixListener>,
 }
 
 const MAX_FRAME: usize = 8192;
@@ -64,26 +67,48 @@ const ASSETS: &[(&str, &str)] = &[
 ];
 
 pub fn start(tx: SyncSender<crate::event::Event>) -> Result<IntegrationServer> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
+    // An unusable XDG_RUNTIME_DIR (`su` without `-`, /run/user removed after logout) falls back
+    // to the temp dir instead of ending Crit.
+    let bases: Vec<PathBuf> = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+        .into_iter()
+        .chain([std::env::temp_dir()])
+        .collect();
+    start_in(tx, &bases)
+}
+
+/// Serve from the first base, in order, that can hold the private directory.
+fn start_in(tx: SyncSender<crate::event::Event>, bases: &[PathBuf]) -> Result<IntegrationServer> {
     let mut random = [0u8; 8];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-    let directory = base.join(format!(
+    let name = format!(
         "crit-{}-{:016x}",
         std::process::id(),
         u64::from_ne_bytes(random)
-    ));
-    DirBuilder::new()
-        .mode(0o700)
-        .create(&directory)
-        .with_context(|| {
-            format!(
-                "creating private integration directory {}",
-                directory.display()
-            )
-        })?;
+    );
+    let mut created = None;
+    for (index, base) in bases.iter().enumerate() {
+        let directory = base.join(&name);
+        match DirBuilder::new().mode(0o700).create(&directory) {
+            Ok(()) => {
+                created = Some(directory);
+                break;
+            }
+            Err(error) => {
+                // An existing name is not ours; any other failure moves on to the next base.
+                if error.kind() == std::io::ErrorKind::AlreadyExists || index + 1 == bases.len() {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "creating private integration directory {}",
+                            directory.display()
+                        )
+                    });
+                }
+            }
+        }
+    }
+    let directory = created.context("no directory for the integration socket")?;
     let socket_path = directory.join("agent.sock");
     let stopping = Arc::new(AtomicBool::new(false));
     let mut server = IntegrationServer {
@@ -91,9 +116,15 @@ pub fn start(tx: SyncSender<crate::event::Event>) -> Result<IntegrationServer> {
         directory,
         stopping,
         worker: None,
+        waker: None,
     };
     fs::set_permissions(&server.directory, fs::Permissions::from_mode(0o700))?;
     let listener = UnixListener::bind(&server.socket_path).context("binding lifecycle socket")?;
+    server.waker = Some(
+        listener
+            .try_clone()
+            .context("duplicating lifecycle socket")?,
+    );
     fs::set_permissions(&server.socket_path, fs::Permissions::from_mode(0o600))?;
     let stop = Arc::clone(&server.stopping);
     server.worker = Some(
@@ -105,6 +136,18 @@ pub fn start(tx: SyncSender<crate::event::Event>) -> Result<IntegrationServer> {
                     let mut stream = match listener.accept() {
                         Ok((stream, _)) => stream,
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                        // Descriptor or memory exhaustion is transient and accept reports it
+                        // immediately, so back off rather than end the integration. Drop's unpark
+                        // cuts the wait short and the loop condition then exits.
+                        Err(error)
+                            if matches!(
+                                error.raw_os_error(),
+                                Some(libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+                            ) =>
+                        {
+                            thread::park_timeout(Duration::from_millis(100));
+                            continue;
+                        }
                         Err(_) => break,
                     };
                     if stop.load(Ordering::Acquire) {
@@ -190,8 +233,13 @@ impl Drop for IntegrationServer {
         self.stopping.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
             worker.thread().unpark();
-            // Wake our own blocking accept; in-progress reads have a total deadline.
-            let _ = UnixStream::connect(&self.socket_path);
+            // Wake our own blocking accept through the socket itself, since its path may be
+            // gone; in-progress reads have a total deadline.
+            if let Some(waker) = &self.waker {
+                unsafe {
+                    libc::shutdown(waker.as_raw_fd(), libc::SHUT_RDWR);
+                }
+            }
             let _ = worker.join();
         }
         let _ = fs::remove_file(&self.socket_path);
@@ -351,6 +399,8 @@ fn relocate_plugins(plugins: &mut [Value], base: &Path) -> Result<()> {
 }
 
 /// Return launch-scoped injection; inherited auth, profiles and plugin discovery stay intact.
+/// `resume` is passed through unchecked: callers validate it first (`validate_resume`, plus
+/// `existing_opencode_chats` for OpenCode), because restore checks every chat up front.
 pub fn command(
     kind: &str,
     session: u64,
@@ -375,7 +425,6 @@ pub fn command(
         ("CRIT_AGENT_PID".into(), String::new()),
     ];
     if let Some(identity) = resume {
-        validate_resume(kind, identity)?;
         env.push(("CRIT_RESUME_ID".into(), identity.into()));
     }
     let mut args = Vec::new();
@@ -449,9 +498,12 @@ pub fn command(
     Ok((kind.into(), args, env))
 }
 
-fn validate_resume(kind: &str, identity: &str) -> Result<()> {
+/// Refuses a saved chat identity that cannot be resumed. For OMP it also reads the chat
+/// file's header. OpenCode keeps chats in its database, which `existing_opencode_chats`
+/// checks for all of them at once.
+pub fn validate_resume(kind: &str, identity: &str) -> Result<()> {
     use std::io::BufRead;
-    if identity.is_empty() || identity.len() > 4096 || identity.contains('\0') {
+    if !valid_identity(identity) {
         bail!("invalid {kind} resume identity");
     }
     if kind == "omp" {
@@ -491,30 +543,51 @@ fn validate_resume(kind: &str, identity: &str) -> Result<()> {
         if header["type"] != "session" || !header["id"].is_string() {
             bail!("saved OMP chat has no valid session header: {identity}");
         }
-    } else {
-        // OpenCode's missing-session TUI route falls back to Home. Check the
-        // native database through its CLI, requesting only this ID's metadata.
-        let query = format!(
-            "SELECT id FROM session WHERE id = '{}' LIMIT 1",
-            identity.replace('\'', "''")
-        );
-        let output = std::process::Command::new("opencode")
-            .args(["db", "--format", "json", &query])
-            .output()
-            .context("checking saved OpenCode chat")?;
-        if !output.status.success() {
-            bail!("could not check saved OpenCode chat {identity}");
-        }
-        let rows: Value = serde_json::from_slice(&output.stdout)
-            .context("reading OpenCode chat existence result")?;
-        if !rows
-            .as_array()
-            .is_some_and(|rows| rows.len() == 1 && rows[0]["id"].as_str() == Some(identity))
-        {
-            bail!("saved OpenCode chat does not exist: {identity}");
-        }
     }
     Ok(())
+}
+
+fn valid_identity(identity: &str) -> bool {
+    !identity.is_empty() && identity.len() <= 4096 && !identity.contains('\0')
+}
+
+/// Which of `ids` exist in OpenCode's database, from a single `opencode db` call: the CLI
+/// takes about 0.6 s to start, so one call per chat would freeze a restore for seconds.
+/// An identity that cannot be a chat identity is never reported as existing.
+pub fn existing_opencode_chats(ids: &[&str]) -> Result<HashSet<String>> {
+    let Some(query) = opencode_chat_query(ids) else {
+        return Ok(HashSet::new());
+    };
+    // OpenCode's missing-session TUI route falls back to Home, so a missing chat must be
+    // caught here. The query returns only the IDs that exist.
+    let output = std::process::Command::new("opencode")
+        .args(["db", "--format", "json", &query])
+        .output()
+        .context("checking saved OpenCode chats")?;
+    if !output.status.success() {
+        bail!("could not check saved OpenCode chats");
+    }
+    let rows: Value =
+        serde_json::from_slice(&output.stdout).context("reading OpenCode chat existence result")?;
+    Ok(rows
+        .as_array()
+        .context("OpenCode chat existence result is not a list")?
+        .iter()
+        .filter_map(|row| row["id"].as_str().map(str::to_owned))
+        .collect())
+}
+
+/// `None` when no identity qualifies; each valid identity appears once, quoted for SQL.
+fn opencode_chat_query(ids: &[&str]) -> Option<String> {
+    let mut seen = HashSet::new();
+    let quoted: Vec<String> = ids
+        .iter()
+        .copied()
+        .filter(|id| valid_identity(id) && seen.insert(*id))
+        .map(|id| format!("'{}'", id.replace('\'', "''")))
+        .collect();
+    (!quoted.is_empty())
+        .then(|| format!("SELECT id FROM session WHERE id IN ({})", quoted.join(",")))
 }
 
 fn substitute_tui_config(text: &str, base: &Path) -> Result<String> {
@@ -627,6 +700,21 @@ mod tests {
     }
 
     #[test]
+    fn opencode_batch_query_escapes_and_dedupes() {
+        assert_eq!(
+            opencode_chat_query(&["ses_a", "it's", "ses_a", "", "nul\0", "ses_b"]).as_deref(),
+            Some("SELECT id FROM session WHERE id IN ('ses_a','it''s','ses_b')")
+        );
+        assert_eq!(opencode_chat_query(&[]), None);
+        assert_eq!(opencode_chat_query(&["", &"x".repeat(4097)]), None);
+        // Nothing to ask means no `opencode` call at all.
+        assert!(existing_opencode_chats(&[]).unwrap().is_empty());
+        // Resume validation no longer asks OpenCode; only the identity is checked here.
+        assert!(validate_resume("opencode", "ses_a").is_ok());
+        assert!(validate_resume("opencode", "").is_err());
+    }
+
+    #[test]
     fn malformed_clients_and_duplicates_cannot_replace_another_session() {
         let (tx, rx) = mpsc::sync_channel(4);
         let server = start(tx).unwrap();
@@ -683,6 +771,41 @@ mod tests {
             .write_all(b"{\"session\":1,\"state\":\"idle\"}\n")
             .unwrap();
         drop(integration);
+    }
+
+    #[test]
+    fn drop_returns_after_socket_path_is_removed() {
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let server = start(tx).unwrap();
+        // An acked round trip proves the worker is back in its blocking accept.
+        assert!(send(
+            &server.socket_path,
+            b"{\"session\":1,\"state\":\"idle\"}\n"
+        ));
+        let directory = server.directory.clone();
+        fs::remove_file(&server.socket_path).unwrap();
+        let (done, finished) = mpsc::channel();
+        thread::spawn(move || {
+            drop(server);
+            let _ = done.send(());
+        });
+        finished
+            .recv_timeout(Duration::from_secs(1))
+            .expect("drop must not hang once the socket path is gone");
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn start_in_skips_bases_that_cannot_hold_the_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = PathBuf::from("/proc/crit-nonexistent");
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let server = start_in(tx, &[missing.clone(), temp.path().to_path_buf()]).unwrap();
+        assert!(server.socket_path.starts_with(temp.path()));
+        assert!(UnixStream::connect(&server.socket_path).is_ok());
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let error = start_in(tx, &[missing]).err().unwrap();
+        assert!(format!("{error:#}").contains("/proc/crit-nonexistent"));
     }
 
     #[test]

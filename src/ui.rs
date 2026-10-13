@@ -17,6 +17,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::sync::atomic::Ordering;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 const FG: Color = Color::Rgb(224, 228, 232);
@@ -38,14 +39,22 @@ fn areas(app: &App, size: Size) -> ([Rect; 2], usize) {
         app.project.layout,
         app.project.secondary.is_some(),
         app.project.split_ratio,
+        size,
         content,
     )
 }
 
-fn pane_areas(layout: LayoutMode, split: bool, split_ratio: u16, size: Size) -> ([Rect; 2], usize) {
+fn pane_areas(
+    layout: LayoutMode,
+    split: bool,
+    split_ratio: u16,
+    window: Size,
+    size: Size,
+) -> ([Rect; 2], usize) {
     // Only visible notices reserve bottom rows; areas() subtracts their height.
     let main = Rect::new(0, 1, size.width, size.height.saturating_sub(1));
-    if !split || layout == LayoutMode::Full || size.width < 60 || size.height < 16 {
+    // The window decides whether both panes fit; a notice must not collapse a split.
+    if !split || layout == LayoutMode::Full || window.width < 60 || window.height < 16 {
         return ([main, Rect::default()], 1);
     }
     match layout {
@@ -134,17 +143,29 @@ fn pane_target(project: &Project, pane: usize, count: usize) -> (usize, usize, b
 }
 
 pub fn resize_sessions(app: &mut App, size: Size) -> Result<()> {
+    // Nothing is drawn below the minimum; keep the last usable PTY size.
+    if size.width < 30 || size.height < 10 {
+        return Ok(());
+    }
     let (areas, count) = areas(app, size);
     for (pane, area) in areas.iter().enumerate().take(count) {
         let (index, selected, _) = pane_target(&app.project, pane, count);
         let rect = body(*area);
         let workspace = &mut app.project.workspaces[index];
         if let Some(session) = workspace.sessions.get_mut(selected) {
-            if app
-                .selection
-                .as_ref()
-                .is_some_and(|selection| selection.session == session.id && selection.body != rect)
-            {
+            let keep = match &mut app.selection {
+                Some(selection) if selection.session == session.id && selection.body != rect => {
+                    // A notice only moves the bottom edge; the frozen rows keep their places.
+                    let same = (selection.body.x, selection.body.y, selection.body.width)
+                        == (rect.x, rect.y, rect.width);
+                    if same {
+                        selection.body = rect;
+                    }
+                    same
+                }
+                _ => true,
+            };
+            if !keep {
                 app.selection = None;
             }
             session.resize(rect.height, rect.width)?;
@@ -304,7 +325,8 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) {
     let mut end = start;
     for (cell, hit) in tab_hits.iter_mut().enumerate().skip(start) {
         let cell_width = hit.area.width.min(width.saturating_sub(x));
-        if cell_width < hit.area.width.min(5) {
+        // Keep a cramped first cell (the focused tab at minimum width) clickable.
+        if cell > start && cell_width < hit.area.width.min(5) {
             break;
         }
         hit.area = Rect::new(x, 0, cell_width, 1);
@@ -441,11 +463,23 @@ fn draw_workspace(
                     target.set_diff_option(ratatui::buffer::CellDiffOption::Skip);
                     continue;
                 }
-                target.set_symbol(if cell.has_contents() {
+                let symbol = if cell.has_contents() {
                     cell.contents()
                 } else {
                     " "
-                });
+                };
+                if !cell.is_wide() && symbol.len() > 3 && symbol.contains('\u{fe0f}') {
+                    // vt100 gave this emoji presentation sequence one column; drop VS16 so the
+                    // outer terminal uses one column too. Cells hold at most 22 bytes.
+                    let mut text = [0_u8; 32];
+                    let mut len = 0;
+                    for ch in symbol.chars().filter(|&ch| ch != '\u{fe0f}') {
+                        len += ch.encode_utf8(&mut text[len..]).len();
+                    }
+                    target.set_symbol(std::str::from_utf8(&text[..len]).unwrap_or(" "));
+                } else {
+                    target.set_symbol(symbol);
+                }
                 let mut style = Style::default()
                     .fg(vt_color(cell.fgcolor(), FG))
                     .bg(vt_color(cell.bgcolor(), BG));
@@ -483,6 +517,8 @@ fn draw_workspace(
             && screen.scrollback() == 0
         {
             let (row, col) = screen.cursor_position();
+            // Pending wrap parks the cursor at `cols`; show it on the last column.
+            let col = col.min(screen.size().1.saturating_sub(1));
             if row < body.height && col < body.width {
                 frame.set_cursor_position((body.x + col, body.y + row));
             }
@@ -600,7 +636,7 @@ pub fn draw_updates(frame: &mut Frame, states: &[UpdateState; 2], tick: usize) {
     if width > 4 {
         let checking = states
             .iter()
-            .any(|state| matches!(state, UpdateState::Waiting | UpdateState::Checking));
+            .any(|state| matches!(state, UpdateState::Checking));
         let label = if !checking {
             " is ready"
         } else if width >= 43 {
@@ -644,10 +680,11 @@ pub fn draw_updates(frame: &mut Frame, states: &[UpdateState; 2], tick: usize) {
             break;
         }
         let (mark, text, color) = match state {
-            UpdateState::Waiting => ("·", "waiting", MUTED),
             UpdateState::Checking => ("›", "checking", ACCENT),
             UpdateState::Ready => ("✓", "ready", GREEN),
             UpdateState::Failed => ("!", "using installed version", AMBER),
+            UpdateState::Skipped => ("–", "skipped", MUTED),
+            UpdateState::Missing => ("·", "not installed", MUTED),
         };
         buffer.set_stringn(
             x + 2,
@@ -679,7 +716,7 @@ pub fn draw_updates(frame: &mut Frame, states: &[UpdateState; 2], tick: usize) {
         buffer.set_stringn(
             x,
             y + 5,
-            "ctrl+c cancel",
+            "esc skip · ctrl+c quit",
             width as usize,
             Style::default().fg(MUTED),
         );
@@ -868,21 +905,24 @@ fn intent_dialog(frame: &mut Frame, inner: Rect, dialog: &IntentDialog) {
         &dialog.input,
         !dialog.pending,
     );
-    let status = if let Some(error) = &dialog.error {
-        error.as_str()
-    } else if dialog.loading {
-        "Finding projects and worktrees..."
-    } else if dialog.pending {
-        "Interpreting with Haiku 5.5... Esc cancels."
+    let status_area = Rect::new(inner.x, inner.y + 11, inner.width, inner.height - 13);
+    if let Some(error) = &dialog.error {
+        draw_notice(frame, error, status_area);
     } else {
-        "Enter to act · destructive actions still require confirmation."
-    };
-    frame.render_widget(
-        Paragraph::new(status)
-            .style(Style::default().fg(if dialog.error.is_some() { AMBER } else { MUTED }))
-            .wrap(Wrap { trim: false }),
-        Rect::new(inner.x, inner.y + 11, inner.width, inner.height - 13),
-    );
+        let status = if dialog.loading {
+            "Finding projects and worktrees..."
+        } else if dialog.pending {
+            "Interpreting with Haiku 5.5... Esc cancels."
+        } else {
+            "Enter to act · destructive actions still require confirmation."
+        };
+        frame.render_widget(
+            Paragraph::new(status)
+                .style(Style::default().fg(MUTED))
+                .wrap(Wrap { trim: false }),
+            status_area,
+        );
+    }
     frame.render_widget(
         Paragraph::new("Enter send · Esc cancel · Ctrl+U clear · F2 manual controls")
             .style(Style::default().fg(MUTED)),
@@ -991,7 +1031,7 @@ fn draw_existing_split_picker(
             list,
             choices.iter().map(|choice| match choice {
                 SplitTarget::Worktree(tree) => {
-                    format!("{}  {}", tree.branch, tree.path.display())
+                    format!("{}  {}", tree.label(), tree.path.display())
                 }
                 SplitTarget::Branch(branch) => format!("{branch}  (create worktree)"),
             }),
@@ -1012,7 +1052,7 @@ fn draw_existing_split_picker(
 }
 
 fn draw_opening_split(frame: &mut Frame, bounds: Rect) {
-    let message = "Opening split…";
+    let message = "Opening split… Esc hides";
     let inner = modal_area_in(
         frame,
         bounds,
@@ -1120,7 +1160,9 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
         Modal::Removal { error, .. } => Some(
             error
                 .as_deref()
-                .unwrap_or("Checking and removing worktree…\nThe tab will close on success."),
+                .unwrap_or(
+                    "Checking and removing worktree…\nThe tab will close on success.\nEsc hides this; removal continues.",
+                ),
         ),
         _ => None,
     };
@@ -1239,7 +1281,7 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
                 frame.render_widget(
                     Paragraph::new(format!(
                         "Enter creates the checkout from {base}, starts its Compose stack, and {outcome} {base}.",
-                        base = app.focused().tree.branch,
+                        base = app.focused().label(),
                     )).wrap(Wrap { trim: false }),
                     Rect::new(inner.x, inner.y + 4, inner.width, inner.height - 5),
                 );
@@ -1260,7 +1302,7 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
             inner,
             trees
                 .iter()
-                .map(|tree| format!("{}  {}", tree.branch, tree.path.display())),
+                .map(|tree| format!("{}  {}", tree.label(), tree.path.display())),
             *selected,
         ),
         Modal::Split { .. } | Modal::ExistingSplit { .. } | Modal::OpeningSplit { .. } => {
@@ -1285,7 +1327,7 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
                     "Stop this worktree's Docker?\nOther worktrees unaffected.\nVolumes remain."
                 }
                 Confirm::RemoveWorktree => {
-                    "Delete this checkout?\nDirty/main/locked refused.\nStop Docker first.\nBranch remains."
+                    "Delete this checkout?\nIgnored files go with it.\nDirty/main/locked refused.\nStop Docker first.\nBranch remains."
                 }
             };
             draw_confirmation(frame, inner, message);
@@ -1343,14 +1385,29 @@ fn notice_chunks<'a>(text: &'a str, width: u16, mut emit: impl FnMut(&'a str)) {
     for line in text.trim_end_matches('\n').split('\n') {
         let mut start = 0;
         let mut columns = 0;
-        for (offset, ch) in line.char_indices() {
-            let next = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+        let mut place = |offset: usize, next: u16| {
             if columns + next > width && offset > start {
                 emit(&line[start..offset]);
                 start = offset;
                 columns = 0;
             }
             columns += next;
+        };
+        // Ratatui draws whole grapheme clusters and drops those holding control
+        // characters, so measure the same units. ASCII lines skip the segmentation.
+        if line.is_ascii() {
+            for (offset, byte) in line.bytes().enumerate() {
+                place(offset, u16::from(!byte.is_ascii_control()));
+            }
+        } else {
+            for (offset, grapheme) in line.grapheme_indices(true) {
+                let next = if grapheme.contains(char::is_control) {
+                    0
+                } else {
+                    grapheme.width() as u16
+                };
+                place(offset, next);
+            }
         }
         emit(&line[start..]);
     }
@@ -1431,6 +1488,8 @@ mod tests {
                 head: String::new(),
                 is_main: false,
                 locked: false,
+                bare: false,
+                prunable: false,
             },
             source: None,
             sessions: Vec::new(),
@@ -1465,7 +1524,7 @@ mod tests {
             for focus_secondary in [false, true] {
                 project.focus_secondary = focus_secondary;
                 for size in [Size::new(80, 24), Size::new(30, 10), Size::new(80, 15)] {
-                    let (_, count) = pane_areas(layout, true, project.split_ratio, size);
+                    let (_, count) = pane_areas(layout, true, project.split_ratio, size, size);
                     if count == 2 {
                         assert_eq!(pane_target(&project, 0, count), (0, 0, false));
                         assert_eq!(pane_target(&project, 1, count), (0, 1, true));
@@ -1631,6 +1690,81 @@ mod tests {
         assert!(row_text(buffer, panes[1], panes[1].y).contains("Exited (test exit)"));
     }
 
+    /// A workspace whose only session is an idle `cat` sized to `body`.
+    fn cat_workspace(
+        directory: &std::path::Path,
+        body: Rect,
+    ) -> (Workspace, std::sync::mpsc::Receiver<crate::event::Event>) {
+        let mut workspace = test_workspace();
+        workspace.tree.path = directory.to_owned();
+        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        workspace.sessions.push(
+            crate::terminal::Session::spawn(
+                1,
+                "shell",
+                None,
+                directory,
+                &directory.join("unused.sock"),
+                tx,
+                body.height,
+                body.width,
+                Some(("/bin/cat".into(), Vec::new())),
+            )
+            .unwrap(),
+        );
+        (workspace, rx)
+    }
+
+    #[test]
+    fn vs16_emoji_keep_their_single_vt100_column() {
+        let directory = tempfile::tempdir().unwrap();
+        let area = Rect::new(0, 1, 40, 6);
+        let content = body(area);
+        let (workspace, _rx) = cat_workspace(directory.path(), content);
+        workspace.sessions[0]
+            .parser
+            .lock()
+            .process("⚠\u{fe0f}ab".as_bytes());
+        let mut terminal = Terminal::new(TestBackend::new(40, 7)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_workspace(frame, &workspace, 0, area, content, true, true, None);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        // vt100 keeps the sequence in one column, so the outer terminal must use one too.
+        assert_eq!(buffer[(content.x, content.y)].symbol(), "⚠");
+        assert_eq!(buffer[(content.x + 1, content.y)].symbol(), "a");
+        // Copied text still comes from vt100's untouched cell.
+        let parser = workspace.sessions[0].parser.lock();
+        assert_eq!(parser.screen().cell(0, 0).unwrap().contents(), "⚠\u{fe0f}");
+    }
+
+    #[test]
+    fn cursor_stays_visible_in_pending_wrap_column() {
+        let directory = tempfile::tempdir().unwrap();
+        let area = Rect::new(0, 1, 12, 6);
+        let content = body(area);
+        assert_eq!(content.width, 10);
+        let (workspace, _rx) = cat_workspace(directory.path(), content);
+        workspace.sessions[0].parser.lock().process(b"0123456789");
+        // The last column is written, so vt100 parks the cursor one past it.
+        let cursor = workspace.sessions[0]
+            .parser
+            .lock()
+            .screen()
+            .cursor_position();
+        assert_eq!(cursor, (0, 10));
+        let mut terminal = Terminal::new(TestBackend::new(12, 7)).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_workspace(frame, &workspace, 0, area, content, true, true, None);
+            })
+            .unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert_eq!((cursor.x, cursor.y), (content.x + 9, content.y));
+    }
+
     #[test]
     fn split_picker_keeps_every_selection_and_controls_inside_available_space() {
         for size in [Size::new(30, 10), Size::new(80, 24)] {
@@ -1746,7 +1880,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_split_picker_remains_navigable_and_opening_has_no_cancel_hint() {
+    fn empty_split_picker_remains_navigable_and_opening_hints_that_esc_hides_it() {
         let size = Size::new(30, 10);
         let bounds = Rect::new(
             0,
@@ -1774,7 +1908,7 @@ mod tests {
             .filter(|row| !row.trim().is_empty())
             .collect();
         assert!(rows.iter().any(|row| row.contains("Opening")));
-        assert!(!rows.iter().any(|row| row.contains("Esc")));
+        assert!(rows.iter().any(|row| row.contains("Esc")));
         assert!(rows.len() < bounds.height as usize / 2);
     }
 
@@ -1791,8 +1925,13 @@ mod tests {
                 LayoutMode::Vertical,
                 LayoutMode::Horizontal,
             ] {
-                let (panes, count) =
-                    pane_areas(layout, true, crate::restore::default_split_ratio(), size);
+                let (panes, count) = pane_areas(
+                    layout,
+                    true,
+                    crate::restore::default_split_ratio(),
+                    size,
+                    size,
+                );
                 for pane in panes.into_iter().take(count) {
                     let content = body(pane);
                     assert!(content.right() <= size.width);
@@ -1810,7 +1949,7 @@ mod tests {
         for width in [60, 61, 80, 121, 240] {
             let size = Size::new(width, 24);
             for ratio in [0, 1, scale / 4, scale / 2, 3 * scale / 4, scale, u16::MAX] {
-                let (panes, count) = pane_areas(LayoutMode::Vertical, true, ratio, size);
+                let (panes, count) = pane_areas(LayoutMode::Vertical, true, ratio, size, size);
                 let divider = split_divider(LayoutMode::Vertical, panes, count).unwrap();
                 let [left, right] = panes.map(body);
                 assert_eq!(count, 2);
@@ -1856,7 +1995,7 @@ mod tests {
                 Size::new(181, 25),
                 Size::new(160, 24),
             ] {
-                let (panes, count) = pane_areas(LayoutMode::Vertical, true, ratio, size);
+                let (panes, count) = pane_areas(LayoutMode::Vertical, true, ratio, size, size);
                 let divider = split_divider(LayoutMode::Vertical, panes, count).unwrap();
                 let desired = u32::from(size.width) * u32::from(ratio);
                 let actual = u32::from(panes[0].width) * scale;
@@ -1894,10 +2033,15 @@ mod tests {
                     {
                         continue;
                     }
-                    let baseline =
-                        pane_areas(layout, split, crate::restore::default_split_ratio(), size);
+                    let baseline = pane_areas(
+                        layout,
+                        split,
+                        crate::restore::default_split_ratio(),
+                        size,
+                        size,
+                    );
                     for ratio in [0, 2_500, 7_500, u16::MAX] {
-                        let (panes, count) = pane_areas(layout, split, ratio, size);
+                        let (panes, count) = pane_areas(layout, split, ratio, size, size);
                         assert_eq!((panes, count), baseline);
                         assert!(split_divider(layout, panes, count).is_none());
                         if count == 1 {
@@ -2003,6 +2147,20 @@ mod tests {
         notice_chunks("界界e\u{301}\nlast", 4, |chunk| chunks.push(chunk));
         assert_eq!(chunks, ["界界", "e\u{301}", "last"]);
         assert!(chunks.iter().all(|chunk| chunk.width() <= 4));
+        // A VS16 emoji is one two-column unit, and a ZWJ sequence is never split.
+        let vs16 = "⚠\u{fe0f}".repeat(3);
+        let mut emoji = Vec::new();
+        notice_chunks(&vs16, 4, |chunk| emoji.push(chunk));
+        assert_eq!(emoji, ["⚠\u{fe0f}⚠\u{fe0f}", "⚠\u{fe0f}"]);
+        let mut family = Vec::new();
+        notice_chunks("ab👨\u{200d}👩\u{200d}👧cd", 4, |chunk| {
+            family.push(chunk)
+        });
+        assert_eq!(family, ["ab👨\u{200d}👩\u{200d}👧", "cd"]);
+        // Ratatui drops control characters, so they take no columns on either path.
+        let mut controls = Vec::new();
+        notice_chunks("ab\tcd\r\n界\u{1b}[0m", 4, |chunk| controls.push(chunk));
+        assert_eq!(controls, ["ab\tcd\r", "界\u{1b}[0", "m"]);
     }
 
     #[test]
@@ -2034,6 +2192,7 @@ mod tests {
                 LayoutMode::Horizontal,
                 true,
                 crate::restore::default_split_ratio(),
+                size,
                 content,
             );
             for pane in panes.into_iter().take(count) {

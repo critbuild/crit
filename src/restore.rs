@@ -17,6 +17,7 @@ pub fn default_split_ratio() -> u16 {
 
 const MAX_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
 const SNAPSHOT_FILE: &str = "workspace.json";
+const BACKUP_FILE: &str = "workspace.json.bak";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -319,6 +320,18 @@ impl Store {
     }
 
     pub fn save(&self, snapshot: &Snapshot) -> Result<()> {
+        self.write(snapshot, SNAPSHOT_FILE)
+    }
+
+    /// Keeps `snapshot` as `workspace.json.bak` beside the live file, validated and
+    /// written as privately and atomically as `save`, so a restore that leaves items
+    /// out can replace `workspace.json` without losing them. Returns the backup's path.
+    pub fn back_up(&self, snapshot: &Snapshot) -> Result<PathBuf> {
+        self.write(snapshot, BACKUP_FILE)?;
+        Ok(self.directory.join(BACKUP_FILE))
+    }
+
+    fn write(&self, snapshot: &Snapshot, name: &str) -> Result<()> {
         snapshot
             .validate()
             .context("validating workspace snapshot")?;
@@ -343,7 +356,7 @@ impl Store {
             .sync_all()
             .context("syncing temporary workspace snapshot")?;
         temporary
-            .persist(self.directory.join(SNAPSHOT_FILE))
+            .persist(self.directory.join(name))
             .context("replacing workspace snapshot")?;
         // Rename is the commit point. A directory-sync error means the complete
         // new snapshot is visible, but its survival across power loss is unknown.
@@ -607,6 +620,27 @@ mod tests {
                 mode
             );
         }
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn backup_keeps_a_private_copy_beside_the_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_in(directory.path()).unwrap();
+        let expected = snapshot();
+        let path = store.back_up(&expected).unwrap();
+        assert_eq!(path, directory.path().join("workspace.json.bak"));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let decoded: Snapshot = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(decoded, expected);
+        // The live snapshot is untouched: there is still none to load.
+        assert_eq!(store.load().unwrap(), None);
+        let mut invalid = snapshot();
+        invalid.version += 1;
+        assert!(store.back_up(&invalid).is_err());
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
     }
 

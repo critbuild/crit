@@ -22,7 +22,7 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     fmt::Write as _,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
@@ -63,8 +63,11 @@ pub struct ProjectPicker {
 }
 impl ProjectPicker {
     fn new(base: PathBuf, jobs: &SyncSender<Job>, request: u64) -> Result<Self> {
-        jobs.try_send(Job::Projects(base.clone()))
-            .context("command queue is busy")?;
+        jobs.try_send(Job::Projects {
+            request,
+            base: base.clone(),
+        })
+        .context("command queue is busy")?;
         Ok(Self {
             base,
             terminal_path: None,
@@ -164,6 +167,7 @@ impl ProjectPicker {
                         request: self.request,
                         path,
                         agent: None,
+                        fresh_tab: false,
                     })
                     .context("command queue is busy")?;
                     self.pending = true;
@@ -229,6 +233,8 @@ pub struct IntentTarget {
     id: usize,
     kind: &'static str,
     name: String,
+    /// Navigation uses this exact path; the interpreter sees a lossy copy.
+    #[serde(serialize_with = "lossy_path")]
     path: PathBuf,
     branch: Option<String>,
 }
@@ -313,7 +319,7 @@ pub enum Modal {
         selected: usize,
         error: Option<String>,
     },
-    /// An accepted checkout operation must finish before leaving the picker.
+    /// An accepted checkout operation runs on while this shows; Esc only hides it.
     OpeningSplit {
         request: u64,
     },
@@ -466,7 +472,7 @@ impl Project {
             .max_by_key(|(_, tree)| tree.path.components().count())
             .map(|(index, _)| index)
             .context("folder is not inside a checked-out worktree")?;
-        let name = folder_name(&trees[0].path);
+        let name = project_name(&trees[0].path, &repository.common_dir);
         let tree = trees.swap_remove(active);
         Ok(Self {
             repository: Some(repository),
@@ -495,6 +501,8 @@ impl Project {
             head: String::new(),
             is_main: false,
             locked: false,
+            bare: false,
+            prunable: false,
         };
         Ok(Self {
             repository: None,
@@ -541,19 +549,28 @@ impl Project {
     }
 
     fn close_workspace(&mut self, index: usize) {
+        // Closing the focused primary leaves its visible peer, not the next tab in order.
+        let promoted = self
+            .secondary
+            .filter(|&s| index == self.active && s != index);
         self.workspaces.remove(index);
-        self.active = if self.active > index {
-            self.active - 1
+        if let Some(peer) = promoted {
+            self.active = peer - usize::from(peer > index);
+            self.secondary = None;
         } else {
-            self.active.min(self.workspaces.len().saturating_sub(1))
-        };
-        self.secondary = self.secondary.and_then(|s| {
-            if s == index {
-                None
+            self.active = if self.active > index {
+                self.active - 1
             } else {
-                Some(if s > index { s - 1 } else { s })
-            }
-        });
+                self.active.min(self.workspaces.len().saturating_sub(1))
+            };
+            self.secondary = self.secondary.and_then(|s| {
+                if s == index {
+                    None
+                } else {
+                    Some(if s > index { s - 1 } else { s })
+                }
+            });
+        }
         if self.secondary.is_none()
             || (self.secondary == Some(self.active) && self.secondary_session.is_none())
         {
@@ -571,8 +588,12 @@ pub struct App {
     pub native_keys: bool,
     pub modal: Option<Modal>,
     pub notice: Option<String>,
+    /// The notice is a warning that terminal input must not dismiss.
+    notice_sticky: bool,
     pub panes: Vec<Pane>,
     scroll_drag: Option<(u64, u16)>,
+    /// The session and pane body that received a forwarded press, until its release.
+    mouse_capture: Option<(u64, Rect)>,
     pub split_divider: Option<SplitDivider>,
     pub split_drag: Option<u16>,
     pub selection: Option<Selection>,
@@ -584,6 +605,8 @@ pub struct App {
     next_request: u64,
     pending_creations: VecDeque<(PathBuf, String, Modal)>,
     state_dirty: bool,
+    /// The snapshot last written, so unchanged state is not saved again.
+    last_saved: Option<restore::Snapshot>,
     metadata_pending: bool,
     metadata_checked: Instant,
     socket: PathBuf,
@@ -597,6 +620,7 @@ enum Job {
         request: u64,
         path: PathBuf,
         agent: Option<AgentKind>,
+        fresh_tab: bool,
     },
     IntentTargets {
         request: u64,
@@ -604,7 +628,10 @@ enum Job {
         repository: Option<worktree::Repository>,
         known_projects: Vec<PathBuf>,
     },
-    Projects(PathBuf),
+    Projects {
+        request: u64,
+        base: PathBuf,
+    },
     Create {
         repository: worktree::Repository,
         branch: String,
@@ -665,18 +692,24 @@ pub fn project_slots<'a>(
     })
 }
 
-/// One-line Compose status for the notice row, e.g. `main: + web :8080 · ! db`.
+/// One-line Compose status for the notice row, e.g. `main: + web :8080 · ~ db · - migrate · ! worker`:
+/// `+` running, `~` still starting, `-` finished with exit code 0, `!` failing.
 fn environment_summary(label: &str, environment: &compose::Environment) -> String {
     let mut summary = format!("{label}: ");
     if environment.services.is_empty() {
         summary.push_str("stack stopped");
     }
     for (index, service) in environment.services.iter().enumerate() {
-        let healthy = service.state == "running" && service.health != "unhealthy";
+        let marker = match (service.state.as_str(), service.health.as_str()) {
+            ("running", "" | "healthy") => "+ ",
+            ("running", "starting") => "~ ",
+            ("exited", _) if service.exit_code == 0 => "- ",
+            _ => "! ",
+        };
         if index > 0 {
             summary.push_str(" · ");
         }
-        summary.push_str(if healthy { "+ " } else { "! " });
+        summary.push_str(marker);
         summary.push_str(&service.name);
         for port in &service.ports {
             let _ = write!(summary, " :{}", port.host);
@@ -684,6 +717,9 @@ fn environment_summary(label: &str, environment: &compose::Environment) -> Strin
     }
     summary
 }
+
+/// Shown when a new worktree's tab exists but the full job queue refused its Docker start.
+const ENVIRONMENT_NOT_STARTED: &str = "Worktree created; its Docker environment was not started (command queue busy). Start it from F1 → F2.";
 
 impl App {
     const METADATA_INTERVAL: Duration = Duration::from_secs(1);
@@ -707,23 +743,53 @@ impl App {
         }
     }
 
-    fn apply_metadata(&mut self, trees: Vec<Worktree>) -> bool {
+    fn apply_metadata(&mut self, listings: Vec<(PathBuf, Vec<Worktree>)>) -> bool {
         self.metadata_pending = false;
         self.metadata_checked = Instant::now();
         let mut changed = false;
-        for workspace in self.all_workspaces_mut() {
-            let Some(tree) = trees
-                .iter()
-                .find(|tree| tree.id == workspace.tree.id && tree.path == workspace.tree.path)
+        let mut moved = false;
+        for project in std::iter::once(&mut self.project).chain(&mut self.saved_projects) {
+            let Some(trees) = project
+                .common_dir()
+                .and_then(|common_dir| listings.iter().find(|(listed, _)| listed == common_dir))
+                .map(|(_, trees)| trees)
             else {
                 continue;
             };
-            if workspace.tree.branch != tree.branch || workspace.tree.head != tree.head {
-                workspace.tree.branch.clone_from(&tree.branch);
-                workspace.tree.head.clone_from(&tree.head);
-                changed = true;
+            for index in 0..project.workspaces.len() {
+                let current = &project.workspaces[index];
+                if let Some(tree) = trees
+                    .iter()
+                    .find(|tree| tree.id == current.tree.id && tree.path == current.tree.path)
+                {
+                    if current.tree.branch != tree.branch || current.tree.head != tree.head {
+                        let workspace = &mut project.workspaces[index];
+                        workspace.tree.branch.clone_from(&tree.branch);
+                        workspace.tree.head.clone_from(&tree.head);
+                        changed = true;
+                    }
+                    continue;
+                }
+                // `git worktree move` keeps the branch but changes the path, and with it the
+                // id. Follow the checkout when exactly one unopened one carries that branch.
+                if current.tree.branch.is_empty() || current.pending {
+                    continue;
+                }
+                let mut unopened = trees.iter().filter(|tree| {
+                    tree.branch == current.tree.branch
+                        && !project
+                            .workspaces
+                            .iter()
+                            .any(|open| open.tree.id == tree.id)
+                });
+                if let (Some(tree), None) = (unopened.next(), unopened.next()) {
+                    project.workspaces[index].tree = tree.clone();
+                    changed = true;
+                    moved = true;
+                }
             }
         }
+        self.state_dirty |= moved;
         changed
     }
 
@@ -772,10 +838,51 @@ impl App {
         Ok(())
     }
 
+    /// Sends a drag or release to the program that took the press, clamped to its pane body.
+    fn forward_capture(
+        &self,
+        mouse: crossterm::event::MouseEvent,
+        id: u64,
+        body: Rect,
+    ) -> Result<()> {
+        if let Some(session) = self.panes.iter().find_map(|pane| {
+            let workspace = self.project.workspaces.get(pane.workspace)?;
+            let session = workspace.sessions.get(pane.session)?;
+            (session.id == id).then_some(session)
+        }) {
+            let column = mouse.column.clamp(body.x, body.right() - 1) - body.x;
+            let row = mouse.row.clamp(body.y, body.bottom() - 1) - body.y;
+            session.mouse(mouse, column, row)?;
+        }
+        Ok(())
+    }
+
+    /// Reads the system clipboard on a worker thread, so a hung clipboard owner cannot
+    /// stall the UI. The text returns as `Event::ClipboardText` for `target`: the session
+    /// that asked, or `None` for the dialog that was open then.
+    fn paste_from_clipboard(&self, target: Option<u64>) -> Result<()> {
+        let tx = self.tx.clone();
+        std::thread::Builder::new()
+            .name("clipboard-read".into())
+            .spawn(move || {
+                let result = clipboard::paste().map_err(|error| format!("{error:#}"));
+                let _ = tx.send(Event::ClipboardText { target, result });
+            })?;
+        Ok(())
+    }
+
     fn snapshot(&self) -> restore::Snapshot {
         let mut active_project = 0;
         let projects = project_slots(&self.project, &self.saved_projects)
-            .filter(|(_, project)| !project.workspaces.is_empty())
+            // The snapshot stores UTF-8 paths. A project with a path that is not UTF-8 is not
+            // saved, rather than making every later save fail.
+            .filter(|(_, project)| {
+                !project.workspaces.is_empty()
+                    && project
+                        .workspaces
+                        .iter()
+                        .all(|workspace| workspace.tree.path.to_str().is_some())
+            })
             .enumerate()
             .map(|(index, (slot, project))| {
                 if slot.is_none() {
@@ -788,7 +895,8 @@ impl App {
                     .enumerate()
                     .map(|(workspace_index, workspace)| {
                         let mut selected = 0;
-                        let sessions = workspace
+                        let mut selected_restorable = false;
+                        let sessions: Vec<_> = workspace
                             .sessions
                             .iter()
                             .enumerate()
@@ -799,6 +907,7 @@ impl App {
                             .map(|(saved_index, (index, session))| {
                                 if index == workspace.selected {
                                     selected = saved_index;
+                                    selected_restorable = true;
                                 }
                                 if workspace_index == project.active
                                     && Some(index) == project.secondary_session
@@ -811,9 +920,21 @@ impl App {
                                 }
                             })
                             .collect();
+                        // The fallback index 0 collides with a peer that is the first restorable
+                        // terminal; any other restorable terminal can lead the split instead.
+                        if workspace_index == project.active
+                            && !selected_restorable
+                            && secondary_session == Some(selected)
+                            && sessions.len() > 1
+                        {
+                            selected = 1;
+                        }
                         restore::SavedWorkspace {
                             path: workspace.tree.path.clone(),
-                            source: workspace.source.clone(),
+                            source: workspace
+                                .source
+                                .clone()
+                                .filter(|source| source.to_str().is_some()),
                             sessions,
                             selected,
                         }
@@ -859,13 +980,18 @@ impl App {
         let Some(owner) = store.as_ref() else {
             return false;
         };
-        if let Err(error) = owner.save(&self.snapshot()) {
-            self.set_notice(format!(
+        let snapshot = self.snapshot();
+        if self.last_saved.as_ref() == Some(&snapshot) {
+            return false;
+        }
+        if let Err(error) = owner.save(&snapshot) {
+            self.set_warning(format!(
                 "Workspace could not be saved: {error:#}. Saving disabled for this window."
             ));
             *store = None;
             return true;
         }
+        self.last_saved = Some(snapshot);
         false
     }
 
@@ -904,7 +1030,32 @@ impl App {
         self.workspace_changed();
     }
     fn set_notice(&mut self, message: impl Into<String>) {
-        self.notice = Some(message.into());
+        const NOTICE_TAIL: usize = 16 * 1024;
+        let mut message = message.into();
+        if message.len() > NOTICE_TAIL {
+            // Only the final rows are ever drawn; bound the per-frame wrapping work.
+            let mut start = message.len() - NOTICE_TAIL;
+            while !message.is_char_boundary(start) {
+                start += 1;
+            }
+            message.replace_range(..start, "...");
+        }
+        self.notice = Some(message);
+        self.notice_sticky = false;
+    }
+
+    /// A notice that terminal input does not dismiss: saving is off, or saved items were
+    /// left out at startup. Esc or a Crit shortcut dismisses it, and any later notice replaces it.
+    fn set_warning(&mut self, message: impl Into<String>) {
+        self.set_notice(message);
+        self.notice_sticky = true;
+    }
+
+    /// Typing, pasting or clicking acknowledges an ordinary notice; a warning needs Esc.
+    fn clear_notice_on_input(&mut self, escape: bool) {
+        if escape || !self.notice_sticky {
+            self.notice = None;
+        }
     }
 
     fn git_repository(&self) -> Result<&worktree::Repository> {
@@ -954,7 +1105,14 @@ impl App {
         }
     }
 
-    fn open_project(&mut self, mut project: Project, agent: Option<AgentKind>) -> Result<()> {
+    /// `fresh_tab` (Home) opens another tab for a plain folder even if it is already open,
+    /// and another session in the tab of a Git checkout, whose id must stay unique.
+    fn open_project(
+        &mut self,
+        mut project: Project,
+        agent: Option<AgentKind>,
+        fresh_tab: bool,
+    ) -> Result<()> {
         self.workspace_changed();
         if !self.project.same_project(&project) {
             if let Some(index) = self
@@ -981,12 +1139,13 @@ impl App {
         }
         // Reopening a folder selects its worktree without duplicating its sessions.
         let tree = project.workspaces.swap_remove(project.active).tree;
-        let index = if let Some(index) = self
+        let reused = self
             .project
             .workspaces
             .iter()
             .position(|w| w.tree.id == tree.id)
-        {
+            .filter(|_| !(fresh_tab && self.project.repository.is_none()));
+        let index = if let Some(index) = reused {
             index
         } else {
             self.project.workspaces.push(Workspace::new(tree));
@@ -995,6 +1154,10 @@ impl App {
         self.full_width();
         self.modal = None;
         self.notice = None;
+        if fresh_tab && reused.is_some() {
+            let kind = self.default_agent.clone();
+            self.spawn(index, &kind, None)?;
+        }
         self.select_workspace(index, agent)
     }
 
@@ -1092,7 +1255,9 @@ impl App {
             && !self.project.workspaces[index].pending
             && compose::has_config(&self.project.workspaces[index].tree)
         {
-            self.env(index, EnvironmentOp::Probe)?;
+            // Best effort: the selection above already happened, and a probe is only a
+            // silent background check.
+            let _ = self.env(index, EnvironmentOp::Probe);
         }
         Ok(())
     }
@@ -1168,12 +1333,13 @@ impl App {
             && !workspace.pending
             && compose::has_config(&workspace.tree)
         {
-            self.env(index, EnvironmentOp::Probe)?;
+            // Best effort, like the probe in `select_workspace`: the split already exists.
+            let _ = self.env(index, EnvironmentOp::Probe);
         }
         Ok(())
     }
     fn new_tab_choices(&self) -> Vec<(String, NewTabAction)> {
-        let mut choices = Vec::with_capacity(5);
+        let mut choices = Vec::with_capacity(4);
         choices.push(("Home (~)".to_owned(), NewTabAction::Home));
         choices.push((
             "Open folder — no Git required".to_owned(),
@@ -1187,12 +1353,6 @@ impl App {
             choices.push((
                 format!("Open existing worktree of {}", self.project.name),
                 NewTabAction::Command(IntentCommand::OpenWorktree),
-            ));
-        }
-        if !self.saved_projects.is_empty() {
-            choices.push((
-                format!("Switch to an open project ({})", self.saved_projects.len()),
-                NewTabAction::Command(IntentCommand::SwitchProject),
             ));
         }
         choices
@@ -1262,13 +1422,13 @@ impl App {
         let context = serde_json::json!({
             "active_project": {
                 "name": self.project.name,
-                "path": self.project.path(),
-                "common_dir": self.project.common_dir(),
+                "path": self.project.path().to_string_lossy(),
+                "common_dir": self.project.common_dir().map(Path::to_string_lossy),
                 "is_git": self.project.repository.is_some(),
             },
             "focused_worktree": {
                 "id": self.focused().tree.id,
-                "path": self.focused().tree.path,
+                "path": self.focused().tree.path.to_string_lossy(),
                 "branch": self.project.repository.as_ref().map(|_| &self.focused().tree.branch),
                 "is_git": self.project.repository.is_some(),
             },
@@ -1335,13 +1495,19 @@ impl App {
         }
     }
 
-    fn open_path(&mut self, path: PathBuf, agent: Option<AgentKind>) -> Result<()> {
+    fn open_path(
+        &mut self,
+        path: PathBuf,
+        agent: Option<AgentKind>,
+        fresh_tab: bool,
+    ) -> Result<()> {
         let request = self.new_request();
         self.jobs
             .try_send(Job::OpenProject {
                 request,
                 path,
                 agent,
+                fresh_tab,
             })
             .context("command queue is busy")?;
         self.modal = Some(Modal::Loading {
@@ -1361,7 +1527,7 @@ impl App {
                 agent,
             } => {
                 let repository = self.focused_repository()?;
-                self.set_notice(format!("Creating {branch} in a separate worktree..."));
+                let notice = format!("Creating {branch} in a separate worktree...");
                 self.jobs
                     .try_send(Job::Create {
                         repository,
@@ -1371,13 +1537,14 @@ impl App {
                         split: None,
                     })
                     .context("command queue is busy")?;
+                self.set_notice(notice);
             }
             Plan::Open { target, agent } => {
                 let target = targets
                     .iter()
                     .find(|candidate| candidate.id == target)
                     .context("The interpreter selected an unknown project or worktree")?;
-                self.open_path(target.path.clone(), agent)?;
+                self.open_path(target.path.clone(), agent, false)?;
             }
             Plan::Session { agent } => self.spawn(self.focused_index(), agent.as_str(), None)?,
             Plan::Command { command } => self.run_command(command)?,
@@ -1447,7 +1614,10 @@ impl App {
             RestartEnvironment => self.env(index, EnvironmentOp::Restart)?,
             RefreshEnvironment => self.env(index, EnvironmentOp::Status)?,
             EnvironmentLogs => {
-                let args = compose::logs_args(&self.project.workspaces[index].tree)?;
+                let mut args = compose::logs_args(&self.project.workspaces[index].tree)?;
+                // The pane keeps 512 rows of history, so older lines would only be parsed and
+                // dropped.
+                args.extend(["--tail".to_owned(), "512".to_owned()]);
                 self.spawn(index, "logs", Some(("docker".into(), args)))?;
             }
             Preview => {
@@ -1569,16 +1739,37 @@ impl App {
         Ok(())
     }
 
+    /// Esc on a progress dialog only hides it: the job keeps running and its result
+    /// arrives as a notice.
+    fn note_hidden_progress(&mut self, modal: &Modal) {
+        match modal {
+            Modal::Removal {
+                tree, error: None, ..
+            } => {
+                let label = self
+                    .all_workspaces_mut()
+                    .find(|workspace| workspace.tree.id == *tree)
+                    .map_or_else(
+                        || "the checkout".to_owned(),
+                        |workspace| workspace.label().to_owned(),
+                    );
+                self.set_notice(format!(
+                    "Still removing {label}; the result will appear here."
+                ));
+            }
+            Modal::OpeningSplit { .. } => {
+                self.set_notice("Still opening the split; the checkout will open as a tab.");
+            }
+            _ => {}
+        }
+    }
+
     fn modal_key(&mut self, key: KeyEvent) -> Result<()> {
         let Some(mut modal) = self.modal.take() else {
             return Ok(());
         };
-        if key.code == KeyCode::Esc
-            && !matches!(
-                &modal,
-                Modal::Removal { error: None, .. } | Modal::OpeningSplit { .. }
-            )
-        {
+        if key.code == KeyCode::Esc {
+            self.note_hidden_progress(&modal);
             if let Modal::ExistingSplit { layout, .. } = modal {
                 self.modal = Some(Modal::Split {
                     layout,
@@ -1635,7 +1826,7 @@ impl App {
                             match action {
                                 NewTabAction::Home => {
                                     let home = project_path("~", &self.focused().tree.path)?;
-                                    self.open_path(home, None)?;
+                                    self.open_path(home, None, true)?;
                                 }
                                 NewTabAction::Command(command) => self.run_command(command)?,
                             }
@@ -1651,8 +1842,10 @@ impl App {
                 Modal::SwitchProject { selected } => {
                     navigate(key, selected, self.saved_projects.len());
                     if key.code == KeyCode::Enter && *selected < self.saved_projects.len() {
-                        self.switch_project(*selected, None)?;
+                        // A failure after the swap must not bring the picker back: its
+                        // indices describe the order from before.
                         retain = false;
+                        self.switch_project(*selected, None)?;
                     }
                 }
                 Modal::NewWorktree { input, split } => match key.code {
@@ -1773,27 +1966,7 @@ impl App {
                     navigate(key, selected, urls.len());
                     if key.code == KeyCode::Enter {
                         if let Some((_, url)) = urls.get(*selected) {
-                            let url = url.clone();
-                            let tx = self.tx.clone();
-                            std::thread::spawn(move || {
-                                match std::process::Command::new("xdg-open")
-                                    .arg(&url)
-                                    .stdout(std::process::Stdio::null())
-                                    .stderr(std::process::Stdio::null())
-                                    .status()
-                                {
-                                    Ok(status) if status.success() => {}
-                                    Ok(status) => {
-                                        let _ = tx.send(Event::Error(format!(
-                                            "Opening {url} failed: {status}"
-                                        )));
-                                    }
-                                    Err(error) => {
-                                        let _ = tx
-                                            .send(Event::Error(format!("Opening {url}: {error}")));
-                                    }
-                                }
-                            });
+                            self.open_link(url.clone())?;
                         }
                         retain = false;
                     }
@@ -1864,6 +2037,10 @@ impl App {
                                         })
                                         .context("command queue is busy")
                                 })();
+                                if result.is_ok() {
+                                    // Docker must not start on this checkout while Git removes it.
+                                    self.project.workspaces[index].pending = true;
+                                }
                                 self.notice = None;
                                 self.modal = Some(Modal::Removal {
                                     tree,
@@ -1909,14 +2086,11 @@ impl App {
                 Event::Input(crossterm::event::Event::Key(key))
                     if keys::action(*key) == Some(Action::ToggleNative) => {}
                 Event::Input(crossterm::event::Event::Key(key))
-                    if key.code == KeyCode::Esc
-                        && key.kind != KeyEventKind::Release
-                        && !matches!(
-                            &self.modal,
-                            Some(Modal::Removal { error: None, .. } | Modal::OpeningSplit { .. })
-                        ) =>
+                    if key.code == KeyCode::Esc && key.kind != KeyEventKind::Release =>
                 {
-                    self.modal = None;
+                    if let Some(modal) = self.modal.take() {
+                        self.note_hidden_progress(&modal);
+                    }
                     return Ok(true);
                 }
                 Event::Input(crossterm::event::Event::Resize(_, _)) => {}
@@ -1945,8 +2119,16 @@ impl App {
                             return Ok(false);
                         }
                         KeyCode::Char('v' | 'V') => {
-                            let text = clipboard::paste()?;
-                            return self.handle(Event::Input(crossterm::event::Event::Paste(text)));
+                            // The text belongs to what has focus now, not to whatever has
+                            // focus when the read finishes.
+                            if self.native_keys || self.modal.is_none() {
+                                if let Some(session) = self.focused_session() {
+                                    self.paste_from_clipboard(Some(session.id))?;
+                                }
+                            } else {
+                                self.paste_from_clipboard(None)?;
+                            }
+                            return Ok(false);
                         }
                         _ => {}
                     }
@@ -1961,6 +2143,7 @@ impl App {
                     if let Some(session) = self.focused_session() {
                         session.key(key)?;
                     }
+                    self.clear_notice_on_input(key.code == KeyCode::Esc);
                 } else if self.modal.is_some() {
                     self.modal_key(key)?;
                 } else if let Some(action) = action {
@@ -1974,25 +2157,32 @@ impl App {
                 {
                     self.notice = None;
                     self.select_shell()?;
-                } else if let Some(session) = self.focused_session() {
-                    session.key(key)?;
+                } else {
+                    if let Some(session) = self.focused_session() {
+                        session.key(key)?;
+                    }
+                    self.clear_notice_on_input(key.code == KeyCode::Esc);
                 }
             }
             Event::Input(crossterm::event::Event::Paste(text)) => {
                 self.selection = None;
                 self.finish_split_drag();
-                match &mut self.modal {
-                    Some(Modal::Intent(dialog)) if !dialog.pending && !dialog.submitted => {
-                        paste_input(&mut dialog.input, &text, 4096);
+                // Routed like keys: the terminal gets it in native mode or with no dialog,
+                // even behind a progress dialog.
+                if self.native_keys || self.modal.is_none() {
+                    if let Some(session) = self.focused_session() {
+                        session.paste(&text)?;
+                        self.clear_notice_on_input(false);
                     }
-                    Some(Modal::NewWorktree { input, .. }) => paste_input(input, &text, 256),
-                    Some(Modal::OpenProject(picker)) => picker.paste(&text),
-                    None => {
-                        if let Some(session) = self.focused_session() {
-                            session.paste(&text)?;
+                } else {
+                    match &mut self.modal {
+                        Some(Modal::Intent(dialog)) if !dialog.pending && !dialog.submitted => {
+                            paste_input(&mut dialog.input, &text, 4096);
                         }
+                        Some(Modal::NewWorktree { input, .. }) => paste_input(input, &text, 256),
+                        Some(Modal::OpenProject(picker)) => picker.paste(&text),
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
             Event::Input(crossterm::event::Event::Mouse(mouse)) if self.modal.is_none() => {
@@ -2094,6 +2284,21 @@ impl App {
                         return Ok(true);
                     }
                 }
+                if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                    self.clear_notice_on_input(false);
+                }
+                if matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_)) {
+                    // A press that reached a program owns its drag and release wherever
+                    // the pointer goes. A press Crit consumed leaves nothing to forward.
+                    let Some((id, body)) = self.mouse_capture else {
+                        return Ok(false);
+                    };
+                    if matches!(mouse.kind, MouseEventKind::Up(_)) {
+                        self.mouse_capture = None;
+                    }
+                    self.forward_capture(mouse, id, body)?;
+                    return Ok(true);
+                }
                 if let Some(hit) = self
                     .tab_hits
                     .iter()
@@ -2118,7 +2323,9 @@ impl App {
                         pane.body,
                         pane.scrollbar,
                     );
-                    if matches!(mouse.kind, crossterm::event::MouseEventKind::Down(_)) {
+                    if matches!(mouse.kind, crossterm::event::MouseEventKind::Down(_))
+                        && self.project.focus_secondary != secondary
+                    {
                         self.project.focus_secondary = secondary;
                         self.state_dirty = true;
                     }
@@ -2146,8 +2353,7 @@ impl App {
                                 _ => {}
                             }
                         } else if mouse.kind == MouseEventKind::Down(MouseButton::Middle) {
-                            let text = clipboard::paste()?;
-                            session.paste(&text)?;
+                            self.paste_from_clipboard(Some(session.id))?;
                         } else if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
                             let parser = session.parser.lock();
                             let selection = Selection::new(
@@ -2166,11 +2372,18 @@ impl App {
                                 self.selection = Some(selection);
                             } else {
                                 session.mouse(mouse, mouse.column - body.x, mouse.row - body.y)?;
+                                self.mouse_capture = Some((session.id, body));
                             }
                         } else {
                             session.mouse(mouse, mouse.column - body.x, mouse.row - body.y)?;
+                            if matches!(mouse.kind, MouseEventKind::Down(_)) {
+                                self.mouse_capture = Some((session.id, body));
+                            }
                         }
                     }
+                }
+                if mouse.kind == MouseEventKind::Moved {
+                    return Ok(false);
                 }
             }
             Event::Input(crossterm::event::Event::Resize(cols, rows)) => {
@@ -2180,10 +2393,25 @@ impl App {
                 self.finish_split_drag();
                 self.split_divider = None;
                 self.selection = None;
+                self.mouse_capture = None;
                 self.tab_hits.clear();
             }
+            // Pointer motion over a dialog changes nothing worth a frame.
+            Event::Input(crossterm::event::Event::Mouse(mouse))
+                if mouse.kind == MouseEventKind::Moved =>
+            {
+                return Ok(false);
+            }
+            // A dialog hides the pane, but a release still ends the drag its program began.
+            Event::Input(crossterm::event::Event::Mouse(mouse))
+                if matches!(mouse.kind, MouseEventKind::Up(_)) =>
+            {
+                if let Some((id, body)) = self.mouse_capture.take() {
+                    self.forward_capture(mouse, id, body)?;
+                }
+            }
             Event::Input(_) => {}
-            Event::Metadata(trees) => return Ok(self.apply_metadata(trees)),
+            Event::Metadata(listings) => return Ok(self.apply_metadata(listings)),
             Event::Dirty(id) => {
                 return Ok(self.panes.iter().any(|p| {
                     self.project.workspaces[p.workspace]
@@ -2201,6 +2429,32 @@ impl App {
                     }
                 }
             }
+            Event::Clipboard { ty, data } => {
+                clipboard::copy_encoded(&ty, &data).context("forwarding a pane's OSC 52 copy")?;
+                return Ok(false);
+            }
+            Event::ClipboardText { target, result } => match result {
+                Err(error) => self.set_notice(error),
+                Ok(text) => {
+                    // The read took a while: paste only where it was asked for.
+                    let terminal_has_input = self.native_keys || self.modal.is_none();
+                    let still_there = match target {
+                        Some(id) => {
+                            terminal_has_input
+                                && self
+                                    .focused_session()
+                                    .is_some_and(|session| session.id == id)
+                        }
+                        None => !terminal_has_input,
+                    };
+                    if still_there {
+                        return self.handle(Event::Input(crossterm::event::Event::Paste(text)));
+                    }
+                    self.set_notice(
+                        "Clipboard paste dropped: focus changed before the clipboard answered.",
+                    );
+                }
+            },
             Event::Agent(update) => {
                 let mut identity_changed = false;
                 for workspace in self.all_workspaces_mut() {
@@ -2311,17 +2565,18 @@ impl App {
                     }
                 }
             }
-            Event::Projects { base, projects } => {
-                if let Some(Modal::OpenProject(picker)) = &mut self.modal {
-                    if picker.base == base {
-                        picker.set_projects(projects);
-                    }
+            Event::Projects { request, projects } => {
+                if let Some(Modal::OpenProject(picker)) = &mut self.modal
+                    && picker.request == request
+                {
+                    picker.set_projects(projects);
                 }
             }
             Event::ProjectOpened {
                 request,
                 result,
                 agent,
+                fresh_tab,
             } => {
                 let expected = match &self.modal {
                     Some(Modal::OpenProject(picker)) => picker.pending && picker.request == request,
@@ -2334,7 +2589,7 @@ impl App {
                     return Ok(false);
                 }
                 match result {
-                    Ok(project) => self.open_project(project, agent)?,
+                    Ok(project) => self.open_project(project, agent, fresh_tab)?,
                     Err(error) => {
                         if let Some(Modal::OpenProject(picker)) = &mut self.modal {
                             picker.pending = false;
@@ -2363,6 +2618,7 @@ impl App {
                         self.workspace_changed();
                         let has_compose = compose::has_config(&tree);
                         if self.project.common_dir() != Some(project.as_path()) {
+                            let mut not_started = false;
                             if let Some(saved) = self
                                 .saved_projects
                                 .iter_mut()
@@ -2372,22 +2628,27 @@ impl App {
                                 workspace.source =
                                     preparation_error.as_ref().map(|_| source.clone());
                                 if has_compose && preparation_error.is_none() {
-                                    self.jobs
+                                    // The tab exists whether or not the queue took the start.
+                                    workspace.pending = self
+                                        .jobs
                                         .try_send(Job::Environment {
                                             tree: workspace.tree.clone(),
                                             operation: EnvironmentOp::Up,
                                             source: workspace.source.clone(),
                                         })
-                                        .context("command queue is busy")?;
-                                    workspace.pending = true;
+                                        .is_ok();
+                                    not_started = !workspace.pending;
                                 }
                                 saved.workspaces.push(workspace);
                             }
                             if let Some(error) = preparation_error {
                                 self.set_notice(format!("Worktree created; local environment preparation failed: {error}"));
+                            } else if not_started {
+                                self.set_notice(ENVIRONMENT_NOT_STARTED);
                             }
                             return Ok(true);
                         }
+                        let mut not_started = false;
                         let index = if let Some(index) = self
                             .project
                             .workspaces
@@ -2402,7 +2663,7 @@ impl App {
                             let index = self.project.workspaces.len() - 1;
                             // Creation owns the initial start; do not enqueue a redundant status query.
                             if has_compose && preparation_error.is_none() {
-                                self.env(index, EnvironmentOp::Up)?;
+                                not_started = self.env(index, EnvironmentOp::Up).is_err();
                             }
                             index
                         };
@@ -2419,6 +2680,8 @@ impl App {
                         }
                         if let Some(error) = preparation_error {
                             self.set_notice(format!("Worktree created; local environment preparation failed: {error}. Fix the files, then start its environment again."));
+                        } else if not_started {
+                            self.set_notice(ENVIRONMENT_NOT_STARTED);
                         } else {
                             self.set_notice(if has_compose {
                                 "Worktree created; starting its isolated Docker environment."
@@ -2428,7 +2691,9 @@ impl App {
                         }
                     }
                     Err(error) => {
-                        if self.modal.is_none()
+                        // A restored dialog could not be answered while the terminal owns the keys.
+                        if !self.native_keys
+                            && self.modal.is_none()
                             && self.project.common_dir() == Some(project.as_path())
                             && let Some((_, workspace, mut modal)) = pending
                             && self.focused().tree.id == workspace
@@ -2460,14 +2725,15 @@ impl App {
                         let summary = (!matches!(operation, EnvironmentOp::Probe))
                             .then(|| environment_summary(workspace.label(), &environment));
                         workspace.environment = Some(environment);
-                        if !active {
-                        } else if let Some(summary) = summary {
+                        // A background probe never touches the notice.
+                        if active && let Some(summary) = summary {
                             self.set_notice(summary);
-                        } else {
-                            self.notice = None;
                         }
                     }
-                    Err(error) => self.set_notice(error),
+                    Err(error) if !matches!(operation, EnvironmentOp::Probe) => {
+                        self.set_notice(error)
+                    }
+                    Err(_) => {}
                 }
                 self.state_dirty |= source_changed;
             }
@@ -2523,10 +2789,21 @@ impl App {
                 preparation_error,
                 result,
             } => {
-                if self.project.common_dir() != Some(project.as_path())
-                    || !matches!(&self.modal, Some(Modal::OpeningSplit { request: pending }) if *pending == request)
-                {
-                    return Ok(false);
+                // Esc hides the progress dialog, so the result can arrive without it.
+                let waiting = matches!(&self.modal, Some(Modal::OpeningSplit { request: pending }) if *pending == request);
+                if self.project.common_dir() != Some(project.as_path()) {
+                    // The project was left while the checkout opened: only report it.
+                    if waiting {
+                        self.modal = None;
+                    }
+                    match result {
+                        Ok((tree, _)) => self.set_notice(format!(
+                            "{} is ready in the project you left; open it there from Open existing worktree.",
+                            tree.label()
+                        )),
+                        Err(error) => self.set_notice(error),
+                    }
+                    return Ok(true);
                 }
                 match result {
                     Ok((tree, created)) if tree.id != self.focused().tree.id => {
@@ -2543,35 +2820,59 @@ impl App {
                             self.project.workspaces.push(workspace);
                             self.project.workspaces.len() - 1
                         };
-                        self.modal = None;
+                        if waiting {
+                            self.modal = None;
+                        }
+                        let mut not_started = false;
                         if created
                             && preparation_error.is_none()
                             && compose::has_config(&self.project.workspaces[index].tree)
                             && !self.project.workspaces[index].pending
                         {
-                            self.env(index, EnvironmentOp::Up)?;
+                            not_started = self.env(index, EnvironmentOp::Up).is_err();
                         }
-                        self.split_with(layout, index, false)?;
+                        if waiting {
+                            self.split_with(layout, index, false)?;
+                        } else {
+                            // The layout may have changed since Esc, so only add the tab.
+                            self.workspace_changed();
+                        }
                         if let Some(error) = preparation_error {
                             self.set_notice(format!("Worktree created; local environment preparation failed: {error}. Fix the files, then start its environment again."));
+                        } else if not_started {
+                            self.set_notice(ENVIRONMENT_NOT_STARTED);
+                        } else if !waiting {
+                            let label = self.project.workspaces[index].label().to_owned();
+                            self.set_notice(format!("{label} is ready as a tab."));
                         }
                     }
                     result => {
+                        // The picker comes back only where it can be used: not after Esc hid the
+                        // progress dialog, and not in native mode, where the terminal owns the keys.
+                        let restore = waiting && !self.native_keys;
                         let error = match result {
                             Err(error) => error,
-                            Ok(_) => "This checkout is already in the focused pane. Choose another, or go back and use Split terminal.".to_owned(),
+                            Ok(_) if restore => "This checkout is already in the focused pane. Choose another, or go back and use Split terminal.".to_owned(),
+                            Ok(_) => "This checkout is already in the focused pane.".to_owned(),
                         };
-                        self.modal = Some(Modal::ExistingSplit {
-                            layout,
-                            choices,
-                            selected,
-                            error: Some(error),
-                        });
+                        if restore {
+                            self.modal = Some(Modal::ExistingSplit {
+                                layout,
+                                choices,
+                                selected,
+                                error: Some(error),
+                            });
+                        } else {
+                            if waiting {
+                                self.modal = None;
+                            }
+                            self.set_notice(error);
+                        }
                     }
                 }
             }
             Event::Removed { tree, result } => match result {
-                Ok(()) => {
+                Ok(warning) => {
                     self.workspace_changed();
                     if let Some(index) = self
                         .project
@@ -2609,9 +2910,19 @@ impl App {
                             self.saved_projects[project].close_workspace(index);
                         }
                     }
-                    self.set_notice("Checkout removed; Git branch and Docker volumes retained.");
+                    self.set_notice(match warning {
+                        Some(warning) => format!(
+                            "Checkout removed; Git branch retained. Docker could not be checked ({warning}); if this worktree's stack still exists, run: docker compose -p crit-{tree} down"
+                        ),
+                        None => {
+                            "Checkout removed; Git branch and Docker volumes retained.".to_owned()
+                        }
+                    });
                 }
                 Err(error) => {
+                    if let Some(workspace) = self.all_workspaces_mut().find(|w| w.tree.id == tree) {
+                        workspace.pending = false;
+                    }
                     if let Some(Modal::Removal {
                         tree: pending,
                         error: failure,
@@ -2658,6 +2969,27 @@ fn folder_name(path: &Path) -> String {
         .collect()
 }
 
+/// The project's display name: its main checkout's folder. A bare repository has no checkout,
+/// so its entry is the repository itself (`myapp/.bare`, `app.git`), which is named after the
+/// folder that holds it instead.
+fn project_name(main_tree: &Path, common_dir: &Path) -> String {
+    let name = folder_name(main_tree);
+    if main_tree != common_dir {
+        return name;
+    }
+    if name.starts_with('.') {
+        return main_tree
+            .parent()
+            .map(folder_name)
+            .filter(|parent| !parent.is_empty())
+            .unwrap_or(name);
+    }
+    match name.strip_suffix(".git") {
+        Some(stem) if !stem.is_empty() => stem.to_owned(),
+        _ => name,
+    }
+}
+
 fn edit_input(key: KeyEvent, input: &mut String, limit: usize) {
     match key.code {
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => input.clear(),
@@ -2678,7 +3010,15 @@ fn edit_input(key: KeyEvent, input: &mut String, limit: usize) {
 }
 
 fn paste_input(input: &mut String, text: &str, limit: usize) {
-    for c in text.chars().filter(|c| !c.is_control()) {
+    for c in text.chars() {
+        // Pasted line breaks and tabs become one space, so lines do not run together.
+        let c = if !c.is_control() {
+            c
+        } else if c.is_whitespace() && !input.is_empty() && !input.ends_with(' ') {
+            ' '
+        } else {
+            continue;
+        };
         if input.len() + c.len_utf8() > limit {
             break;
         }
@@ -2699,35 +3039,48 @@ fn navigate(key: KeyEvent, selected: &mut usize, count: usize) {
     }
 }
 
+/// Serializes an intent destination's path as UTF-8 text; invalid bytes become U+FFFD.
+fn lossy_path<S: serde::Serializer>(
+    path: &Path,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(&path.to_string_lossy())
+}
+
 fn intent_targets(
     base: &Path,
     repository: Option<&worktree::Repository>,
     known_projects: &[PathBuf],
 ) -> Result<Vec<IntentTarget>> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let mut projects = worktree::projects(base, home.as_deref());
-    projects.extend_from_slice(known_projects);
-    projects.sort();
-    projects.dedup();
-    let trees = repository
+    let discovered = worktree::projects(base, home.as_deref());
+    let mut trees = repository
         .map(worktree::list)
         .transpose()?
         .unwrap_or_default();
-    let mut targets = Vec::with_capacity(projects.len() + trees.len());
-    for path in projects {
-        targets.push(IntentTarget {
-            id: targets.len(),
-            kind: "project",
-            name: path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
-            path,
-            branch: None,
-        });
-    }
+    // A bare repository, or a checkout deleted outside Crit, is not a place to open.
+    trees.retain(Worktree::is_checkout);
+    Ok(ranked_intent_targets(trees, known_projects, discovered))
+}
+
+/// Request bytes one destination costs beyond its name and path: keys, quotes, id, branch.
+const INTENT_TARGET_OVERHEAD: usize = 60;
+/// What the destinations may take of the interpreter's 64 KiB request cap; the context and
+/// conversation need the rest.
+const INTENT_TARGET_BUDGET: usize = 48 * 1024;
+
+/// Destinations for Ask Crit, most relevant first: the active repository's worktrees, the
+/// open projects, then the discovered ones. Discovered projects stop at the byte budget, so
+/// a huge scan cannot make every request exceed the cap.
+fn ranked_intent_targets(
+    trees: Vec<Worktree>,
+    known: &[PathBuf],
+    mut discovered: Vec<PathBuf>,
+) -> Vec<IntentTarget> {
+    let mut targets = Vec::with_capacity(trees.len() + known.len() + discovered.len());
+    let mut bytes = 0;
     for tree in trees {
+        bytes += tree.path.as_os_str().len() + 2 * tree.branch.len() + INTENT_TARGET_OVERHEAD;
         targets.push(IntentTarget {
             id: targets.len(),
             kind: "worktree",
@@ -2736,13 +3089,68 @@ fn intent_targets(
             branch: Some(tree.branch),
         });
     }
-    Ok(targets)
+    let mut open = known.to_vec();
+    open.sort();
+    open.dedup();
+    discovered.retain(|path| open.binary_search(path).is_err());
+    let projects = open
+        .into_iter()
+        .map(|path| (path, false))
+        .chain(discovered.into_iter().map(|path| (path, true)));
+    for (path, trimmed) in projects {
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let cost = path.as_os_str().len() + name.len() + INTENT_TARGET_OVERHEAD;
+        if trimmed && bytes + cost > INTENT_TARGET_BUDGET {
+            break;
+        }
+        bytes += cost;
+        targets.push(IntentTarget {
+            id: targets.len(),
+            kind: "project",
+            name,
+            path,
+            branch: None,
+        });
+    }
+    targets
 }
 
 fn prepare_local_environment(source: &Path, target: &Worktree) -> Result<()> {
     let repository = worktree::discover(source)?;
     let source = crate::selected_tree(&repository, source)?;
     compose::prepare_local_files(&source, target)
+}
+
+/// Runs one Docker operation and reports it as the `Environment` event.
+fn environment_event(tree: Worktree, operation: EnvironmentOp, source: Option<PathBuf>) -> Event {
+    let mut prepared = false;
+    let result = (|| {
+        if matches!(operation, EnvironmentOp::Up | EnvironmentOp::Restart)
+            && let Some(source) = source
+        {
+            // A source that no longer exists can never be retried; use the files in place.
+            if source.try_exists().unwrap_or(true) {
+                prepare_local_environment(&source, &tree)?;
+            }
+            prepared = true;
+        }
+        match operation {
+            EnvironmentOp::Up => compose::up(&tree),
+            EnvironmentOp::Down => compose::down(&tree),
+            EnvironmentOp::Restart => compose::restart(&tree),
+            EnvironmentOp::Status | EnvironmentOp::Probe => compose::status(&tree),
+        }
+    })();
+    Event::Environment {
+        tree: tree.id,
+        operation,
+        prepared,
+        result: result.map_err(|e| format!("{e:#}")),
+    }
 }
 
 fn start_worker(tx: SyncSender<Event>) -> Result<SyncSender<Job>> {
@@ -2752,10 +3160,10 @@ fn start_worker(tx: SyncSender<Event>) -> Result<SyncSender<Job>> {
         .spawn(move || {
             while let Ok(job) = rx.recv() {
                 let event = match job {
-                    Job::Projects(base) => {
+                    Job::Projects { request, base } => {
                         let home = std::env::var_os("HOME").map(PathBuf::from);
                         let projects = worktree::projects(&base, home.as_deref());
-                        Event::Projects { base, projects }
+                        Event::Projects { request, projects }
                     }
                     Job::IntentTargets {
                         request,
@@ -2771,10 +3179,12 @@ fn start_worker(tx: SyncSender<Event>) -> Result<SyncSender<Job>> {
                         request,
                         path,
                         agent,
+                        fresh_tab,
                     } => Event::ProjectOpened {
                         request,
                         result: Project::open(&path).map_err(|e| format!("{e:#}")),
                         agent,
+                        fresh_tab,
                     },
                     Job::Create {
                         repository,
@@ -2804,7 +3214,12 @@ fn start_worker(tx: SyncSender<Event>) -> Result<SyncSender<Job>> {
                         repository,
                     } => Event::Worktrees {
                         request,
-                        result: worktree::list(&repository).map_err(|e| format!("{e:#}")),
+                        result: worktree::list(&repository)
+                            .map(|mut trees| {
+                                trees.retain(Worktree::is_checkout);
+                                trees
+                            })
+                            .map_err(|e| format!("{e:#}")),
                         project: repository.common_dir,
                     },
                     Job::SplitTargets { request, repository, focused, layout } => Event::SplitTargets {
@@ -2831,26 +3246,33 @@ fn start_worker(tx: SyncSender<Event>) -> Result<SyncSender<Job>> {
                         }
                     }
                     Job::RefreshMetadata(repositories) => {
-                        let mut trees = Vec::new();
+                        let mut listings = Vec::new();
                         for repository in repositories {
                             // Checkout can temporarily make Git metadata unreadable.
                             // Keep the previous labels and retry without notice spam.
                             if let Ok(found) = worktree::list(&repository) {
-                                trees.extend(found);
+                                listings.push((repository.common_dir, found));
                             }
                         }
-                        Event::Metadata(trees)
+                        Event::Metadata(listings)
                     }
                     Job::Remove { repository, tree } => {
-                        let result = (|| -> Result<()> {
-                            if compose::has_config(&tree)
-                                && !compose::status(&tree)?.services.is_empty()
-                            {
-                                anyhow::bail!(
-                                    "Stop this worktree's Docker environment first: Esc, then F1 → F2 → Stop environment."
-                                );
-                            }
-                            worktree::remove(&repository, &tree)
+                        let result = (|| -> Result<Option<String>> {
+                            // Only an environment Crit started can hold containers, so a tree
+                            // without one is removable even where Docker cannot run. Docker
+                            // that cannot answer is no reason to refuse either: the removal
+                            // goes ahead and the notice names the stack to clean up.
+                            let warning = match compose::existing_status(&tree) {
+                                Ok(Some(environment)) if !environment.services.is_empty() => {
+                                    anyhow::bail!(
+                                        "Stop this worktree's Docker environment first: Esc, then F1 → F2 → Stop environment."
+                                    )
+                                }
+                                Ok(_) => None,
+                                Err(error) => Some(format!("{error:#}").trim_end().to_owned()),
+                            };
+                            worktree::remove(&repository, &tree)?;
+                            Ok(warning)
                         })();
                         Event::Removed {
                             tree: tree.id,
@@ -2862,28 +3284,25 @@ fn start_worker(tx: SyncSender<Event>) -> Result<SyncSender<Job>> {
                         operation,
                         source,
                     } => {
-                        let mut prepared = false;
-                        let result = (|| {
-                            if matches!(operation, EnvironmentOp::Up | EnvironmentOp::Restart)
-                                && let Some(source) = source
-                            {
-                                prepare_local_environment(&source, &tree)?;
-                                prepared = true;
-                            }
-                            match operation {
-                                EnvironmentOp::Up => compose::up(&tree),
-                                EnvironmentOp::Down => compose::down(&tree),
-                                EnvironmentOp::Restart => compose::restart(&tree),
-                                EnvironmentOp::Status | EnvironmentOp::Probe => {
-                                    compose::status(&tree)
-                                }
-                            }
-                        })();
-                        Event::Environment {
-                            tree: tree.id,
-                            operation,
-                            prepared,
-                            result: result.map_err(|e| format!("{e:#}")),
+                        // Docker can run for minutes; other jobs must not queue behind it.
+                        // `Workspace::pending` keeps one operation per worktree in flight.
+                        let id = tree.id.clone();
+                        let environment_tx = tx.clone();
+                        match std::thread::Builder::new()
+                            .name("environment".into())
+                            .spawn(move || {
+                                let _ =
+                                    environment_tx.send(environment_event(tree, operation, source));
+                            }) {
+                            Ok(_) => continue,
+                            Err(error) => Event::Environment {
+                                tree: id,
+                                operation,
+                                prepared: false,
+                                result: Err(format!(
+                                    "could not start the environment thread: {error}"
+                                )),
+                            },
                         }
                     }
                 };
@@ -2895,12 +3314,18 @@ fn start_worker(tx: SyncSender<Event>) -> Result<SyncSender<Job>> {
     Ok(jobs)
 }
 
+/// Set while a `TerminalGuard` holds the terminal, so the panic hook and the guard restore it
+/// exactly once: a second `?1049l` would move the cursor back over the panic message, and a
+/// second `PopKeyboardEnhancementFlags` would pop the shell's own keyboard mode.
+static TERMINAL_OWNED: AtomicBool = AtomicBool::new(false);
+
 struct TerminalGuard {
     use_kitty: bool,
 }
 impl TerminalGuard {
     fn enter(use_kitty: bool) -> Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
+        TERMINAL_OWNED.store(true, Ordering::Release);
         let guard = Self { use_kitty };
         execute!(
             io::stdout(),
@@ -2914,10 +3339,13 @@ impl TerminalGuard {
         }
         Ok(guard)
     }
-}
-impl Drop for TerminalGuard {
-    fn drop(&mut self) {
-        if self.use_kitty {
+
+    /// Hands the terminal back. Only the first call does anything.
+    fn restore(use_kitty: bool) {
+        if !TERMINAL_OWNED.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        if use_kitty {
             let _ = kitty::leave(&mut io::stdout());
         }
         let _ = execute!(
@@ -2932,6 +3360,25 @@ impl Drop for TerminalGuard {
         let _ = io::stdout().flush();
     }
 }
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        Self::restore(self.use_kitty);
+    }
+}
+
+/// Restores the terminal before the default hook prints a UI-thread panic. Otherwise the
+/// message lands on the alternate screen, which leaving it discards. Panics on other threads
+/// keep the previous behavior, so the UI stays usable after them.
+fn install_panic_hook(use_kitty: bool) {
+    let ui = std::thread::current().id();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if std::thread::current().id() == ui {
+            TerminalGuard::restore(use_kitty);
+        }
+        previous(info);
+    }));
+}
 
 fn choose_project(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -2939,23 +3386,18 @@ fn choose_project(
     pending: &mut VecDeque<Event>,
     jobs: &SyncSender<Job>,
     path: &Path,
-    error: Option<anyhow::Error>,
-    update_notice: Option<&str>,
+    notice: Option<&str>,
     use_kitty: bool,
 ) -> Result<Option<(Project, bool, bool)>> {
-    let launch_path = std::env::current_dir()?;
+    let launch_path = std::env::current_dir().context("the current folder no longer exists")?;
     let base = if path.is_dir() {
         path.to_path_buf()
     } else {
         launch_path.clone()
     };
-    let mut notice = if let Some(error) = error {
-        format!("{error:#}")
-    } else if let Some(notice) = update_notice {
-        notice.to_owned()
-    } else {
-        "Choose New terminal for a shell here, or open a project or any folder.".into()
-    };
+    let mut notice = notice
+        .unwrap_or("Choose New terminal for a shell here, or open a project or any folder.")
+        .to_owned();
     let mut picker = ProjectPicker::new(base, jobs, 0)?;
     picker.terminal_path = Some(launch_path.clone());
     let mut native_keys = false;
@@ -2996,7 +3438,7 @@ fn choose_project(
             Event::Input(crossterm::event::Event::Paste(text)) if interaction_visible => {
                 picker.paste(&text);
             }
-            Event::Projects { base, projects } if picker.base == base => {
+            Event::Projects { request, projects } if picker.request == request => {
                 picker.set_projects(projects);
             }
             Event::ProjectOpened {
@@ -3015,37 +3457,103 @@ fn choose_project(
     }
 }
 
+/// Reopens the saved projects without ever failing as a whole: a folder, worktree, chat or
+/// agent that cannot be reopened is left out and described in the returned lines, and a split
+/// that loses a pane falls back to full width on the survivor. The first element is `None`
+/// when no project could be reopened.
 fn restore_projects(
     snapshot: &restore::Snapshot,
     socket: &Path,
     tx: &SyncSender<Event>,
     size: ratatui::layout::Size,
     next_session: &mut u64,
-) -> Result<(Project, Vec<Project>)> {
+) -> (Option<(Project, Vec<Project>)>, Vec<String>) {
+    // One `opencode db` call covers every saved OpenCode chat; OMP chats are read per file.
+    let opencode_ids: Vec<&str> = snapshot
+        .projects
+        .iter()
+        .flat_map(|project| &project.workspaces)
+        .flat_map(|workspace| &workspace.sessions)
+        .filter(|session| session.kind == "opencode")
+        .filter_map(|session| session.resume.as_deref())
+        .collect();
+    let opencode_chats =
+        integration::existing_opencode_chats(&opencode_ids).map_err(|error| format!("{error:#}"));
+    let mut skipped = Vec::new();
     let mut projects = Vec::with_capacity(snapshot.projects.len());
-    for (order, saved) in snapshot.projects.iter().enumerate() {
-        let mut project = Project::open(&saved.workspaces[0].path)
-            .with_context(|| format!("restore project {}", saved.workspaces[0].path.display()))?;
-        for (index, saved_workspace) in saved.workspaces.iter().enumerate() {
-            let tree = if index == 0 {
-                project.workspaces.remove(0).tree
-            } else {
-                let mut candidate = Project::open(&saved_workspace.path).with_context(|| {
-                    format!("restore worktree {}", saved_workspace.path.display())
-                })?;
-                anyhow::ensure!(
-                    project.same_project(&candidate),
-                    "saved worktree {} no longer belongs to its project",
-                    saved_workspace.path.display()
-                );
-                candidate.workspaces.remove(0).tree
-            };
-            let mut workspace = Workspace::new(tree);
-            workspace.source = saved_workspace.source.clone();
-            for saved_session in &saved_workspace.sessions {
+    let mut current = None;
+    for (index, saved) in snapshot.projects.iter().enumerate() {
+        let Some(mut project) = restore_project(
+            saved,
+            &opencode_chats,
+            socket,
+            tx,
+            size,
+            next_session,
+            &mut skipped,
+        ) else {
+            continue;
+        };
+        project.order = projects.len() as u64;
+        if index == snapshot.active_project {
+            current = Some(projects.len());
+        }
+        projects.push(project);
+    }
+    if projects.is_empty() {
+        return (None, skipped);
+    }
+    // If the current project itself was left out, the first one that reopened takes its place.
+    let current = projects.remove(current.unwrap_or(0));
+    (Some((current, projects)), skipped)
+}
+
+/// One saved project, or `None` when none of its folders reopened. Every item that cannot be
+/// reopened adds a line to `skipped`.
+fn restore_project(
+    saved: &restore::SavedProject,
+    opencode_chats: &Result<HashSet<String>, String>,
+    socket: &Path,
+    tx: &SyncSender<Event>,
+    size: ratatui::layout::Size,
+    next_session: &mut u64,
+    skipped: &mut Vec<String>,
+) -> Option<Project> {
+    let mut project: Option<Project> = None;
+    // Where each saved workspace, and each saved session of the active one, ended up.
+    let mut workspaces: Vec<Option<usize>> = Vec::with_capacity(saved.workspaces.len());
+    let mut active_sessions: Vec<Option<usize>> = Vec::new();
+    for (index, saved_workspace) in saved.workspaces.iter().enumerate() {
+        let path = &saved_workspace.path;
+        let mut opened = match Project::open(path) {
+            Ok(opened) => opened,
+            Err(error) => {
+                skipped.push(format!("{}: {error:#}", path.display()));
+                workspaces.push(None);
+                continue;
+            }
+        };
+        if let Some(project) = &project
+            && !project.same_project(&opened)
+        {
+            skipped.push(format!(
+                "{}: no longer part of {}",
+                path.display(),
+                project.name
+            ));
+            workspaces.push(None);
+            continue;
+        }
+        let tree = opened.workspaces.remove(0).tree;
+        let project = project.get_or_insert(opened);
+        let mut workspace = Workspace::new(tree);
+        workspace.source = saved_workspace.source.clone();
+        let mut sessions = Vec::with_capacity(saved_workspace.sessions.len());
+        for saved_session in &saved_workspace.sessions {
+            let spawned = check_resume(saved_session, opencode_chats).and_then(|()| {
                 let id = *next_session;
                 *next_session += 1;
-                let session = Session::spawn(
+                Session::spawn(
                     id,
                     &saved_session.kind,
                     saved_session.resume.as_deref(),
@@ -3056,33 +3564,85 @@ fn restore_projects(
                     size.width.saturating_sub(2),
                     None,
                 )
-                .with_context(|| {
-                    format!(
-                        "restore {} session in {}",
+            });
+            match spawned {
+                Ok(session) => {
+                    sessions.push(Some(workspace.sessions.len()));
+                    workspace.sessions.push(session);
+                }
+                Err(error) => {
+                    skipped.push(format!(
+                        "{} session in {}: {error:#}",
                         saved_session.kind,
-                        workspace.tree.path.display()
-                    )
-                })?;
-                workspace.sessions.push(session);
+                        path.display()
+                    ));
+                    sessions.push(None);
+                }
             }
-            workspace.selected = saved_workspace.selected;
-            project.workspaces.push(workspace);
         }
-        project.active = saved.active;
-        project.secondary = saved.secondary;
-        project.secondary_session = saved.secondary_session;
+        workspace.selected = sessions
+            .get(saved_workspace.selected)
+            .copied()
+            .flatten()
+            .unwrap_or(0);
+        workspaces.push(Some(project.workspaces.len()));
+        project.workspaces.push(workspace);
+        if index == saved.active {
+            active_sessions = sessions;
+        }
+    }
+    let mut project = project?;
+    let active = workspaces.get(saved.active).copied().flatten();
+    let secondary = saved
+        .secondary
+        .map(|index| workspaces.get(index).copied().flatten());
+    let secondary_session = saved
+        .secondary_session
+        .map(|index| active_sessions.get(index).copied().flatten());
+    // The split survives only if both panes do; otherwise it is full width on what is left,
+    // which keeps every invariant `Snapshot::validate` checks.
+    if let Some(active) = active
+        && let Some(Some(secondary)) = secondary
+        && secondary_session.is_none_or(|session| {
+            session.is_some_and(|session| session != project.workspaces[active].selected)
+        })
+    {
+        project.active = active;
+        project.secondary = Some(secondary);
+        project.secondary_session = secondary_session.flatten();
         project.focus_secondary = saved.focus_secondary;
         project.layout = match saved.layout {
             restore::SavedLayout::Full => LayoutMode::Full,
             restore::SavedLayout::Vertical => LayoutMode::Vertical,
             restore::SavedLayout::Horizontal => LayoutMode::Horizontal,
         };
-        project.split_ratio = saved.split_ratio;
-        project.order = order as u64;
-        projects.push(project);
+    } else {
+        project.active = active.or(secondary.flatten()).unwrap_or(0);
     }
-    let current = projects.remove(snapshot.active_project);
-    Ok((current, projects))
+    project.split_ratio = saved.split_ratio;
+    Some(project)
+}
+
+/// Why a saved chat cannot be resumed. OMP chats are read here; every OpenCode chat was looked
+/// up at once in `opencode`.
+fn check_resume(
+    session: &restore::SavedSession,
+    opencode: &Result<HashSet<String>, String>,
+) -> Result<()> {
+    let Some(identity) = session.resume.as_deref() else {
+        return Ok(());
+    };
+    integration::validate_resume(&session.kind, identity)?;
+    if session.kind == "opencode" {
+        match opencode {
+            Ok(chats) => anyhow::ensure!(
+                chats.contains(identity),
+                "saved OpenCode chat does not exist: {identity}"
+            ),
+            Err(error) => anyhow::bail!("{error}"),
+        }
+    }
+    Ok(())
 }
 
 pub fn run(
@@ -3110,6 +3670,7 @@ pub fn run(
             }
         })?;
     let _guard = TerminalGuard::enter(use_kitty)?;
+    install_panic_hook(use_kitty);
     std::thread::Builder::new()
         .name("input".into())
         .spawn(move || {
@@ -3131,7 +3692,7 @@ pub fn run(
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let startup = updates::run(&mut terminal, &rx);
     let updates::Startup {
-        notice: mut update_notice,
+        notice: update_notice,
         mut pending,
     } = match startup {
         Ok(Some(startup)) => startup,
@@ -3140,12 +3701,17 @@ pub fn run(
             return result.map(|_| ());
         }
     };
+    // Everything startup has to say, shown together. `sticky` keeps it past terminal input:
+    // it reports that saving is off or that saved items were left out.
+    let mut notices: Vec<String> = update_notice.into_iter().collect();
+    let mut sticky = false;
     let mut store = match restore::Store::open() {
         Ok(store) => Some(store),
         Err(error) => {
-            update_notice = Some(format!(
+            notices.push(format!(
                 "Workspace restoration/saving unavailable: {error:#}. This window will not replace the saved workspace."
             ));
+            sticky = true;
             None
         }
     };
@@ -3157,9 +3723,10 @@ pub fn run(
                 .flatten()
                 .filter(|snapshot| !snapshot.projects.is_empty()),
             Err(error) => {
-                update_notice = Some(format!(
+                notices.push(format!(
                     "Saved workspace could not be loaded: {error:#}. Original state retained; saving disabled. Use --fresh to replace it."
                 ));
+                sticky = true;
                 store = None;
                 None
             }
@@ -3167,28 +3734,47 @@ pub fn run(
     };
     let server = integration::start(tx.clone())?;
     let mut next_session = 1;
-    let restored = match snapshot
-        .as_ref()
-        .map(|snapshot| {
-            restore_projects(
-                snapshot,
-                &server.socket_path,
-                &tx,
-                terminal.size()?,
-                &mut next_session,
-            )
-        })
-        .transpose()
-    {
-        Ok(restored) => restored,
-        Err(error) => {
-            update_notice = Some(format!(
-                "Saved workspace could not be restored: {error:#}. Original state retained; saving disabled. Fix the cause and restart, or use --fresh."
-            ));
-            store = None;
-            None
-        }
+    let (restored, skipped) = match &snapshot {
+        Some(snapshot) => restore_projects(
+            snapshot,
+            &server.socket_path,
+            &tx,
+            terminal.size()?,
+            &mut next_session,
+        ),
+        None => (None, Vec::new()),
     };
+    if !skipped.is_empty() {
+        // Keep the file as it was before the first checkpoint replaces it. A snapshot only
+        // loads through a store, so both exist here.
+        let kept = match (&store, &snapshot) {
+            (Some(store), Some(snapshot)) => store.back_up(snapshot),
+            _ => Err(anyhow::anyhow!("no saved workspace is open")),
+        };
+        let items = format!(
+            "{} item{}",
+            skipped.len(),
+            if skipped.len() == 1 { "" } else { "s" }
+        );
+        let summary = match kept {
+            Ok(backup) if restored.is_some() => format!(
+                "Reopened the saved workspace without the {items} above. The previous workspace file is kept at {}.",
+                backup.display()
+            ),
+            Ok(backup) => format!(
+                "None of the saved projects could be reopened. The previous workspace file is kept at {}.",
+                backup.display()
+            ),
+            Err(error) => {
+                store = None;
+                format!(
+                    "The items above could not be reopened, and the previous workspace file could not be kept ({error:#}); saving is disabled for this window."
+                )
+            }
+        };
+        notices.push(format!("{}\n{summary}", skipped.join("\n")));
+        sticky = true;
+    }
     let was_restored = restored.is_some();
     let (project, saved_projects, native_keys, start_shell) =
         if let Some((project, saved)) = restored {
@@ -3201,16 +3787,23 @@ pub fn run(
         } else {
             let selection = match direct_start.then(|| Project::open(path)) {
                 Some(Ok(project)) => Ok(Some((project, false, false))),
-                result => choose_project(
-                    &mut terminal,
-                    &rx,
-                    &mut pending,
-                    &jobs,
-                    path,
-                    result.and_then(Result::err),
-                    update_notice.as_deref(),
-                    use_kitty,
-                ),
+                result => {
+                    notices.extend(
+                        result
+                            .and_then(Result::err)
+                            .map(|error| format!("{error:#}")),
+                    );
+                    let shown = notices.join("\n");
+                    choose_project(
+                        &mut terminal,
+                        &rx,
+                        &mut pending,
+                        &jobs,
+                        path,
+                        (!shown.is_empty()).then_some(shown.as_str()),
+                        use_kitty,
+                    )
+                }
             };
             match selection {
                 Ok(Some((project, native_keys, start_shell))) => {
@@ -3233,9 +3826,11 @@ pub fn run(
         saved_projects,
         native_keys,
         modal: None,
-        notice: update_notice,
+        notice: None,
+        notice_sticky: false,
         panes: Vec::with_capacity(2),
         scroll_drag: None,
+        mouse_capture: None,
         selection: None,
         tab_hits: Vec::new(),
         interaction_visible: true,
@@ -3245,6 +3840,7 @@ pub fn run(
         next_request: 1,
         pending_creations: VecDeque::new(),
         state_dirty: true,
+        last_saved: None,
         metadata_pending: false,
         metadata_checked: Instant::now() - App::METADATA_INTERVAL,
         socket: server.socket_path.clone(),
@@ -3259,7 +3855,7 @@ pub fn run(
             app.ensure_session(active)
         };
         if let Err(error) = launched {
-            app.set_notice(format!(
+            notices.push(format!(
                 "{error:#}. F1 → ask to start another agent or shell."
             ));
         }
@@ -3268,18 +3864,34 @@ pub fn run(
     {
         app.env(active, EnvironmentOp::Probe)?;
     }
+    // An explicit --repo/--agent also opens after a restore, as one more tab.
+    if was_restored
+        && direct_start
+        && let Err(error) =
+            Project::open(path).and_then(|project| app.open_project(project, None, false))
+    {
+        notices.push(format!("Could not open {}: {error:#}", path.display()));
+    }
+    if !notices.is_empty() {
+        let notice = notices.join("\n");
+        if sticky {
+            app.set_warning(notice);
+        } else {
+            app.set_notice(notice);
+        }
+    }
     let frame_interval = Duration::from_millis(16);
     let mut last_draw = Instant::now() - frame_interval;
     let mut redraw = true;
     while !app.should_quit {
         app.refresh_metadata();
-        redraw |= app.checkpoint(&mut store);
         if redraw && last_draw.elapsed() >= frame_interval {
             ui::resize_sessions(&mut app, terminal.size()?)?;
             terminal.draw(|frame| ui::draw(frame, &mut app))?;
             redraw = false;
             last_draw = Instant::now();
         }
+        redraw |= app.checkpoint(&mut store);
         let event = if let Some(event) = pending.pop_front() {
             Some(event)
         } else if redraw {
@@ -3444,6 +4056,19 @@ mod tests {
         assert!(snapshot.projects[0].secondary_session.is_none());
         store.save(&snapshot).unwrap();
         assert_eq!(store.load().unwrap(), Some(snapshot));
+
+        // A focused terminal that is not restorable must not collapse the split when its
+        // peer is the first restorable one: shell B leads and shell A follows.
+        app.project.workspaces[0].sessions[0].kind = "shell".into();
+        app.project.workspaces[0].sessions[1].kind = "logs".into();
+        app.project.layout = LayoutMode::Vertical;
+        app.project.secondary_session = Some(0);
+        let snapshot = app.snapshot();
+        assert_eq!(snapshot.projects[0].layout, restore::SavedLayout::Vertical);
+        assert_eq!(snapshot.projects[0].workspaces[0].selected, 1);
+        assert_eq!(snapshot.projects[0].secondary_session, Some(0));
+        store.save(&snapshot).unwrap();
+        assert_eq!(store.load().unwrap(), Some(snapshot));
     }
 
     #[test]
@@ -3506,10 +4131,13 @@ mod tests {
             .unwrap();
         app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
+        // The checkout is being removed: nothing else may start Docker work on it.
+        assert!(app.project.workspaces[1].pending);
         for visible in [true, false] {
             app.interaction_visible = visible;
+            // Only Esc leaves the progress dialog; other keys cannot answer it early.
             app.handle(Event::Input(crossterm::event::Event::Key(KeyEvent::new(
-                KeyCode::Esc,
+                KeyCode::Enter,
                 KeyModifiers::NONE,
             ))))
             .unwrap();
@@ -3529,11 +4157,117 @@ mod tests {
             Some(Modal::Removal { error: Some(_), .. })
         ));
         assert_eq!(app.focused().tree.id, "other");
+        assert!(!app.project.workspaces[1].pending);
         app.interaction_visible = true;
         app.modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .unwrap();
         assert!(app.modal.is_none());
         assert_eq!(app.project.workspaces.len(), 2);
+    }
+
+    #[test]
+    fn escaped_removal_and_split_finish_in_background() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, queued, _events) = interaction_app();
+        // The surviving tab already has a session, so closing the focused one spawns nothing.
+        let session = sleeping_session(&app, directory.path(), 1);
+        app.project.workspaces[0].sessions.push(session);
+        app.project.active = 1;
+        let escape = || {
+            Event::Input(crossterm::event::Event::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )))
+        };
+        let delete = |app: &mut App| {
+            app.action(Action::CloseWorktree).unwrap();
+            for code in [KeyCode::Up, KeyCode::Enter] {
+                app.modal_key(KeyEvent::new(code, KeyModifiers::NONE))
+                    .unwrap();
+            }
+            assert!(matches!(
+                &app.modal,
+                Some(Modal::Removal { error: None, .. })
+            ));
+            assert!(matches!(queued.recv().unwrap(), Job::Remove { .. }));
+        };
+
+        // A refusal that arrives after Esc has no dialog left to show it: it is a notice.
+        delete(&mut app);
+        app.handle(escape()).unwrap();
+        assert!(app.modal.is_none());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Still removing other; the result will appear here.")
+        );
+        app.handle(Event::Removed {
+            tree: "other".into(),
+            result: Err("local changes".into()),
+        })
+        .unwrap();
+        assert!(app.modal.is_none());
+        assert_eq!(app.notice.as_deref(), Some("local changes"));
+        assert_eq!(app.project.workspaces.len(), 2);
+
+        // Success still closes the tab, whichever Esc path hid the dialog.
+        delete(&mut app);
+        app.interaction_visible = false;
+        app.handle(escape()).unwrap();
+        app.interaction_visible = true;
+        assert!(app.modal.is_none());
+        assert!(app.notice.as_deref().unwrap().starts_with("Still removing"));
+        app.handle(Event::Removed {
+            tree: "other".into(),
+            result: Ok(None),
+        })
+        .unwrap();
+        assert_eq!(app.project.workspaces.len(), 1);
+        assert_eq!(app.focused().tree.id, "main");
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Checkout removed; Git branch and Docker volumes retained.")
+        );
+
+        // A split checkout that finishes after Esc lands as a tab and leaves the layout alone.
+        let mut third = app.project.workspaces[0].tree.clone();
+        third.id = "third".into();
+        third.branch = "third".into();
+        let opened = |app: &App, request, result| Event::SplitOpened {
+            request,
+            project: app.project.common_dir().unwrap().to_owned(),
+            layout: LayoutMode::Vertical,
+            choices: Vec::new(),
+            selected: 0,
+            source: app.project.path().to_owned(),
+            preparation_error: None,
+            result,
+        };
+        app.modal = Some(Modal::OpeningSplit { request: 9 });
+        app.handle(escape()).unwrap();
+        assert!(app.modal.is_none());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Still opening the split; the checkout will open as a tab.")
+        );
+        // A dialog opened meanwhile is not the result's to answer.
+        app.modal = Some(Modal::Confirm(Confirm::Quit));
+        let event = opened(&app, 9, Ok((third, true)));
+        app.handle(event).unwrap();
+        assert!(matches!(app.modal, Some(Modal::Confirm(Confirm::Quit))));
+        app.modal = None;
+        assert_eq!(app.project.workspaces.len(), 2);
+        assert_eq!(app.project.workspaces[1].tree.id, "third");
+        assert!(app.project.layout == LayoutMode::Full);
+        assert!(app.project.secondary.is_none());
+        assert_eq!(app.focused().tree.id, "main");
+        assert_eq!(app.notice.as_deref(), Some("third is ready as a tab."));
+
+        app.modal = Some(Modal::OpeningSplit { request: 10 });
+        app.handle(escape()).unwrap();
+        let event = opened(&app, 10, Err("branch no longer exists".into()));
+        app.handle(event).unwrap();
+        assert!(app.modal.is_none());
+        assert_eq!(app.notice.as_deref(), Some("branch no longer exists"));
     }
 
     #[test]
@@ -3561,6 +4295,10 @@ mod tests {
         let (mut background, _, _) = interaction_app();
         background.project.name = "background".into();
         background.project.order = 1;
+        background.project.repository = Some(worktree::Repository {
+            root: PathBuf::from("/background"),
+            common_dir: PathBuf::from("/background/.git"),
+        });
         for workspace in &mut background.project.workspaces {
             workspace.tree.id = format!("background-{}", workspace.tree.id);
             workspace.tree.path = PathBuf::from("/background").join(&workspace.tree.id);
@@ -3578,10 +4316,14 @@ mod tests {
         detached.head = "0123456789abcdef".into();
         let mut renamed = app.saved_projects[0].workspaces[0].tree.clone();
         renamed.branch = "renamed".into();
-        assert!(
-            app.handle(Event::Metadata(vec![switched, detached, renamed]))
-                .unwrap()
-        );
+        let listings = vec![
+            (
+                PathBuf::from("/interaction-fixture/.git"),
+                vec![switched, detached],
+            ),
+            (PathBuf::from("/background/.git"), vec![renamed]),
+        ];
+        assert!(app.handle(Event::Metadata(listings)).unwrap());
         assert_eq!(app.project.active, 0);
         assert_eq!(app.project.secondary, Some(1));
         assert!(app.project.focus_secondary);
@@ -3916,6 +4658,1512 @@ mod tests {
         assert!(app.snapshot().projects.is_empty());
     }
 
+    #[test]
+    fn open_intent_tolerates_non_utf8_paths() {
+        use std::os::unix::ffi::OsStringExt;
+        let (mut app, _queued, _events) = interaction_app();
+        let bad = |path: &[u8]| PathBuf::from(std::ffi::OsString::from_vec(path.to_vec()));
+        app.project.repository = Some(worktree::Repository {
+            root: bad(b"/interaction-fixture/bad-\xff"),
+            common_dir: bad(b"/interaction-fixture/bad-\xff/.git"),
+        });
+        app.project.workspaces[0].tree.path = bad(b"/interaction-fixture/bad-\xff");
+        app.open_intent().unwrap();
+        let Some(Modal::Intent(dialog)) = &app.modal else {
+            panic!("expected interpreter dialog");
+        };
+        for path in [
+            &dialog.context["active_project"]["path"],
+            &dialog.context["active_project"]["common_dir"],
+            &dialog.context["focused_worktree"]["path"],
+        ] {
+            assert!(path.is_string());
+        }
+    }
+
+    #[test]
+    fn input_reaching_the_terminal_clears_the_notice() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let session = sleeping_session(&app, directory.path(), 1);
+        app.project.workspaces[0].sessions.push(session);
+        for native_keys in [false, true] {
+            app.native_keys = native_keys;
+            // Pointer motion is not an acknowledgement.
+            app.notice = Some("Tab closed".into());
+            app.handle(mouse_event(MouseEventKind::Moved, 0, 0))
+                .unwrap();
+            assert!(app.notice.is_some());
+            for event in [
+                Event::Input(crossterm::event::Event::Key(KeyEvent::new(
+                    KeyCode::Char('a'),
+                    KeyModifiers::NONE,
+                ))),
+                Event::Input(crossterm::event::Event::Paste("a".into())),
+                mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            ] {
+                app.notice = Some("Tab closed".into());
+                // The notice row must disappear on the next frame.
+                assert!(app.handle(event).unwrap());
+                assert!(app.notice.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn sticky_warnings_survive_terminal_input_until_escape() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let session = sleeping_session(&app, directory.path(), 1);
+        app.project.workspaces[0].sessions.push(session);
+        let key = |code| {
+            Event::Input(crossterm::event::Event::Key(KeyEvent::new(
+                code,
+                KeyModifiers::NONE,
+            )))
+        };
+        for native_keys in [false, true] {
+            app.native_keys = native_keys;
+            for event in [
+                key(KeyCode::Char('a')),
+                Event::Input(crossterm::event::Event::Paste("a".into())),
+                mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
+            ] {
+                app.set_warning("Saving disabled");
+                app.handle(event).unwrap();
+                assert_eq!(app.notice.as_deref(), Some("Saving disabled"));
+            }
+            // Esc dismisses it over a pane with a session and over one without.
+            for active in [0, 1] {
+                app.project.active = active;
+                app.set_warning("Saving disabled");
+                assert!(app.handle(key(KeyCode::Esc)).unwrap());
+                assert!(app.notice.is_none());
+            }
+            app.project.active = 0;
+            // An ordinary notice replaces a warning, and clears on the next key again.
+            app.set_warning("Saving disabled");
+            app.set_notice("Tab closed");
+            app.handle(key(KeyCode::Char('a'))).unwrap();
+            assert!(app.notice.is_none());
+        }
+        // A failed save raises exactly such a warning.
+        let state = directory.path().join("crit");
+        let mut store = Some(restore::Store::open_in(&state).unwrap());
+        std::fs::remove_dir_all(&state).unwrap();
+        app.set_notice("Tab closed");
+        app.state_dirty = true;
+        assert!(app.checkpoint(&mut store));
+        assert!(store.is_none());
+        assert!(app.notice_sticky);
+        assert!(
+            app.notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("Saving disabled for this window"))
+        );
+    }
+
+    #[test]
+    fn restore_leaves_out_missing_items_and_keeps_the_rest() {
+        let directory = tempfile::tempdir().unwrap();
+        let kept = directory.path().join("kept");
+        let gone = directory.path().join("gone");
+        std::fs::create_dir(&kept).unwrap();
+        std::fs::create_dir(&gone).unwrap();
+        let saved = |path: &Path, kinds: &[&str], split: bool| restore::SavedProject {
+            workspaces: vec![restore::SavedWorkspace {
+                path: path.to_path_buf(),
+                source: None,
+                sessions: kinds
+                    .iter()
+                    .map(|kind| restore::SavedSession {
+                        kind: (*kind).into(),
+                        resume: None,
+                    })
+                    .collect(),
+                selected: 0,
+            }],
+            active: 0,
+            secondary: split.then_some(0),
+            secondary_session: split.then_some(1),
+            focus_secondary: split,
+            layout: if split {
+                restore::SavedLayout::Vertical
+            } else {
+                restore::SavedLayout::Full
+            },
+            split_ratio: restore::default_split_ratio(),
+        };
+        let snapshot = |projects, active_project| restore::Snapshot {
+            version: restore::VERSION,
+            projects,
+            active_project,
+            native_keys: false,
+        };
+        // The shared split's second chat cannot start, and the current project is deleted.
+        let both = snapshot(
+            vec![
+                saved(&kept, &["shell", "bogus"], true),
+                saved(&gone, &["shell"], false),
+            ],
+            1,
+        );
+        std::fs::remove_dir(&gone).unwrap();
+        let (tx, _events) = mpsc::sync_channel(64);
+        let socket = directory.path().join("unused.sock");
+        let size = ratatui::layout::Size::new(80, 24);
+        let mut next_session = 1;
+        let (restored, skipped) = restore_projects(&both, &socket, &tx, size, &mut next_session);
+        let (current, others) = restored.expect("the surviving project reopens");
+        assert_eq!(current.name, "kept");
+        assert!(others.is_empty());
+        assert_eq!(current.workspaces[0].sessions.len(), 1);
+        assert!(current.layout == LayoutMode::Full);
+        assert_eq!(
+            (
+                current.secondary,
+                current.secondary_session,
+                current.focus_secondary
+            ),
+            (None, None, false)
+        );
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
+        assert!(skipped.iter().any(|line| line.contains("bogus session in")));
+        assert!(
+            skipped
+                .iter()
+                .any(|line| line.contains(gone.to_str().unwrap()))
+        );
+
+        // What is left is a state that can be saved again.
+        let (mut app, _queued, _app_events) = interaction_app();
+        app.project = current;
+        app.saved_projects = others;
+        restore::Store::open_in(directory.path().join("state"))
+            .unwrap()
+            .save(&app.snapshot())
+            .unwrap();
+
+        // With every project gone nothing reopens, and no session id is used up.
+        let before = next_session;
+        let only_gone = snapshot(vec![saved(&gone, &["shell"], false)], 0);
+        let (restored, skipped) =
+            restore_projects(&only_gone, &socket, &tx, size, &mut next_session);
+        assert!(restored.is_none());
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(next_session, before);
+    }
+
+    /// The child half of `panic_message_survives_leaving_the_alternate_screen`. It holds the
+    /// terminal as Crit does, then panics on its thread, and does nothing unless asked to.
+    #[test]
+    fn panic_child_holding_the_terminal() {
+        if std::env::var_os("CRIT_TEST_PANIC_CHILD").is_none() {
+            return;
+        }
+        let _guard = TerminalGuard::enter(false).unwrap();
+        install_panic_hook(false);
+        print!("ui-frame\r\n");
+        io::stdout().flush().unwrap();
+        panic!("PANIC-MARKER on the UI thread");
+    }
+
+    #[test]
+    fn panic_message_survives_leaving_the_alternate_screen() {
+        let (tx, events) = mpsc::sync_channel(4096);
+        let session = Session::spawn(
+            1,
+            "shell",
+            None,
+            Path::new("/"),
+            Path::new("/unused.sock"),
+            tx,
+            30,
+            120,
+            Some((
+                "/usr/bin/env".into(),
+                vec![
+                    "CRIT_TEST_PANIC_CHILD=1".into(),
+                    std::env::current_exe().unwrap().display().to_string(),
+                    "--exact".into(),
+                    "app::tests::panic_child_holding_the_terminal".into(),
+                    "--nocapture".into(),
+                    "--test-threads=1".into(),
+                ],
+            )),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match events.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok(Event::Exited { .. }) => break,
+                Ok(_) => {}
+                Err(_) => panic!("the child did not exit"),
+            }
+        }
+        // The message is printed after the terminal is restored, so once it is on the screen
+        // it is on the normal one. A lost message never arrives.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !session
+            .parser
+            .lock()
+            .screen()
+            .contents()
+            .contains("PANIC-MARKER")
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let parser = session.parser.lock();
+        let screen = parser.screen();
+        assert!(
+            screen.contents().contains("PANIC-MARKER"),
+            "the panic message was discarded with the alternate screen: {:?}",
+            screen.contents()
+        );
+        assert!(!screen.alternate_screen());
+    }
+
+    #[test]
+    fn non_utf8_projects_are_left_out_of_the_snapshot() {
+        use std::os::unix::ffi::OsStringExt;
+        let non_utf8 = || PathBuf::from(std::ffi::OsString::from_vec(b"/x/caf\xe9".to_vec()));
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let mut odd = Project::terminal(directory.path()).unwrap();
+        odd.workspaces[0].tree.path = non_utf8();
+        odd.order = 1;
+        app.saved_projects.push(odd);
+        app.project.workspaces[0].source = Some(non_utf8());
+        let snapshot = app.snapshot();
+        assert_eq!(snapshot.projects.len(), 1);
+        assert_eq!(snapshot.projects[0].workspaces[0].source, None);
+        // Saving would otherwise fail on the path and switch saving off for the window.
+        restore::Store::open_in(directory.path().join("state"))
+            .unwrap()
+            .save(&snapshot)
+            .unwrap();
+    }
+
+    #[test]
+    fn tiny_terminal_keeps_last_usable_pty_size() {
+        use ratatui::layout::Size;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let session = sleeping_session(&app, directory.path(), 1);
+        let parser = session.parser.clone();
+        app.project.workspaces[0].sessions.push(session);
+        ui::resize_sessions(&mut app, Size::new(80, 24)).unwrap();
+        assert_eq!(parser.lock().screen().size(), (21, 78));
+        // Nothing is drawn below 30x10, so the program keeps its last usable size.
+        for tiny in [
+            Size::new(3, 10),
+            Size::new(40, 4),
+            Size::new(29, 10),
+            Size::new(30, 9),
+        ] {
+            ui::resize_sessions(&mut app, tiny).unwrap();
+            assert_eq!(parser.lock().screen().size(), (21, 78));
+        }
+        ui::resize_sessions(&mut app, Size::new(30, 10)).unwrap();
+        assert_eq!(parser.lock().screen().size(), (7, 28));
+    }
+
+    #[test]
+    fn notice_dismissing_press_keeps_its_selection() {
+        use ratatui::layout::Size;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let session = sleeping_session(&app, directory.path(), 1);
+        session.parser.lock().process(b"hello");
+        app.project.workspaces[0].sessions.push(session);
+        let size = Size::new(40, 14);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 14)).unwrap();
+        app.notice = Some("Environment ready".into());
+        ui::resize_sessions(&mut app, size).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let reduced = app.panes[0].body;
+        app.handle(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            reduced.x,
+            reduced.y,
+        ))
+        .unwrap();
+        assert!(app.notice.is_none());
+        // The press removed the notice, so the next frame's body is one row taller.
+        ui::resize_sessions(&mut app, size).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let full = app.panes[0].body;
+        assert_eq!(full.height, reduced.height + 1);
+        app.handle(mouse_event(
+            MouseEventKind::Drag(MouseButton::Left),
+            reduced.x + 4,
+            reduced.y,
+        ))
+        .unwrap();
+        let selection = app.selection.as_ref().expect("the press began a selection");
+        assert_eq!(selection.body, full);
+        assert!(selection.moved);
+        assert_eq!(selection.text(), "hello");
+        // A change to the left edge, top edge or width still invalidates the frozen rows.
+        ui::resize_sessions(&mut app, Size::new(50, 14)).unwrap();
+        assert!(app.selection.is_none());
+    }
+
+    #[test]
+    fn worktree_dialogs_name_detached_checkouts() {
+        let (mut app, _queued, _events) = interaction_app();
+        let mut detached = app.project.workspaces[0].tree.clone();
+        detached.branch.clear();
+        detached.head = "0123456789abcdef".into();
+        app.project.workspaces[0].tree = detached.clone();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        for (modal, expected) in [
+            (
+                Modal::NewWorktree {
+                    input: String::new(),
+                    split: None,
+                },
+                "from detached HEAD",
+            ),
+            (
+                Modal::NewWorktree {
+                    input: String::new(),
+                    split: Some(LayoutMode::Vertical),
+                },
+                "side by side with detached HEAD.",
+            ),
+            (
+                Modal::OpenWorktree {
+                    trees: vec![detached.clone()],
+                    selected: 0,
+                },
+                "detached HEAD  /interaction-fixture/main",
+            ),
+            (
+                Modal::ExistingSplit {
+                    layout: LayoutMode::Vertical,
+                    choices: vec![worktree::SplitTarget::Worktree(detached.clone())],
+                    selected: 0,
+                    error: None,
+                },
+                "detached HEAD  /interaction-fixture/main",
+            ),
+        ] {
+            app.modal = Some(modal);
+            terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows: Vec<String> = (0..buffer.area.height)
+                .map(|row| {
+                    (0..buffer.area.width)
+                        .map(|column| buffer[(column, row)].symbol())
+                        .collect()
+                })
+                .collect();
+            assert!(
+                rows.iter().any(|row| row.contains(expected)),
+                "{expected:?} missing from {rows:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_notices_keep_their_tail() {
+        let (mut app, _queued, _events) = interaction_app();
+        app.set_notice("x".repeat(300_000) + "\nfinal cause");
+        let notice = app.notice.as_deref().unwrap();
+        assert!(notice.len() <= 16 * 1024 + 3);
+        assert!(notice.starts_with("..."));
+        assert!(notice.ends_with("final cause"));
+        // A cut inside a multi-byte character moves on to the next boundary.
+        app.set_notice("界".repeat(20_000));
+        let notice = app.notice.as_deref().unwrap();
+        assert!(notice.len() <= 16 * 1024 + 3);
+        assert!(notice.starts_with("...界"));
+        app.set_notice("short");
+        assert_eq!(app.notice.as_deref(), Some("short"));
+        // Paragraph scrolls by a u16, so an unbounded notice showed a middle slice.
+        app.set_notice(
+            (0..70_000)
+                .map(|row| format!("line{row}\n"))
+                .collect::<String>(),
+        );
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 14)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let last: String = (0..40)
+            .map(|column| buffer[(column, 13)].symbol())
+            .collect();
+        assert!(last.contains("line69999"), "{last:?}");
+    }
+
+    #[test]
+    fn notices_keep_split_panes() {
+        let (mut app, _queued, _events) = interaction_app();
+        app.project.secondary = Some(1);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
+        for layout in [LayoutMode::Horizontal, LayoutMode::Vertical] {
+            app.project.layout = layout;
+            // The window is tall enough for both panes; the rows a notice takes are not.
+            for notice in [None, Some("one\ntwo\nthree")] {
+                app.notice = notice.map(Into::into);
+                terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+                assert_eq!(app.panes.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn notice_rows_keep_newest_output() {
+        use ratatui::layout::Size;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let session = sleeping_session(&app, directory.path(), 1);
+        let parser = session.parser.clone();
+        app.project.workspaces[0].sessions.push(session);
+        let size = Size::new(80, 24);
+        ui::resize_sessions(&mut app, size).unwrap();
+        {
+            let mut parser = parser.lock();
+            for row in 1..=30 {
+                parser.process(format!("line{row}\r\n").as_bytes());
+            }
+            parser.process(b"ERROR\r\nprompt$ ");
+        }
+        let assert_newest_output_visible = || {
+            let parser = parser.lock();
+            let screen = parser.screen();
+            let visible: Vec<String> = screen.rows(0, 78).collect();
+            let cursor = usize::from(screen.cursor_position().0);
+            assert!(visible[cursor].starts_with("prompt$"), "{visible:?}");
+            assert_eq!(visible[cursor - 1], "ERROR");
+            assert_eq!(visible[cursor - 2], "line30");
+        };
+        app.notice = Some("Environment ready".into());
+        ui::resize_sessions(&mut app, size).unwrap();
+        assert_newest_output_visible();
+        {
+            // The row the notice took left through the top into history, not the bin.
+            let mut parser = parser.lock();
+            assert_eq!(parser.screen().size(), (20, 78));
+            parser.screen_mut().set_scrollback(usize::MAX);
+            assert_eq!(parser.screen().scrollback(), 12);
+            assert_eq!(parser.screen().rows(0, 78).next().as_deref(), Some("line1"));
+            parser.screen_mut().set_scrollback(0);
+        }
+        app.notice = None;
+        ui::resize_sessions(&mut app, size).unwrap();
+        assert_newest_output_visible();
+    }
+
+    #[test]
+    fn clicking_the_focused_pane_does_not_mark_state_dirty() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let session = sleeping_session(&app, directory.path(), 1);
+        app.project.workspaces[0].sessions.push(session);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        app.state_dirty = false;
+        let body = app.panes[0].body;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle(mouse_event(kind, body.x + 1, body.y + 1))
+                .unwrap();
+        }
+        assert!(!app.state_dirty, "an unchanged focus has nothing to save");
+
+        // Clicking the other pane really moves focus, and that is saved.
+        app.project.layout = LayoutMode::Vertical;
+        app.project.secondary = Some(1);
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let other = app.panes[1].body;
+        app.handle(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            other.x + 1,
+            other.y + 1,
+        ))
+        .unwrap();
+        assert!(app.project.focus_secondary);
+        assert!(app.state_dirty);
+    }
+
+    #[test]
+    fn unchanged_state_is_not_saved_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let mut store = Some(restore::Store::open_in(directory.path()).unwrap());
+        app.state_dirty = true;
+        assert!(!app.checkpoint(&mut store));
+        assert_eq!(
+            store.as_ref().unwrap().load().unwrap(),
+            Some(app.snapshot())
+        );
+
+        // What another save left behind survives a checkpoint that finds no change.
+        let other = restore::Snapshot {
+            version: restore::VERSION,
+            projects: Vec::new(),
+            active_project: 0,
+            native_keys: false,
+        };
+        store.as_ref().unwrap().save(&other).unwrap();
+        app.state_dirty = true;
+        assert!(!app.checkpoint(&mut store));
+        assert_eq!(store.as_ref().unwrap().load().unwrap(), Some(other));
+
+        app.native_keys = true;
+        app.state_dirty = true;
+        assert!(!app.checkpoint(&mut store));
+        assert_eq!(
+            store.as_ref().unwrap().load().unwrap(),
+            Some(app.snapshot())
+        );
+    }
+
+    #[test]
+    fn pointer_motion_does_not_request_a_redraw() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let session = sleeping_session(&app, directory.path(), 1);
+        app.project.workspaces[0].sessions.push(session);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let body = app.panes[0].body;
+        // Over the pane, then over the tab bar.
+        for (column, row) in [(body.x + 1, body.y + 1), (1, 0)] {
+            assert!(
+                !app.handle(mouse_event(MouseEventKind::Moved, column, row))
+                    .unwrap()
+            );
+        }
+        // A click is real input.
+        assert!(
+            app.handle(mouse_event(
+                MouseEventKind::Down(MouseButton::Left),
+                body.x + 1,
+                body.y + 1,
+            ))
+            .unwrap()
+        );
+        app.modal = Some(Modal::Confirm(Confirm::Quit));
+        assert!(
+            !app.handle(mouse_event(MouseEventKind::Moved, 1, 1))
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn drag_and_release_follow_the_pane_that_took_the_press() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let outputs = [
+            directory.path().join("left"),
+            directory.path().join("right"),
+        ];
+        for (id, output) in (1..).zip(&outputs) {
+            let session = recording_session(id, directory.path(), app.tx.clone(), output);
+            app.project.workspaces[0].sessions.push(session);
+        }
+        app.project.layout = LayoutMode::Vertical;
+        app.project.secondary = Some(0);
+        app.project.secondary_session = Some(1);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        ui::resize_sessions(&mut app, ratatui::layout::Size::new(120, 24)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let (left, right) = (app.panes[0].body, app.panes[1].body);
+        assert!(right.x >= left.right());
+
+        app.handle(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            left.x + 2,
+            left.y + 2,
+        ))
+        .unwrap();
+        assert!(app.mouse_capture.is_some());
+        // The pointer crosses into the other pane: the drag and the release stay with the
+        // pressed program, clamped to its right edge.
+        let (x, y) = (right.x + 5, right.y + 4);
+        app.handle(mouse_event(MouseEventKind::Drag(MouseButton::Left), x, y))
+            .unwrap();
+        app.handle(mouse_event(MouseEventKind::Up(MouseButton::Left), x, y))
+            .unwrap();
+        assert!(app.mouse_capture.is_none());
+        let edge = left.width;
+        let received = format!("\x1b[<0;3;3M\x1b[<32;{edge};5M\x1b[<0;{edge};5m");
+        wait_for_file(&outputs[0], received.as_bytes());
+        // Nothing reached the other pane: its program sees only what is sent to it later.
+        app.project.workspaces[0].sessions[1].paste("Z").unwrap();
+        wait_for_file(&outputs[1], b"Z");
+
+        // Crit consumed no press this time, so a stray drag belongs to nothing.
+        app.handle(mouse_event(
+            MouseEventKind::Drag(MouseButton::Left),
+            left.x + 1,
+            left.y + 1,
+        ))
+        .unwrap();
+        app.project.workspaces[0].sessions[0].paste("Y").unwrap();
+        wait_for_file(&outputs[0], format!("{received}Y").as_bytes());
+
+        // A resize invalidates the remembered pane.
+        app.handle(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            left.x + 1,
+            left.y + 1,
+        ))
+        .unwrap();
+        assert!(app.mouse_capture.is_some());
+        app.handle(Event::Input(crossterm::event::Event::Resize(120, 24)))
+            .unwrap();
+        assert!(app.mouse_capture.is_none());
+
+        // A release over a dialog hides the pane, but still ends the drag at the program that
+        // took the press, so nothing stays captured for a later click.
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        app.handle(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            left.x + 1,
+            left.y + 1,
+        ))
+        .unwrap();
+        assert!(app.mouse_capture.is_some());
+        app.modal = Some(Modal::Confirm(Confirm::Quit));
+        app.handle(mouse_event(MouseEventKind::Up(MouseButton::Left), x, y))
+            .unwrap();
+        app.modal = None;
+        assert!(app.mouse_capture.is_none());
+        let received = format!("{received}Y\x1b[<0;2;2M\x1b[<0;2;2M\x1b[<0;{edge};5m");
+        wait_for_file(&outputs[0], received.as_bytes());
+        let tab = app
+            .tab_hits
+            .iter()
+            .find(|hit| hit.workspace == Some(0))
+            .unwrap()
+            .area;
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.handle(mouse_event(kind, tab.x, tab.y)).unwrap();
+        }
+        app.project.workspaces[0].sessions[0].paste("W").unwrap();
+        wait_for_file(&outputs[0], format!("{received}W").as_bytes());
+    }
+
+    #[test]
+    fn clipboard_text_reaches_the_focused_session_and_failures_become_notices() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let output = directory.path().join("pasted");
+        let session = recording_session(1, directory.path(), app.tx.clone(), &output);
+        app.project.workspaces[0].sessions.push(session);
+        app.handle(Event::ClipboardText {
+            target: Some(1),
+            result: Ok("from the clipboard".into()),
+        })
+        .unwrap();
+        wait_for_file(&output, b"from the clipboard");
+        assert!(app.notice.is_none());
+
+        // An open dialog takes the text instead, exactly as a native paste would.
+        app.modal = Some(Modal::NewWorktree {
+            input: String::new(),
+            split: None,
+        });
+        app.handle(Event::ClipboardText {
+            target: None,
+            result: Ok("feature/login".into()),
+        })
+        .unwrap();
+        assert!(
+            matches!(&app.modal, Some(Modal::NewWorktree { input, .. }) if input == "feature/login")
+        );
+
+        app.handle(Event::ClipboardText {
+            target: None,
+            result: Err("no clipboard tool".into()),
+        })
+        .unwrap();
+        assert_eq!(app.notice.as_deref(), Some("no clipboard tool"));
+    }
+
+    #[test]
+    fn failed_background_probe_is_silent() {
+        let (mut app, _queued, _events) = interaction_app();
+        let failure = |operation| Event::Environment {
+            tree: "other".into(),
+            operation,
+            prepared: false,
+            result: Err("docker missing".into()),
+        };
+        app.project.workspaces[1].pending = true;
+        app.handle(failure(EnvironmentOp::Probe)).unwrap();
+        assert!(app.notice.is_none());
+        assert!(!app.project.workspaces[1].pending);
+
+        // An operation the user asked for still reports its failure.
+        app.project.workspaces[1].pending = true;
+        app.handle(failure(EnvironmentOp::Status)).unwrap();
+        assert_eq!(app.notice.as_deref(), Some("docker missing"));
+        assert!(!app.project.workspaces[1].pending);
+    }
+
+    #[test]
+    fn successful_background_probe_keeps_the_notice() {
+        let (mut app, _queued, _events) = interaction_app();
+        let environment = |tree: &str, operation| Event::Environment {
+            tree: tree.into(),
+            operation,
+            prepared: false,
+            result: Ok(compose::Environment::default()),
+        };
+        app.set_notice("Saving disabled for this window.");
+        for tree in ["main", "other"] {
+            app.handle(environment(tree, EnvironmentOp::Probe)).unwrap();
+            assert_eq!(
+                app.notice.as_deref(),
+                Some("Saving disabled for this window.")
+            );
+        }
+        // An explicit refresh still reports what it found.
+        app.handle(environment("main", EnvironmentOp::Status))
+            .unwrap();
+        assert_eq!(app.notice.as_deref(), Some("main: stack stopped"));
+    }
+
+    #[test]
+    fn environment_summary_distinguishes_starting_completed_and_failed_services() {
+        let service = |name: &str, state: &str, health: &str, exit_code| compose::Service {
+            name: name.into(),
+            state: state.into(),
+            health: health.into(),
+            exit_code,
+            ports: Vec::new(),
+        };
+        let environment = compose::Environment {
+            project: "crit-main".into(),
+            services: vec![
+                service("db", "running", "starting", 0),
+                service("migrate", "exited", "", 0),
+                service("web", "running", "", 0),
+                service("worker", "exited", "", 3),
+            ],
+        };
+        assert_eq!(
+            environment_summary("main", &environment),
+            "main: ~ db · - migrate · + web · ! worker"
+        );
+    }
+
+    #[test]
+    fn late_clipboard_text_is_dropped_when_focus_moved_on() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let outputs = [
+            directory.path().join("main"),
+            directory.path().join("other"),
+        ];
+        for (workspace, (id, output)) in (1..).zip(&outputs).enumerate() {
+            let session = recording_session(id, directory.path(), app.tx.clone(), output);
+            app.project.workspaces[workspace].sessions.push(session);
+        }
+        let text = |target| Event::ClipboardText {
+            target,
+            result: Ok("make deploy".into()),
+        };
+        let dropped = "Clipboard paste dropped: focus changed before the clipboard answered.";
+
+        // Asked in "main"; focus moved to "other" while the clipboard tool was answering.
+        app.project.active = 1;
+        app.handle(text(Some(1))).unwrap();
+        assert_eq!(app.notice.as_deref(), Some(dropped));
+
+        // Asked with no dialog open; a dialog has opened since.
+        app.project.active = 0;
+        app.notice = None;
+        app.modal = Some(Modal::NewWorktree {
+            input: String::new(),
+            split: None,
+        });
+        app.handle(text(Some(1))).unwrap();
+        assert!(matches!(&app.modal, Some(Modal::NewWorktree { input, .. }) if input.is_empty()));
+        assert_eq!(app.notice.as_deref(), Some(dropped));
+
+        // Asked from a dialog that has closed since: the terminal behind it must not get it.
+        app.modal = None;
+        app.notice = None;
+        app.handle(text(None)).unwrap();
+        assert_eq!(app.notice.as_deref(), Some(dropped));
+
+        // Nothing reached either program: each sees only what is sent to it later.
+        for (workspace, output) in outputs.iter().enumerate() {
+            app.project.workspaces[workspace].sessions[0]
+                .paste("!")
+                .unwrap();
+            wait_for_file(output, b"!");
+        }
+    }
+
+    #[test]
+    fn native_paste_reaches_the_terminal_behind_a_progress_dialog() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let output = directory.path().join("typed");
+        let session = recording_session(1, directory.path(), app.tx.clone(), &output);
+        app.project.workspaces[0].sessions.push(session);
+        app.modal = Some(Modal::Removal {
+            tree: "main".into(),
+            confirm: Confirm::RemoveWorktree,
+            error: None,
+        });
+        let key = |code| {
+            Event::Input(crossterm::event::Event::Key(KeyEvent::new(
+                code,
+                KeyModifiers::NONE,
+            )))
+        };
+        let paste = |text: &str| Event::Input(crossterm::event::Event::Paste(text.into()));
+
+        // Typed keys already reach the terminal in native mode; a paste must follow them.
+        app.native_keys = true;
+        app.handle(paste("pasted")).unwrap();
+        app.handle(key(KeyCode::Char('k'))).unwrap();
+        wait_for_file(&output, b"pastedk");
+
+        // Crit's own keys leave the progress dialog alone, and so does a paste.
+        app.native_keys = false;
+        app.handle(paste("dropped")).unwrap();
+        app.native_keys = true;
+        app.handle(key(KeyCode::Char('z'))).unwrap();
+        wait_for_file(&output, b"pastedkz");
+    }
+
+    #[test]
+    fn native_mode_failures_report_without_dialogs() {
+        let (mut app, queued, _events) = interaction_app();
+        // A failed creation would bring back the branch dialog.
+        app.modal = Some(Modal::NewWorktree {
+            input: "taken".into(),
+            split: None,
+        });
+        app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        queued.recv().unwrap();
+        app.native_keys = true;
+        app.handle(Event::Created {
+            project: PathBuf::from("/interaction-fixture/.git"),
+            source: PathBuf::from("/interaction-fixture/main"),
+            preparation_error: None,
+            result: Err("branch is already checked out".into()),
+            agent: None,
+            split: None,
+        })
+        .unwrap();
+        assert!(app.modal.is_none());
+        assert_eq!(app.notice.as_deref(), Some("branch is already checked out"));
+
+        // A failed split would bring back the picker.
+        app.notice = None;
+        app.modal = Some(Modal::OpeningSplit { request: 5 });
+        app.handle(Event::SplitOpened {
+            request: 5,
+            project: PathBuf::from("/interaction-fixture/.git"),
+            layout: LayoutMode::Vertical,
+            choices: Vec::new(),
+            selected: 0,
+            source: PathBuf::from("/interaction-fixture/main"),
+            preparation_error: None,
+            result: Err("branch no longer exists".into()),
+        })
+        .unwrap();
+        assert!(app.modal.is_none());
+        assert_eq!(app.notice.as_deref(), Some("branch no longer exists"));
+    }
+
+    #[test]
+    fn creation_results_survive_a_full_job_queue() {
+        let directory = tempfile::tempdir().unwrap();
+        // A worktree with a Compose file wants its environment started.
+        let created = |name: &str| {
+            let path = directory.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::write(path.join("compose.yaml"), "services: {}\n").unwrap();
+            Worktree {
+                id: name.into(),
+                path,
+                branch: name.into(),
+                head: String::new(),
+                is_main: false,
+                locked: false,
+                bare: false,
+                prunable: false,
+            }
+        };
+        let fill = |app: &App| {
+            app.jobs
+                .try_send(Job::Projects {
+                    request: 0,
+                    base: PathBuf::new(),
+                })
+                .unwrap();
+        };
+        let not_started = |app: &App| {
+            assert!(
+                app.notice
+                    .as_deref()
+                    .is_some_and(|notice| notice.contains("not started"))
+            );
+        };
+        let common_dir = PathBuf::from("/interaction-fixture/.git");
+        let source = PathBuf::from("/interaction-fixture/main");
+
+        // A saved project still gets its new tab.
+        let (mut app, _queued, _events) = interaction_app();
+        let mut saved = Project::terminal(directory.path()).unwrap();
+        saved.repository = Some(worktree::Repository {
+            root: PathBuf::from("/saved-fixture"),
+            common_dir: PathBuf::from("/saved-fixture/.git"),
+        });
+        saved.order = 1;
+        app.saved_projects.push(saved);
+        fill(&app);
+        assert!(
+            app.handle(Event::Created {
+                project: PathBuf::from("/saved-fixture/.git"),
+                source: source.clone(),
+                preparation_error: None,
+                result: Ok(created("saved-new")),
+                agent: None,
+                split: None,
+            })
+            .unwrap()
+        );
+        assert_eq!(app.saved_projects[0].workspaces.len(), 2);
+        assert!(!app.saved_projects[0].workspaces[1].pending);
+        not_started(&app);
+
+        // The current project still selects and splits it.
+        let (mut app, _queued, _events) = interaction_app();
+        fill(&app);
+        app.handle(Event::Created {
+            project: common_dir.clone(),
+            source: source.clone(),
+            preparation_error: None,
+            result: Ok(created("created-here")),
+            agent: None,
+            split: Some(LayoutMode::Vertical),
+        })
+        .unwrap();
+        assert_eq!(app.project.workspaces.len(), 3);
+        assert_eq!(app.focused().tree.id, "created-here");
+        assert!(app.project.layout == LayoutMode::Vertical);
+        assert!(!app.project.workspaces[2].pending);
+        not_started(&app);
+
+        // An opened split checkout is still shown.
+        let (mut app, _queued, _events) = interaction_app();
+        app.modal = Some(Modal::OpeningSplit { request: 3 });
+        fill(&app);
+        app.handle(Event::SplitOpened {
+            request: 3,
+            project: common_dir,
+            layout: LayoutMode::Horizontal,
+            choices: Vec::new(),
+            selected: 0,
+            source,
+            preparation_error: None,
+            result: Ok((created("opened"), true)),
+        })
+        .unwrap();
+        assert!(app.modal.is_none());
+        assert_eq!(app.project.secondary, Some(2));
+        assert!(app.project.layout == LayoutMode::Horizontal);
+        assert!(!app.project.workspaces[2].pending);
+        not_started(&app);
+    }
+
+    #[test]
+    fn failed_switch_closes_the_picker() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        for (name, order) in [("alpha", 1), ("gamma", 2)] {
+            let mut project = Project::terminal(directory.path()).unwrap();
+            project.name = name.into();
+            project.order = order;
+            app.saved_projects.push(project);
+        }
+        // Nothing can start in the project switched to.
+        app.default_agent = "bogus".into();
+        app.modal = Some(Modal::SwitchProject { selected: 1 });
+        assert!(
+            app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .is_err()
+        );
+        // The projects are already reordered; a picker restored now would highlight the wrong one.
+        assert_eq!(app.project.name, "gamma");
+        assert!(app.modal.is_none());
+        let saved: Vec<_> = app.saved_projects.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(saved, ["fixture", "alpha"]);
+    }
+
+    #[test]
+    fn unqueued_intent_creation_leaves_no_creating_notice() {
+        let (mut app, _queued, _events) = interaction_app();
+        // The one queue slot still holds the dialog's own destination scan.
+        app.open_intent().unwrap();
+        let Some(Modal::Intent(dialog)) = &mut app.modal else {
+            panic!("expected interpreter dialog");
+        };
+        dialog.loading = false;
+        dialog.pending = true;
+        let request = dialog.request;
+        app.handle(Event::IntentResolved {
+            request,
+            result: Ok(Plan::CreateWorktree {
+                branch: "login-fix".into(),
+                base: None,
+                agent: None,
+            }),
+        })
+        .unwrap();
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Intent(dialog))
+                if dialog.error.as_deref().is_some_and(|error| error.starts_with("command queue is busy"))
+        ));
+        assert!(app.notice.is_none());
+        assert!(app.pending_creations.is_empty());
+    }
+
+    #[test]
+    fn new_tab_menu_has_no_project_switch_entry() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let mut other = Project::terminal(directory.path()).unwrap();
+        other.order = 1;
+        app.saved_projects.push(other);
+        let choices = app.new_tab_choices();
+        assert!(!choices.iter().any(|(_, action)| matches!(
+            action,
+            NewTabAction::Command(IntentCommand::SwitchProject)
+        )));
+        // Home, Open folder, and the two worktree entries of the Git project remain.
+        assert_eq!(choices.len(), 4);
+    }
+
+    #[test]
+    fn home_opens_a_new_tab_each_time() {
+        let home = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let (mut app, queued, _events) = interaction_app();
+        app.project = Project::terminal(home.path()).unwrap();
+        // Delivers the job the app queued, the way the worker would answer it.
+        let deliver = |app: &mut App| {
+            let Job::OpenProject {
+                request, fresh_tab, ..
+            } = queued.recv().unwrap()
+            else {
+                panic!("expected project opening");
+            };
+            app.handle(Event::ProjectOpened {
+                request,
+                agent: None,
+                fresh_tab,
+                result: Ok(Project::terminal(home.path()).unwrap()),
+            })
+            .unwrap();
+            fresh_tab
+        };
+        for tabs in [2, 3] {
+            app.action(Action::NewTab).unwrap();
+            app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+            assert!(deliver(&mut app), "Home asks for a fresh tab");
+            assert_eq!(app.project.workspaces.len(), tabs);
+            assert_eq!(app.focused_index(), tabs - 1);
+            assert_eq!(app.focused().tree.path, home.path().canonicalize().unwrap());
+        }
+
+        // Reopening the folder any other way still selects the tab it already has.
+        app.open_path(home.path().to_owned(), None, false).unwrap();
+        assert!(!deliver(&mut app));
+        assert_eq!(app.project.workspaces.len(), 3);
+        assert_eq!(app.focused_index(), 0);
+
+        // Tabs for the same folder survive a restart.
+        let store = restore::Store::open_in(state.path()).unwrap();
+        let snapshot = app.snapshot();
+        assert_eq!(snapshot.projects[0].workspaces.len(), 3);
+        store.save(&snapshot).unwrap();
+        assert_eq!(store.load().unwrap(), Some(snapshot));
+    }
+
+    #[test]
+    fn git_home_gets_a_fresh_session_in_its_existing_tab() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let session = sleeping_session(&app, directory.path(), 1);
+        app.project.workspaces[1].sessions.push(session);
+        app.next_session = 2;
+        let reopened = Project {
+            repository: app.project.repository.clone(),
+            name: "fixture".into(),
+            workspaces: vec![Workspace::new(app.project.workspaces[1].tree.clone())],
+            active: 0,
+            secondary: None,
+            secondary_session: None,
+            focus_secondary: false,
+            layout: LayoutMode::Full,
+            split_ratio: restore::default_split_ratio(),
+            order: 0,
+        };
+        app.open_project(reopened, None, true).unwrap();
+        // A checkout keeps one tab, whose id metadata and removal look up; it gains a session.
+        assert_eq!(app.project.workspaces.len(), 2);
+        assert_eq!(app.focused().tree.id, "other");
+        assert_eq!(app.focused().sessions.len(), 2);
+        assert_eq!(app.focused_session().unwrap().id, 2);
+    }
+
+    #[test]
+    fn non_utf8_destinations_still_load_in_ask_crit() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        let (mut app, queued, _events) = interaction_app();
+        app.open_intent().unwrap();
+        let Job::IntentTargets { request, .. } = queued.recv().unwrap() else {
+            panic!("expected the destination scan");
+        };
+        let exact = std::ffi::OsString::from_vec(b"/x/caf\xe9".to_vec());
+        app.handle(Event::IntentTargets {
+            request,
+            result: Ok(vec![IntentTarget {
+                id: 0,
+                kind: "project",
+                name: "caf".into(),
+                path: PathBuf::from(&exact),
+                branch: None,
+            }]),
+        })
+        .unwrap();
+        let Some(Modal::Intent(dialog)) = &app.modal else {
+            panic!("expected interpreter dialog");
+        };
+        assert!(!dialog.stale);
+        assert!(dialog.error.is_none());
+        assert!(dialog.context["targets"][0]["path"].is_string());
+        // Navigation still gets the exact bytes.
+        assert_eq!(
+            dialog.targets[0].path.as_os_str().as_bytes(),
+            exact.as_bytes()
+        );
+    }
+
+    #[test]
+    fn stale_project_scan_keeps_the_picker_selection() {
+        let (mut app, queued, _events) = interaction_app();
+        app.run_command(IntentCommand::OpenProject).unwrap();
+        let Job::Projects { request, .. } = queued.recv().unwrap() else {
+            panic!("expected a project scan");
+        };
+        let scan = |request| Event::Projects {
+            request,
+            projects: ["alpha", "beta", "gamma"]
+                .iter()
+                .map(|name| PathBuf::from("/projects").join(name))
+                .collect(),
+        };
+        let selected = |app: &App| match &app.modal {
+            Some(Modal::OpenProject(picker)) => picker.selected,
+            _ => panic!("expected project picker"),
+        };
+        app.handle(scan(request)).unwrap();
+        for _ in 0..2 {
+            app.modal_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+                .unwrap();
+        }
+        assert_eq!(selected(&app), 2);
+        // The scan of a picker that was closed meanwhile must not reset this one's highlight.
+        app.handle(scan(request + 1)).unwrap();
+        assert_eq!(selected(&app), 2);
+    }
+
+    #[test]
+    fn intent_targets_trim_discovered_projects_to_budget() {
+        let tree = |branch: &str| Worktree {
+            id: branch.into(),
+            path: PathBuf::from("/work/app").join(branch),
+            branch: branch.into(),
+            head: String::new(),
+            is_main: false,
+            locked: false,
+            bare: false,
+            prunable: false,
+        };
+        let open = vec![
+            PathBuf::from("/work/open/app"),
+            PathBuf::from("/work/open/api"),
+        ];
+        // A scan of a huge organization, which also finds the projects that are open.
+        let discovered: Vec<_> = (0..4_000)
+            .map(|n| PathBuf::from(format!("/work/org/project-{n:04}")))
+            .chain(open.iter().cloned())
+            .collect();
+        let targets = ranked_intent_targets(
+            vec![tree("main"), tree("fix-login")],
+            &open,
+            discovered.clone(),
+        );
+
+        let order: Vec<_> = targets
+            .iter()
+            .take(5)
+            .map(|target| (target.kind, target.path.to_str().unwrap()))
+            .collect();
+        assert_eq!(
+            order,
+            [
+                ("worktree", "/work/app/main"),
+                ("worktree", "/work/app/fix-login"),
+                ("project", "/work/open/api"),
+                ("project", "/work/open/app"),
+                ("project", "/work/org/project-0000"),
+            ]
+        );
+        assert!(
+            targets
+                .iter()
+                .enumerate()
+                .all(|(index, target)| target.id == index)
+        );
+        // Open projects are listed once, and the discovered tail is cut at the budget.
+        let listed = |path: &str| targets.iter().filter(|t| t.path == Path::new(path)).count();
+        assert_eq!(listed("/work/open/app"), 1);
+        assert_eq!(listed("/work/org/project-3999"), 0);
+        let size = serde_json::to_string(&targets).unwrap().len();
+        assert!(
+            (INTENT_TARGET_BUDGET - 4 * 1024..56 * 1024).contains(&size),
+            "{size} bytes"
+        );
+
+        // A small scan is kept whole.
+        let small = ranked_intent_targets(Vec::new(), &open, discovered[..3].to_vec());
+        assert_eq!(small.len(), 5);
+    }
+
+    #[test]
+    fn closing_focused_primary_collapses_to_visible_peer() {
+        // The visible peer stays, whichever tabs surround it.
+        for order in [["b", "a", "c"], ["c", "a", "b"], ["a", "b", "c"]] {
+            let (mut app, _queued, _events) = interaction_app();
+            app.project.workspaces = order
+                .into_iter()
+                .map(|branch| {
+                    Workspace::new(Worktree {
+                        id: branch.into(),
+                        path: PathBuf::from("/interaction-fixture").join(branch),
+                        branch: branch.into(),
+                        head: String::new(),
+                        is_main: false,
+                        locked: false,
+                        bare: false,
+                        prunable: false,
+                    })
+                })
+                .collect();
+            let position = |label: &str| order.iter().position(|branch| *branch == label).unwrap();
+            app.project.active = position("a");
+            app.project.secondary = Some(position("b"));
+            app.project.layout = LayoutMode::Vertical;
+            app.close_workspace();
+            assert!(app.project.layout == LayoutMode::Full, "{order:?}");
+            assert!(app.project.secondary.is_none(), "{order:?}");
+            assert_eq!(app.project.workspaces.len(), 2, "{order:?}");
+            assert_eq!(app.focused().label(), "b", "{order:?}");
+        }
+    }
+
+    #[test]
+    fn paste_input_separates_pasted_lines_with_single_spaces() {
+        let mut input = String::new();
+        paste_input(
+            &mut input,
+            "\r\nfix login\r\n\r\nthen\tdeploy\x1b[2J\n",
+            4096,
+        );
+        assert_eq!(input, "fix login then deploy[2J ");
+
+        // The byte limit still applies to the separator.
+        let mut input = String::new();
+        paste_input(&mut input, "ab", 3);
+        paste_input(&mut input, "\ncd", 3);
+        assert_eq!(input, "ab ");
+    }
+
+    #[test]
+    fn moved_worktree_is_reassociated_by_branch() {
+        let (mut app, queued, _events) = interaction_app();
+        let directory = tempfile::tempdir().unwrap();
+        let session = sleeping_session(&app, directory.path(), 1);
+        app.project.workspaces[1].sessions.push(session);
+        let metadata = |trees: Vec<Worktree>| {
+            Event::Metadata(vec![(PathBuf::from("/interaction-fixture/.git"), trees)])
+        };
+        let main = app.project.workspaces[0].tree.clone();
+        // `git worktree move` keeps the branch but changes the path, and with it the id.
+        let mut moved = app.project.workspaces[1].tree.clone();
+        moved.id = "other-moved".into();
+        moved.path = PathBuf::from("/interaction-fixture/other-moved");
+
+        // Two unopened checkouts on the branch are ambiguous, so nothing is guessed.
+        let mut twin = moved.clone();
+        twin.id = "other-twin".into();
+        assert!(
+            !app.handle(metadata(vec![main.clone(), moved.clone(), twin]))
+                .unwrap()
+        );
+        assert_eq!(app.project.workspaces[1].tree.id, "other");
+        // An environment operation still addressed to the old id finishes first.
+        app.project.workspaces[1].pending = true;
+        assert!(
+            !app.handle(metadata(vec![main.clone(), moved.clone()]))
+                .unwrap()
+        );
+        app.project.workspaces[1].pending = false;
+
+        assert!(
+            app.handle(metadata(vec![main.clone(), moved.clone()]))
+                .unwrap()
+        );
+        assert_eq!(app.project.workspaces.len(), 2);
+        assert_eq!(app.project.workspaces[1].tree.id, "other-moved");
+        assert_eq!(app.project.workspaces[1].tree.path, moved.path);
+        assert_eq!(app.snapshot().projects[0].workspaces[1].path, moved.path);
+        assert!(app.state_dirty);
+
+        // A later rename in the new location updates the label like any other checkout.
+        moved.branch = "renamed".into();
+        assert!(
+            app.handle(metadata(vec![main.clone(), moved.clone()]))
+                .unwrap()
+        );
+        assert_eq!(app.project.workspaces[1].label(), "renamed");
+
+        // Reopening the moved checkout selects its tab instead of adding another.
+        app.run_command(IntentCommand::OpenWorktree).unwrap();
+        let Job::List {
+            request,
+            repository,
+        } = queued.recv().unwrap()
+        else {
+            panic!("expected worktree listing");
+        };
+        app.handle(Event::Worktrees {
+            request,
+            project: repository.common_dir,
+            result: Ok(vec![main, moved]),
+        })
+        .unwrap();
+        app.modal_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+        app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(app.project.workspaces.len(), 2);
+        assert_eq!(app.focused().tree.id, "other-moved");
+    }
+
+    fn mouse_event(kind: MouseEventKind, column: u16, row: u16) -> Event {
+        Event::Input(crossterm::event::Event::Mouse(
+            crossterm::event::MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+        ))
+    }
+
+    /// A live pane running `/bin/sleep`.
+    fn sleeping_session(app: &App, directory: &Path, id: u64) -> Session {
+        Session::spawn(
+            id,
+            "shell",
+            None,
+            directory,
+            &app.socket,
+            app.tx.clone(),
+            10,
+            40,
+            Some(("/bin/sleep".into(), vec!["30".into()])),
+        )
+        .unwrap()
+    }
+
+    /// A pane whose program appends every byte it receives to `output`, with mouse
+    /// reporting on. Returns once the program has put its terminal in raw mode.
+    fn recording_session(
+        id: u64,
+        directory: &Path,
+        tx: SyncSender<Event>,
+        output: &Path,
+    ) -> Session {
+        let session = Session::spawn(
+            id,
+            "shell",
+            None,
+            directory,
+            &directory.join("unused.sock"),
+            tx,
+            10,
+            40,
+            Some((
+                "/bin/sh".into(),
+                vec![
+                    "-c".into(),
+                    "stty raw -echo; printf ready; exec cat > \"$0\"".into(),
+                    output.to_string_lossy().into_owned(),
+                ],
+            )),
+        )
+        .unwrap();
+        // Enabled here rather than by the program, whose own output would race the test.
+        session.parser.lock().process(b"\x1b[?1002h\x1b[?1006h");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !session.parser.lock().screen().contents().contains("ready") {
+            assert!(
+                Instant::now() < deadline,
+                "the recording program never started"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        session
+    }
+
+    /// Waits until `path` holds `expected.len()` bytes, then requires them to match.
+    fn wait_for_file(path: &Path, expected: &[u8]) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let contents = std::fs::read(path).unwrap_or_default();
+            if contents.len() >= expected.len() {
+                assert_eq!(
+                    String::from_utf8_lossy(&contents),
+                    String::from_utf8_lossy(expected)
+                );
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{} holds {:?}, expected {:?}",
+                path.display(),
+                String::from_utf8_lossy(&contents),
+                String::from_utf8_lossy(expected)
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn interaction_app() -> (App, mpsc::Receiver<Job>, mpsc::Receiver<Event>) {
         let (tx, events) = mpsc::sync_channel(8);
         let (jobs, queued) = mpsc::sync_channel(1);
@@ -3940,6 +6188,8 @@ mod tests {
                             head: String::new(),
                             is_main: branch == "main",
                             locked: false,
+                            bare: false,
+                            prunable: false,
                         })
                     })
                     .collect(),
@@ -3954,8 +6204,10 @@ mod tests {
             native_keys: false,
             modal: None,
             notice: None,
+            notice_sticky: false,
             panes: Vec::new(),
             scroll_drag: None,
+            mouse_capture: None,
             selection: None,
             tab_hits: Vec::new(),
             interaction_visible: true,
@@ -3965,6 +6217,7 @@ mod tests {
             next_request: 1,
             pending_creations: VecDeque::new(),
             state_dirty: false,
+            last_saved: None,
             metadata_pending: false,
             metadata_checked: Instant::now() - App::METADATA_INTERVAL,
             socket: root.join("agent.sock"),
@@ -4017,7 +6270,12 @@ mod tests {
             selected: 0,
             error: None,
         });
-        app.jobs.try_send(Job::Projects(PathBuf::new())).unwrap();
+        app.jobs
+            .try_send(Job::Projects {
+                request: 0,
+                base: PathBuf::new(),
+            })
+            .unwrap();
         assert!(
             app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
                 .is_err()
@@ -4041,18 +6299,15 @@ mod tests {
         else {
             panic!("expected opening");
         };
-        app.modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        // Other keys cannot answer the progress dialog, and neither can native key routing.
+        app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
         app.action(Action::ToggleNative).unwrap();
-        app.interaction_visible = false;
-        app.handle(Event::Input(crossterm::event::Event::Key(KeyEvent::new(
-            KeyCode::Esc,
-            KeyModifiers::NONE,
-        ))))
-        .unwrap();
         assert!(
             matches!(app.modal, Some(Modal::OpeningSplit { request: pending }) if pending == request)
         );
+        // The picker comes back only while the keyboard is Crit's.
+        app.action(Action::ToggleNative).unwrap();
         app.handle(Event::SplitOpened {
             request,
             project: repository.common_dir,
@@ -4209,6 +6464,7 @@ mod tests {
             !app.handle(Event::ProjectOpened {
                 request: requests[0],
                 agent: None,
+                fresh_tab: false,
                 result: Ok(Project::terminal(directory.path()).unwrap()),
             })
             .unwrap()
@@ -4221,6 +6477,7 @@ mod tests {
         app.handle(Event::ProjectOpened {
             request: requests[1],
             agent: None,
+            fresh_tab: false,
             result: Err("replacement unavailable".into()),
         })
         .unwrap();
@@ -4266,6 +6523,7 @@ mod tests {
         app.handle(Event::ProjectOpened {
             request,
             agent: None,
+            fresh_tab: false,
             result: Err("folder disappeared".into()),
         })
         .unwrap();
@@ -4293,7 +6551,12 @@ mod tests {
             matches!(app.modal, Some(Modal::Commands { selected: actual }) if actual == selected)
         );
         app.project.repository = repository;
-        app.jobs.try_send(Job::Projects(PathBuf::new())).unwrap();
+        app.jobs
+            .try_send(Job::Projects {
+                request: 0,
+                base: PathBuf::new(),
+            })
+            .unwrap();
         app.modal = Some(Modal::NewWorktree {
             input: "typed-branch".into(),
             split: Some(LayoutMode::Vertical),
@@ -4309,7 +6572,12 @@ mod tests {
             matches!(queued.recv().unwrap(), Job::Create { branch, .. } if branch == "typed-branch")
         );
         assert!(app.modal.is_none());
-        app.jobs.try_send(Job::Projects(PathBuf::new())).unwrap();
+        app.jobs
+            .try_send(Job::Projects {
+                request: 0,
+                base: PathBuf::new(),
+            })
+            .unwrap();
         app.modal = Some(Modal::Confirm(Confirm::StopEnvironment));
         assert!(
             app.modal_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
@@ -4534,7 +6802,7 @@ mod tests {
         app.modal = Some(Modal::Confirm(Confirm::CloseWorktree { selected: 2 }));
         app.handle(Event::Removed {
             tree: "other".into(),
-            result: Ok(()),
+            result: Ok(None),
         })
         .unwrap();
         assert_eq!(app.focused().tree.id, "third");
@@ -4544,6 +6812,49 @@ mod tests {
             app.modal,
             Some(Modal::Confirm(Confirm::CloseWorktree { .. }))
         ));
+    }
+
+    #[test]
+    fn removal_reports_unchecked_docker_state() {
+        let (mut app, _queued, _events) = interaction_app();
+        app.handle(Event::Removed {
+            tree: "other".into(),
+            result: Ok(Some("daemon down".into())),
+        })
+        .unwrap();
+        assert_eq!(app.project.workspaces.len(), 1);
+        let notice = app.notice.as_deref().unwrap();
+        assert!(notice.contains("could not be checked"), "{notice}");
+        assert!(notice.contains("daemon down"), "{notice}");
+        assert!(
+            notice.contains("docker compose -p crit-other down"),
+            "{notice}"
+        );
+    }
+
+    #[test]
+    fn removed_preparation_source_is_forgotten() {
+        let directory = tempfile::tempdir().unwrap();
+        let (app, _queued, _events) = interaction_app();
+        let (tx, events) = mpsc::sync_channel(8);
+        let jobs = start_worker(tx).unwrap();
+        // A checkout with no Compose file, so Up fails before Docker is involved.
+        let mut tree = app.project.workspaces[0].tree.clone();
+        tree.path = directory.path().to_path_buf();
+        jobs.send(Job::Environment {
+            tree,
+            operation: EnvironmentOp::Up,
+            source: Some(directory.path().join("removed-source")),
+        })
+        .unwrap();
+        let Event::Environment {
+            prepared, result, ..
+        } = events.recv_timeout(Duration::from_secs(10)).unwrap()
+        else {
+            panic!("expected the environment result");
+        };
+        assert!(prepared, "a missing source must not stop the start");
+        assert!(result.unwrap_err().contains("no compose.yaml"));
     }
 
     fn picker(base: &Path) -> (ProjectPicker, SyncSender<Job>, mpsc::Receiver<Job>) {
@@ -4609,6 +6920,20 @@ mod tests {
     }
 
     #[test]
+    fn bare_repository_projects_are_named_after_their_folder() {
+        for (main_tree, common_dir, name) in [
+            ("/x/myapp/.bare", "/x/myapp/.bare", "myapp"),
+            ("/x/app.git", "/x/app.git", "app"),
+            ("/x/repo", "/x/repo/.git", "repo"),
+        ] {
+            assert_eq!(
+                project_name(Path::new(main_tree), Path::new(common_dir)),
+                name
+            );
+        }
+    }
+
+    #[test]
     fn plain_folders_open_as_terminal_tabs_named_after_the_folder() {
         let parent = tempfile::tempdir().unwrap();
         let home = parent.path().join("jyq");
@@ -4630,8 +6955,10 @@ mod tests {
             native_keys: false,
             modal: None,
             notice: None,
+            notice_sticky: false,
             panes: Vec::new(),
             scroll_drag: None,
+            mouse_capture: None,
             selection: None,
             tab_hits: Vec::new(),
             interaction_visible: true,
@@ -4641,6 +6968,7 @@ mod tests {
             next_request: 1,
             pending_creations: VecDeque::new(),
             state_dirty: false,
+            last_saved: None,
             metadata_pending: false,
             metadata_checked: Instant::now() - App::METADATA_INTERVAL,
             socket: parent.path().join("agent.sock"),
@@ -4648,10 +6976,10 @@ mod tests {
             jobs,
             use_kitty: false,
         };
-        app.open_project(project, None).unwrap();
+        app.open_project(project, None, false).unwrap();
         assert_eq!(app.project.name, "jyq");
         assert_eq!(app.saved_projects.len(), 1);
-        app.open_project(Project::open(&home).unwrap(), None)
+        app.open_project(Project::open(&home).unwrap(), None, false)
             .unwrap();
         assert_eq!(app.project.name, "jyq");
         assert_eq!(app.project.workspaces.len(), 1);
@@ -4671,8 +6999,10 @@ mod tests {
             native_keys: false,
             modal: None,
             notice: None,
+            notice_sticky: false,
             panes: Vec::new(),
             scroll_drag: None,
+            mouse_capture: None,
             selection: None,
             tab_hits: Vec::new(),
             interaction_visible: true,
@@ -4682,6 +7012,7 @@ mod tests {
             next_request: 1,
             pending_creations: VecDeque::new(),
             state_dirty: false,
+            last_saved: None,
             metadata_pending: false,
             metadata_checked: Instant::now() - App::METADATA_INTERVAL,
             socket: directory.path().join("agent.sock"),
@@ -4739,7 +7070,7 @@ mod tests {
         assert!(dialog.context["focused_worktree"]["branch"].is_null());
         app.run_command(IntentCommand::OpenProject).unwrap();
         assert!(matches!(app.modal, Some(Modal::OpenProject(_))));
-        assert!(matches!(queued.recv().unwrap(), Job::Projects(_)));
+        assert!(matches!(queued.recv().unwrap(), Job::Projects { .. }));
     }
 
     #[test]
@@ -4760,6 +7091,8 @@ mod tests {
                         head: String::new(),
                         is_main: false,
                         locked: false,
+                        bare: false,
+                        prunable: false,
                     })
                 })
                 .collect(),
@@ -4778,8 +7111,10 @@ mod tests {
             native_keys: false,
             modal: None,
             notice: None,
+            notice_sticky: false,
             panes: Vec::new(),
             scroll_drag: None,
+            mouse_capture: None,
             selection: None,
             tab_hits: Vec::new(),
             interaction_visible: true,
@@ -4789,6 +7124,7 @@ mod tests {
             next_request: 1,
             pending_creations: VecDeque::new(),
             state_dirty: false,
+            last_saved: None,
             metadata_pending: false,
             metadata_checked: Instant::now() - App::METADATA_INTERVAL,
             socket: PathBuf::from("/tabs-fixture/agent.sock"),
@@ -4901,6 +7237,8 @@ mod tests {
                             head: String::new(),
                             is_main: branch == "main",
                             locked: false,
+                            bare: false,
+                            prunable: false,
                         })
                     })
                     .collect(),
@@ -4915,8 +7253,10 @@ mod tests {
             native_keys: false,
             modal: None,
             notice: None,
+            notice_sticky: false,
             panes: Vec::new(),
             scroll_drag: None,
+            mouse_capture: None,
             selection: None,
             tab_hits: Vec::new(),
             interaction_visible: true,
@@ -4926,6 +7266,7 @@ mod tests {
             next_request: 1,
             pending_creations: VecDeque::new(),
             state_dirty: false,
+            last_saved: None,
             metadata_pending: false,
             metadata_checked: Instant::now() - App::METADATA_INTERVAL,
             socket: root.join("agent.sock"),
@@ -5106,5 +7447,60 @@ mod tests {
             panic!("expected project opening");
         };
         assert_eq!(path, target);
+    }
+
+    #[test]
+    fn intent_error_overflow_keeps_final_cause() {
+        let (mut app, queued, _events) = interaction_app();
+        app.open_intent().unwrap();
+        queued.recv().unwrap();
+        let screen = |app: &mut App, height: u16, error: &str| {
+            let Some(Modal::Intent(dialog)) = &mut app.modal else {
+                panic!("expected interpreter dialog");
+            };
+            dialog.loading = false;
+            dialog.error = Some(error.into());
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(80, height)).unwrap();
+            terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (0..height)
+                .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>()
+        };
+        let shown = |rows: &[String], text: &str| rows.iter().any(|row| row.contains(text));
+        let controls = "Enter send · Esc cancel · Ctrl+U clear · F2 manual controls";
+        let long = format!(
+            "OMP intent interpreter failed (1): {}FINAL-CAUSE",
+            "stderr ".repeat(130)
+        );
+        let short = "OMP intent interpreter failed (1): model unavailable";
+        // 18 rows leave a one-row status area; 24 rows leave seven.
+        for height in [18, 24] {
+            let rows = screen(&mut app, height, &long);
+            assert!(shown(&rows, "FINAL-CAUSE"), "80x{height}: {rows:#?}");
+            assert!(shown(&rows, "↑"), "80x{height}: {rows:#?}");
+            assert!(shown(&rows, controls), "80x{height}: {rows:#?}");
+
+            let rows = screen(&mut app, height, short);
+            assert!(shown(&rows, short), "80x{height}: {rows:#?}");
+            assert!(!shown(&rows, "↑"), "80x{height}: {rows:#?}");
+            assert!(shown(&rows, controls), "80x{height}: {rows:#?}");
+        }
+    }
+
+    #[test]
+    fn narrowest_tab_bar_keeps_the_focused_tab_clickable() {
+        let (mut app, _queued, _events) = interaction_app();
+        app.project.active = 1;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(30, 10)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let hit = app
+            .tab_hits
+            .iter()
+            .find(|hit| hit.project.is_none() && hit.workspace == Some(app.focused_index()))
+            .expect("the focused workspace has no click target in the 6-column tab bar");
+        // The key-mode label takes the last 24 of 30 columns.
+        assert!(hit.area.width > 0 && hit.area.right() <= 6);
     }
 }

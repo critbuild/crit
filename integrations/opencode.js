@@ -15,10 +15,18 @@ function ownsLocalLifecycle() {
 }
 
 let claimed = false;
+// OpenCode's TUI copies process.env into its server Worker before the TUI plugin
+// claims the pane, so tool, `!` shell and PTY children would inherit an empty
+// owner. Pin it to this process so a nested `opencode run` or `omp` cannot claim.
+const pinOwner = {
+  "shell.env": async (_input, output) => {
+    if (process.env.CRIT_ENV === "1") output.env.CRIT_AGENT_PID = String(process.pid);
+  },
+};
 async function server() {
-  if (claimed || !ownsLocalLifecycle()) return {};
+  if (claimed || !ownsLocalLifecycle()) return pinOwner;
   const reporter = createReporter();
-  if (!reporter) return {};
+  if (!reporter) return pinOwner;
   claimed = true;
   let selected = process.env.CRIT_RESUME_ID || undefined;
   let state = "unknown";
@@ -44,6 +52,7 @@ async function server() {
   }
   await publish();
   return {
+    ...pinOwner,
     "chat.message": async ({ sessionID }) => {
       if (!sessionID || parents.has(sessionID)) return;
       if (selected !== sessionID) { epoch += 1; blockers.clear(); }
@@ -78,15 +87,18 @@ async function server() {
           break;
         case "session.status":
           if (id !== selected) return;
-          if (data.status?.type === "busy" || data.status?.type === "retry") state = "working";
-          else if (data.status?.type === "idle") state = "idle";
-          else return;
-          error = undefined;
+          if (data.status?.type === "busy" || data.status?.type === "retry") {
+            state = "working";
+            error = undefined;
+          } else if (data.status?.type === "idle") {
+            // OpenCode publishes idle right after session.error; keep the error until the next turn.
+            if (error) return;
+            state = "idle";
+          } else return;
           break;
         case "session.idle":
-          if (id !== selected) return;
+          if (id !== selected || error) return;
           state = "idle";
-          error = undefined;
           break;
         case "session.error":
           if (id !== selected || data.error?.name === "MessageAbortedError") return;

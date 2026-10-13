@@ -21,6 +21,8 @@ pub struct Worktree {
     pub head: String,
     pub is_main: bool,
     pub locked: bool,
+    pub bare: bool,
+    pub prunable: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -38,6 +40,12 @@ impl Worktree {
         } else {
             "terminal"
         }
+    }
+
+    /// Bare repositories have no files and prunable entries (checkout deleted
+    /// outside Git) have no directory, so neither can be opened.
+    pub fn is_checkout(&self) -> bool {
+        !self.bare && !self.prunable
     }
 }
 
@@ -110,7 +118,9 @@ pub fn discover_optional(path: &Path) -> Result<Option<Repository>> {
     } else {
         path
     };
+    // The "not a git repository" match below needs Git's untranslated message.
     let output = git(cwd)
+        .env("LC_ALL", "C")
         .args(["rev-parse", "--show-toplevel"])
         .output()
         .context("could not run discover Git worktree")?;
@@ -205,11 +215,42 @@ pub fn projects(start: &Path, home: Option<&Path>) -> Vec<PathBuf> {
 }
 
 pub fn list(repository: &Repository) -> Result<Vec<Worktree>> {
-    let output = checked(
-        git(&repository.root).args(["worktree", "list", "--porcelain", "-z"]),
-        "list Git worktrees",
-    )?;
-    parse_list(&output.stdout)
+    // The discovered root may be removed or moved later; the common directory
+    // outlives every linked checkout and Git lists identically from it.
+    let output = git(&repository.common_dir)
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()
+        .context("could not run list Git worktrees")?;
+    let mut trees = if output.status.code() == Some(129) {
+        // Git < 2.36 has no -z; its newline porcelain never quotes paths.
+        let output = checked(
+            git(&repository.common_dir).args(["worktree", "list", "--porcelain"]),
+            "list Git worktrees",
+        )?;
+        parse_list(&output.stdout, b'\n')?
+    } else {
+        ensure!(
+            output.status.success(),
+            "list Git worktrees: {}",
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        );
+        parse_list(&output.stdout, 0)?
+    };
+    // Git reports a submodule's Git directory as its main worktree; the real
+    // checkout is the one `core.worktree` names.
+    if let Some(main) = trees.first_mut()
+        && !main.bare
+        && main.path == repository.common_dir
+        && let Ok(top) = checked(
+            git(&repository.common_dir).args(["--git-dir=.", "rev-parse", "--show-toplevel"]),
+            "locate submodule checkout",
+        )
+        && let Ok(path) = fs::canonicalize(output_path(&top.stdout))
+    {
+        main.id = digest(path.as_os_str().as_bytes());
+        main.path = path;
+    }
+    Ok(trees)
 }
 
 /// Registered checkouts first, then local branches not checked out anywhere.
@@ -219,10 +260,17 @@ pub fn split_targets(repository: &Repository, focused: &str) -> Result<Vec<Split
         git(&repository.root).args(["for-each-ref", "--format=%(refname:strip=2)", "refs/heads/"]),
         "list local branches",
     )?;
-    let branches = String::from_utf8(branches.stdout).context("non-UTF-8 Git branch name")?;
-    let mut targets = Vec::with_capacity(trees.len() + branches.lines().count());
+    // A branch name that is not UTF-8 cannot round-trip to Git as a `String`.
+    let names = || {
+        branches
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter_map(|line| std::str::from_utf8(line).ok())
+            .filter(|line| !line.is_empty())
+    };
+    let mut targets = Vec::with_capacity(trees.len() + names().count());
     targets.extend(trees.into_iter().map(SplitTarget::Worktree));
-    for branch in branches.lines() {
+    for branch in names() {
         if !targets
             .iter()
             .any(|target| matches!(target, SplitTarget::Worktree(tree) if tree.branch == branch))
@@ -230,8 +278,12 @@ pub fn split_targets(repository: &Repository, focused: &str) -> Result<Vec<Split
             targets.push(SplitTarget::Branch(branch.to_owned()));
         }
     }
-    // Keep the focused checkout in the branch exclusion set until discovery ends.
-    targets.retain(|target| !matches!(target, SplitTarget::Worktree(tree) if tree.id == focused));
+    // Bare and deleted checkouts cannot be opened but Git still refuses their
+    // branches: keep them and the focused checkout in the branch exclusion set
+    // until discovery ends.
+    targets.retain(|target| {
+        !matches!(target, SplitTarget::Worktree(tree) if tree.id == focused || !tree.is_checkout())
+    });
     Ok(targets)
 }
 
@@ -293,24 +345,28 @@ fn branch_exists(repository: &Repository, branch: &str) -> Result<bool> {
             "--quiet",
             &format!("refs/heads/{branch}"),
         ])
-        .status()
+        .output()
         .context("check whether branch exists")?;
     ensure!(
-        exists.success() || exists.code() == Some(1),
-        "could not inspect branch {branch:?}"
+        exists.status.success() || exists.status.code() == Some(1),
+        "could not inspect branch {branch:?}: {}",
+        String::from_utf8_lossy(&exists.stderr).trim_end()
     );
-    Ok(exists.success())
+    Ok(exists.status.success())
 }
 
-fn parse_list(bytes: &[u8]) -> Result<Vec<Worktree>> {
+fn parse_list(bytes: &[u8], separator: u8) -> Result<Vec<Worktree>> {
     let mut trees = Vec::new();
     let mut current: Option<Worktree> = None;
-    for field in bytes.split(|byte| *byte == 0) {
+    for field in bytes.split(|byte| *byte == separator) {
         if let Some(path) = field.strip_prefix(b"worktree ") {
             if let Some(tree) = current.take() {
                 trees.push(tree);
             }
-            let path = canonical_path(Path::new(OsStr::from_bytes(path)))?;
+            // An unresolvable registered path (dead mount, no permission) must not
+            // break the whole listing; Git prints absolute paths.
+            let raw = Path::new(OsStr::from_bytes(path));
+            let path = canonical_path(raw).unwrap_or_else(|_| raw.to_path_buf());
             current = Some(Worktree {
                 id: digest(path.as_os_str().as_bytes()),
                 path,
@@ -318,15 +374,21 @@ fn parse_list(bytes: &[u8]) -> Result<Vec<Worktree>> {
                 head: String::new(),
                 is_main: trees.is_empty(),
                 locked: false,
+                bare: false,
+                prunable: false,
             });
         } else if let Some(tree) = current.as_mut() {
             if let Some(head) = field.strip_prefix(b"HEAD ") {
                 tree.head = String::from_utf8(head.to_vec()).context("non-UTF-8 Git object id")?;
             } else if let Some(branch) = field.strip_prefix(b"branch refs/heads/") {
-                tree.branch =
-                    String::from_utf8(branch.to_vec()).context("non-UTF-8 Git branch name")?;
+                // Display and comparison only: checkouts are reopened by path.
+                tree.branch = String::from_utf8_lossy(branch).into_owned();
             } else if field == b"locked" || field.starts_with(b"locked ") {
                 tree.locked = true;
+            } else if field == b"bare" {
+                tree.bare = true;
+            } else if field == b"prunable" || field.starts_with(b"prunable ") {
+                tree.prunable = true;
             }
         }
     }
@@ -349,13 +411,14 @@ pub(crate) fn ignored_local_file(root: &Path, relative: &Path) -> Result<bool> {
     let ignored = git(root)
         .args(["check-ignore", "--quiet", "--"])
         .arg(relative)
-        .status()
+        .output()
         .context("inspect local configuration ignore rule")?;
     ensure!(
-        ignored.success() || ignored.code() == Some(1),
-        "could not inspect local configuration ignore rule"
+        ignored.status.success() || ignored.status.code() == Some(1),
+        "could not inspect local configuration ignore rule: {}",
+        String::from_utf8_lossy(&ignored.stderr).trim_end()
     );
-    Ok(ignored.success())
+    Ok(ignored.status.success())
 }
 
 fn branch_slug(branch: &str) -> String {
@@ -403,6 +466,26 @@ pub fn create(repository: &Repository, branch: &str, base: Option<&str>) -> Resu
             "resolve worktree base commit",
         )?;
         if exists {
+            // A base applies to new branches only; never silently open the
+            // existing branch at another commit.
+            let existing = checked(
+                git(&repository.root).args([
+                    "rev-parse",
+                    "--verify",
+                    "--end-of-options",
+                    &format!("refs/heads/{branch}^{{commit}}"),
+                ]),
+                "resolve existing branch commit",
+            )?;
+            if existing.stdout != output.stdout {
+                let id = String::from_utf8_lossy(&existing.stdout);
+                let id = id.trim_end();
+                bail!(
+                    "branch {branch} already exists at {}; it was not created from {}. Omit the base to open the existing branch, or choose a new name",
+                    id.get(..12).unwrap_or(id),
+                    base.unwrap_or("HEAD")
+                );
+            }
             None
         } else {
             Some(
@@ -473,30 +556,64 @@ pub fn remove(repository: &Repository, worktree: &Worktree) -> Result<()> {
         .context("worktree is not registered in this repository")?;
     ensure!(!current.is_main, "refusing to remove the main worktree");
     ensure!(!current.locked, "refusing to remove a locked worktree");
-    let status = checked(
-        git(&current.path).args([
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--ignore-submodules=none",
-        ]),
-        "check worktree for local changes",
-    )?;
-    if !status.stdout.is_empty() {
-        bail!(
-            "refusing to remove dirty worktree {}",
-            current.path.display()
-        );
+    // A checkout deleted outside Git leaves only its registration: nothing to inspect.
+    let missing = matches!(
+        fs::symlink_metadata(&current.path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    );
+    if !missing {
+        let status = checked(
+            git(&current.path).args([
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ]),
+            "check worktree for local changes",
+        )?;
+        if !status.stdout.is_empty() {
+            bail!(
+                "refusing to remove dirty worktree {}",
+                current.path.display()
+            );
+        }
+        ensure_deletable(&current.path)?;
     }
     // Git performs its own final cleanliness/lock checks. Never force, and never
     // delete the branch: a checkout and its branch have independent lifetimes.
     checked(
-        git(&repository.root)
+        git(&repository.common_dir)
             .args(["worktree", "remove", "--"])
             .arg(&current.path),
         "remove Git worktree",
     )?;
+    Ok(())
+}
+
+/// Git deletes ignored files along with the checkout and, when one deletion
+/// fails midway, still drops the registration, leaving a half-deleted checkout.
+/// Refuse up front when a directory cannot be emptied.
+fn ensure_deletable(root: &Path) -> Result<()> {
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let name = std::ffi::CString::new(directory.as_os_str().as_bytes())
+            .with_context(|| format!("inspect {}", directory.display()))?;
+        ensure!(
+            unsafe { libc::access(name.as_ptr(), libc::R_OK | libc::W_OK | libc::X_OK) } == 0,
+            "refusing to remove: {} is not writable by you (often created by a container); fix its ownership or delete it, then retry",
+            directory.display()
+        );
+        let entries =
+            fs::read_dir(&directory).with_context(|| format!("read {}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.with_context(|| format!("read {}", directory.display()))?;
+            // Symlinks are never followed: Git removes the link itself.
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                pending.push(entry.path());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -786,7 +903,7 @@ mod tests {
         bytes.extend_from_slice(
             b"\0HEAD abc\0branch refs/heads/topic\0locked because work matters\0\0",
         );
-        let trees = parse_list(&bytes).unwrap();
+        let trees = parse_list(&bytes, 0).unwrap();
         assert_eq!(trees.len(), 1);
         assert_eq!(trees[0].path, fs::canonicalize(path).unwrap());
         assert_eq!(trees[0].branch, "topic");
@@ -848,5 +965,248 @@ mod tests {
         let second = create(&repository, "topic-a", None).unwrap();
         assert_ne!(first.path, second.path);
         assert_ne!(first.id, second.id);
+    }
+
+    #[test]
+    fn list_and_remove_survive_loss_of_the_discovered_root() {
+        let (_directory, repository) = repository();
+        let first = create(&repository, "first", None).unwrap();
+        let second = create(&repository, "second", None).unwrap();
+        // Crit may have been opened inside a linked checkout that is removed later.
+        let opened = discover(&first.path).unwrap();
+        assert_eq!(opened.root, first.path);
+        remove(&opened, &first).unwrap();
+        assert!(!opened.root.exists());
+        let trees = list(&opened).unwrap();
+        assert_eq!(trees.len(), 2);
+        assert!(trees[0].is_main);
+        assert!(trees.iter().any(|tree| tree.id == second.id));
+        remove(&opened, &second).unwrap();
+        assert_eq!(list(&opened).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn newline_porcelain_from_git_2_34_parses() {
+        // Verbatim output of Git 2.34.1, which has no `-z`: main, a deleted checkout, a locked one.
+        let bytes = b"worktree /tmp/tmp.DxGRnf9rz2/repo\nHEAD 892b551236f0a36cd8a198af890d0cd3c388c3a9\nbranch refs/heads/main\n\nworktree /tmp/tmp.DxGRnf9rz2/gone\nHEAD 892b551236f0a36cd8a198af890d0cd3c388c3a9\nbranch refs/heads/gone\nprunable gitdir file points to non-existent location\n\nworktree /tmp/tmp.DxGRnf9rz2/locked\nHEAD 892b551236f0a36cd8a198af890d0cd3c388c3a9\nbranch refs/heads/locked\nlocked on usb\n\n";
+        let trees = parse_list(bytes, b'\n').unwrap();
+        assert_eq!(trees.len(), 3);
+        assert_eq!(
+            trees.iter().map(|tree| tree.is_main).collect::<Vec<_>>(),
+            [true, false, false]
+        );
+        assert_eq!(
+            trees.iter().map(|tree| tree.prunable).collect::<Vec<_>>(),
+            [false, true, false]
+        );
+        assert_eq!(
+            trees.iter().map(|tree| tree.locked).collect::<Vec<_>>(),
+            [false, false, true]
+        );
+        assert_eq!(trees[1].branch, "gone");
+        assert!(trees[2].path.ends_with("locked"));
+    }
+
+    #[test]
+    fn submodule_main_worktree_is_its_checkout() {
+        let (directory, library) = repository();
+        let superproject = directory.path().join("super");
+        fs::create_dir(&superproject).unwrap();
+        checked(
+            git(&superproject).args(["init", "-b", "main"]),
+            "init superproject",
+        )
+        .unwrap();
+        checked(
+            git(&superproject)
+                .args(["-c", "protocol.file.allow=always", "submodule", "add", "--"])
+                .arg(&library.root)
+                .arg("libs/lib"),
+            "add submodule",
+        )
+        .unwrap();
+        let checkout = fs::canonicalize(superproject.join("libs/lib")).unwrap();
+        let submodule = discover(&checkout).unwrap();
+        assert_ne!(submodule.common_dir, checkout);
+        let trees = list(&submodule).unwrap();
+        assert_eq!(trees[0].path, checkout);
+        assert!(trees[0].is_main && trees[0].is_checkout());
+    }
+
+    #[test]
+    fn missing_checkouts_are_hidden_removable_and_recreatable() {
+        let (_directory, repository) = repository();
+        let tree = create(&repository, "feat", None).unwrap();
+        fs::remove_dir_all(&tree.path).unwrap();
+        let trees = list(&repository).unwrap();
+        let listed = trees.iter().find(|listed| listed.id == tree.id).unwrap();
+        assert!(listed.prunable && !listed.is_checkout());
+        // Git still refuses the branch while the registration exists.
+        let targets = split_targets(&repository, &trees[0].id).unwrap();
+        assert!(targets.iter().all(|target| match target {
+            SplitTarget::Worktree(tree) => tree.branch != "feat",
+            SplitTarget::Branch(branch) => branch != "feat",
+        }));
+        remove(&repository, &tree).unwrap();
+        assert_eq!(list(&repository).unwrap().len(), 1);
+        let recreated = create(&repository, "feat", None).unwrap();
+        assert_eq!(recreated.id, tree.id);
+    }
+
+    #[test]
+    fn bare_repository_entry_is_not_offered_as_a_checkout() {
+        let (directory, source) = repository();
+        checked(
+            git(directory.path())
+                .args(["clone", "--bare", "--quiet", "--"])
+                .arg(&source.root)
+                .arg("bare.git"),
+            "clone bare repository",
+        )
+        .unwrap();
+        checked(
+            git(&directory.path().join("bare.git")).args([
+                "worktree",
+                "add",
+                "--quiet",
+                "../wt-main",
+                "main",
+            ]),
+            "add checkout to bare repository",
+        )
+        .unwrap();
+        let repository = discover(&directory.path().join("wt-main")).unwrap();
+        let trees = list(&repository).unwrap();
+        assert!(trees[0].is_main && trees[0].bare && !trees[0].is_checkout());
+        let focused = trees.iter().find(|tree| tree.branch == "main").unwrap();
+        let targets = split_targets(&repository, &focused.id).unwrap();
+        assert!(
+            !targets.iter().any(
+                |target| matches!(target, SplitTarget::Worktree(tree) if tree.branch.is_empty())
+            )
+        );
+        let created = create(&repository, "topic", None).unwrap();
+        let expected = fs::canonicalize(directory.path())
+            .unwrap()
+            .join(".crit-worktrees");
+        assert!(created.path.starts_with(expected));
+    }
+
+    #[test]
+    fn non_utf8_branch_names_do_not_break_listing() {
+        let (_directory, repository) = repository();
+        let name = OsStr::from_bytes(b"caf\xe9");
+        checked(
+            git(&repository.root).arg("branch").arg(name),
+            "create non-UTF-8 branch",
+        )
+        .unwrap();
+        let focused = list(&repository).unwrap().remove(0).id;
+        assert!(split_targets(&repository, &focused).unwrap().is_empty());
+        checked(
+            git(&repository.root).arg("switch").arg(name),
+            "check out non-UTF-8 branch",
+        )
+        .unwrap();
+        let trees = list(&repository).unwrap();
+        assert!(trees[0].label().contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn existing_branch_at_another_commit_refuses_an_explicit_base() {
+        let (_directory, repository) = repository();
+        for name in ["topic", "same"] {
+            checked(
+                git(&repository.root).args(["branch", name]),
+                "create existing test branch",
+            )
+            .unwrap();
+        }
+        let old = list(&repository).unwrap().remove(0).head;
+        checked(
+            git(&repository.root).args([
+                "-c",
+                "user.name=Crit Test",
+                "-c",
+                "user.email=crit@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "advance main",
+            ]),
+            "advance main",
+        )
+        .unwrap();
+        let error = create(&repository, "topic", Some("main"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("already exists"), "{error}");
+        assert_eq!(list(&repository).unwrap().len(), 1);
+        assert_eq!(create(&repository, "topic", None).unwrap().head, old);
+        // A base that names the branch's own commit is not a conflict.
+        assert_eq!(create(&repository, "same", Some("same")).unwrap().head, old);
+    }
+
+    #[test]
+    fn ignore_rule_errors_include_git_reason() {
+        let (_directory, repository) = repository();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), repository.root.join("env")).unwrap();
+        let error = ignored_local_file(&repository.root, Path::new("env/secret.env"))
+            .unwrap_err()
+            .to_string();
+        // Git echoes the pathspec in every locale: only its stderr can put it here.
+        assert!(error.contains("env/secret.env"), "{error}");
+    }
+
+    #[test]
+    fn removal_refuses_unwritable_directories_and_keeps_checkout() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_directory, repository) = repository();
+        fs::create_dir_all(repository.common_dir.join("info")).unwrap();
+        fs::write(repository.common_dir.join("info/exclude"), "data/\n").unwrap();
+        let tree = create(&repository, "db", None).unwrap();
+        let data = tree.path.join("data/pg");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("PG_VERSION"), "17").unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o500)).unwrap();
+        let refused = remove(&repository, &tree);
+        let registered = list(&repository)
+            .unwrap()
+            .iter()
+            .any(|listed| listed.id == tree.id);
+        // Restore access before asserting so a failure still lets the directory go.
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        let error = refused.unwrap_err().to_string();
+        assert!(error.contains("not writable"), "{error}");
+        assert!(registered && tree.path.join(".git").exists());
+        assert!(data.join("PG_VERSION").exists());
+        remove(&repository, &tree).unwrap();
+        assert!(!tree.path.exists());
+    }
+
+    #[test]
+    fn inaccessible_worktree_does_not_break_listing() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (directory, repository) = repository();
+        let parent = directory.path().join("mnt");
+        fs::create_dir(&parent).unwrap();
+        checked(
+            git(&repository.root)
+                .args(["worktree", "add", "-b", "far"])
+                .arg(parent.join("far")),
+            "create distant checkout",
+        )
+        .unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
+        let trees = list(&repository);
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(trees.unwrap().len(), 2);
     }
 }

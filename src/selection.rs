@@ -196,4 +196,16 @@ mod tests {
             Some("https://example.org/a(b)")
         );
     }
+    #[test]
+    fn selection_survives_widened_scrollback() {
+        let mut parser = vt100::Parser::new(4, 40, 100);
+        for line in 0..20 {
+            parser.process(format!("line-{line:02}\r\n").as_bytes());
+        }
+        parser.screen_mut().set_size(4, 80);
+        parser.screen_mut().set_scrollback(6);
+        let mut selection = Selection::new(1, Rect::new(1, 3, 80, 4), parser.screen(), 1, 3);
+        selection.update(80, 6);
+        assert_eq!(selection.text(), "line-11\nline-12\nline-13\nline-14");
+    }
 }

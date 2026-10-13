@@ -351,9 +351,23 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
             );
             assert!(!home.path().join(".git").exists());
 
-            // Reopening home selects the existing session instead of losing its state.
+            // Choosing home again opens another tab with a fresh session; the first tab
+            // keeps its state.
             drive_until(&mut writer, &rx, &mut screen, b"\x1b[9;6u", in_repo);
             drive_until(&mut writer, &rx, &mut screen, b"\x1b[116;6u\r", in_home);
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                b"printf 'home-fresh:%s\\n' \"${HOME_TAB_TOKEN-unset}\"\r",
+                |contents| contents.contains("home-fresh:unset"),
+            );
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[113;6u", |contents| {
+                contents.contains("Yes, delete worktree")
+            });
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[H\r", |contents| {
+                in_home(contents) && !contents.contains("Yes, delete worktree")
+            });
             drive_until(
                 &mut writer,
                 &rx,
@@ -782,4 +796,216 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+/// Crit on its own PTY with a throwaway `$HOME`. Its `omp` fails the update check, so
+/// startup has a notice of its own, unless `programs` replaces it; no other agent or updater
+/// program can run except the `(name, script)` ones given.
+struct Crit {
+    _child: ChildGuard,
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+    writer: Box<dyn Write + Send>,
+    rx: mpsc::Receiver<Vec<u8>>,
+    screen: vt100::Parser,
+}
+
+impl Crit {
+    fn start(
+        home: &std::path::Path,
+        cwd: &std::path::Path,
+        args: &[&str],
+        programs: &[(&str, &str)],
+    ) -> Self {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = home.join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let git = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|directory| directory.join("git"))
+            .find(|path| path.is_file())
+            .unwrap()
+            .canonicalize()
+            .unwrap();
+        std::os::unix::fs::symlink(git, bin.join("git")).unwrap();
+        for (name, script) in [("omp", "#!/bin/sh\necho refused >&2\nexit 1\n")]
+            .iter()
+            .chain(programs)
+        {
+            std::fs::write(bin.join(name), script).unwrap();
+            std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let pair = portable_pty::native_pty_system()
+            .openpty(PtySize {
+                rows: 24,
+                cols: 160,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .unwrap();
+        let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_crit"));
+        command.arg("--no-kitty");
+        command.args(args);
+        command.cwd(cwd);
+        command.env("SHELL", "/bin/sh");
+        command.env("TERM", "xterm-256color");
+        command.env("HOME", home);
+        // Workspace state must land in the throwaway home, never in the user's.
+        command.env_remove("XDG_STATE_HOME");
+        command.env_remove("XDG_DATA_HOME");
+        command.env("PATH", &bin);
+        command.env("PS1", "CRIT_TEST> ");
+        command.env("XDG_RUNTIME_DIR", home);
+        let child = ChildGuard(pair.slave.spawn_command(command).unwrap());
+        drop(pair.slave);
+        let mut reader = pair.master.try_clone_reader().unwrap();
+        let writer = pair.master.take_writer().unwrap();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = [0; 8192];
+            while let Ok(count) = reader.read(&mut bytes) {
+                if count == 0 || tx.send(bytes[..count].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            _child: child,
+            _master: pair.master,
+            writer,
+            rx,
+            screen: vt100::Parser::new(24, 160, 0),
+        }
+    }
+
+    fn drive(&mut self, input: &[u8], ready: impl Fn(&str) -> bool) {
+        drive_until(&mut self.writer, &self.rx, &mut self.screen, input, ready);
+    }
+}
+
+fn seed_snapshot(home: &std::path::Path, bytes: &[u8]) {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = home.join(".local/state/crit");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let file = directory.join("workspace.json");
+    std::fs::write(&file, bytes).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+fn restored_workspace_still_opens_explicit_repo() {
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let restored = home_path.join("alpha-restored");
+    let requested = home_path.join("bravo-requested");
+    std::fs::create_dir(&restored).unwrap();
+    std::fs::create_dir(&requested).unwrap();
+    seed_snapshot(
+        &home_path,
+        &serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "projects": [{
+                "workspaces": [{
+                    "path": restored,
+                    "source": null,
+                    "sessions": [{"kind": "shell", "resume": null}],
+                    "selected": 0
+                }],
+                "active": 0,
+                "secondary": null,
+                "focus_secondary": false,
+                "layout": "full",
+                "split_ratio": 5000
+            }],
+            "active_project": 0,
+            "native_keys": false
+        }))
+        .unwrap(),
+    );
+    let mut crit = Crit::start(
+        &home_path,
+        &home_path,
+        &["--repo", requested.to_str().unwrap(), "--agent", "shell"],
+        &[],
+    );
+    crit.drive(b"", |screen| screen.contains("CRIT_TEST>"));
+    let contents = crit.screen.screen().contents();
+    let tabs = contents.lines().next().unwrap();
+    assert!(
+        tabs.contains("alpha-restored") && tabs.contains("bravo-requested"),
+        "the restored project and the requested folder must both be tabs: {tabs}"
+    );
+    // The requested folder is the one the visible shell runs in.
+    let expected = format!("opened-in:{}", requested.display());
+    crit.drive(b"printf 'opened-%s:%s\\n' in \"$PWD\"\r", |screen| {
+        screen.contains(&expected)
+    });
+}
+
+#[test]
+fn startup_keeps_update_and_restore_notices() {
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    seed_snapshot(&home_path, b"{broken");
+    let mut crit = Crit::start(&home_path, &home_path, &[], &[]);
+    crit.drive(b"", |screen| {
+        screen.contains("OMP update failed")
+            && screen.contains("Saved workspace could not be loaded")
+    });
+}
+
+#[test]
+fn restore_checks_every_opencode_chat_with_one_query() {
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let project = home_path.join("restored-chats");
+    std::fs::create_dir(&project).unwrap();
+    let log = home_path.join("opencode-db.log");
+    let chats: Vec<_> = (1..=5).map(|number| format!("ses_{number}")).collect();
+    seed_snapshot(
+        &home_path,
+        &serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "projects": [{
+                "workspaces": [{
+                    "path": project,
+                    "source": null,
+                    "sessions": chats
+                        .iter()
+                        .map(|chat| serde_json::json!({"kind": "opencode", "resume": chat}))
+                        .collect::<Vec<_>>(),
+                    "selected": 0
+                }],
+                "active": 0,
+                "secondary": null,
+                "focus_secondary": false,
+                "layout": "full",
+                "split_ratio": 5000
+            }],
+            "active_project": 0,
+            "native_keys": false
+        }))
+        .unwrap(),
+    );
+    // `opencode db` lists every chat as existing and each call is logged; the upgrade check
+    // returns at once and the agent itself just stays alive.
+    let rows = serde_json::to_string(
+        &chats
+            .iter()
+            .map(|chat| serde_json::json!({"id": chat}))
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let opencode = format!(
+        "#!/bin/sh\ncase \"$1\" in\n  db) echo \"$*\" >> '{}'; printf '%s' '{rows}';;\n  upgrade) exit 0;;\n  *) exec /bin/sleep 30;;\nesac\n",
+        log.display()
+    );
+    let mut crit = Crit::start(&home_path, &home_path, &[], &[("opencode", &opencode)]);
+    crit.drive(b"", |screen| screen.contains("restored-chats"));
+    let queries = std::fs::read_to_string(&log).unwrap();
+    assert_eq!(queries.lines().count(), 1, "{queries}");
+    assert!(
+        queries.contains("WHERE id IN ('ses_1','ses_2','ses_3','ses_4','ses_5')"),
+        "{queries}"
+    );
 }

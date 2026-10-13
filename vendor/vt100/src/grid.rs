@@ -74,7 +74,38 @@ impl Grid {
             self.scroll_bottom = size.rows - 1;
         }
 
+        // Keep the cursor row on screen: rows above it that no longer fit
+        // move to scrollback (as xterm, kitty and tmux do), so the truncation
+        // below only drops rows under the cursor.
+        let excess = (self.pos.row + 1).saturating_sub(size.rows);
+        if excess > 0 {
+            for row in self.rows.drain(..usize::from(excess)) {
+                if self.scrollback_len > 0 {
+                    self.scrollback.push_back(row);
+                }
+            }
+            while self.scrollback.len() > self.scrollback_len {
+                self.scrollback.pop_front();
+            }
+            if self.scrollback_offset > 0 {
+                self.scrollback_offset = self
+                    .scrollback
+                    .len()
+                    .min(self.scrollback_offset + usize::from(excess));
+            }
+            self.pos.row -= excess;
+            self.saved_pos.row = self.saved_pos.row.saturating_sub(excess);
+        }
+
         self.size = size;
+        // every visible row must span size.cols, including scrollback rows
+        // that were written when the grid was narrower. history is only ever
+        // padded, never truncated, when the grid gets narrower.
+        for row in &mut self.scrollback {
+            if row.cols() < size.cols {
+                row.resize(size.cols, crate::Cell::new());
+            }
+        }
         for row in &mut self.rows {
             row.resize(size.cols, crate::Cell::new());
         }
@@ -197,6 +228,11 @@ impl Grid {
 
     pub fn set_scrollback(&mut self, rows: usize) {
         self.scrollback_offset = rows.min(self.scrollback.len());
+    }
+
+    pub fn clear_scrollback(&mut self) {
+        self.scrollback.clear();
+        self.scrollback_offset = 0;
     }
 
     pub fn write_contents(&self, contents: &mut String) {
@@ -510,7 +546,7 @@ impl Grid {
                 .unwrap()
                 .is_wide_continuation();
         let row = self.current_row_mut();
-        for _ in 0..count {
+        for _ in 0..count.min(size.cols - pos.col) {
             if wide {
                 row.get_mut(pos.col).unwrap().set_wide_continuation(false);
             }
@@ -542,7 +578,10 @@ impl Grid {
     }
 
     pub fn insert_lines(&mut self, count: u16) {
-        for _ in 0..count {
+        if !self.in_scroll_region() {
+            return;
+        }
+        for _ in 0..count.min(self.scroll_bottom - self.pos.row + 1) {
             self.rows.remove(usize::from(self.scroll_bottom));
             self.rows.insert(usize::from(self.pos.row), self.new_row());
             // self.scroll_bottom is maintained to always be a valid row
@@ -551,6 +590,9 @@ impl Grid {
     }
 
     pub fn delete_lines(&mut self, count: u16) {
+        if !self.in_scroll_region() {
+            return;
+        }
         for _ in 0..(count.min(self.size.rows - self.pos.row)) {
             self.rows
                 .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
@@ -560,24 +602,35 @@ impl Grid {
 
     pub fn scroll_up(&mut self, count: u16) {
         for _ in 0..(count.min(self.size.rows - self.scroll_top)) {
-            self.rows
-                .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
             let removed = self.rows.remove(usize::from(self.scroll_top));
+            // the row that leaves the grid (scrolled out, or evicted from
+            // scrollback) is cleared and reused as the new bottom row
+            let mut recycled = None;
             if self.scrollback_len > 0 && !self.scroll_region_active() {
                 self.scrollback.push_back(removed);
                 while self.scrollback.len() > self.scrollback_len {
-                    self.scrollback.pop_front();
+                    recycled = self.scrollback.pop_front();
                 }
                 if self.scrollback_offset > 0 {
                     self.scrollback_offset =
                         self.scrollback.len().min(self.scrollback_offset + 1);
                 }
+            } else {
+                recycled = Some(removed);
             }
+            let row = match recycled {
+                Some(mut row) => {
+                    row.reset(self.size.cols);
+                    row
+                }
+                None => self.new_row(),
+            };
+            self.rows.insert(usize::from(self.scroll_bottom), row);
         }
     }
 
     pub fn scroll_down(&mut self, count: u16) {
-        for _ in 0..count {
+        for _ in 0..count.min(self.scroll_bottom - self.scroll_top + 1) {
             self.rows.remove(usize::from(self.scroll_bottom));
             self.rows
                 .insert(usize::from(self.scroll_top), self.new_row());
@@ -595,8 +648,7 @@ impl Grid {
             self.scroll_top = 0;
             self.scroll_bottom = self.size().rows - 1;
         }
-        self.pos.row = self.scroll_top;
-        self.pos.col = 0;
+        self.set_pos(Pos { row: 0, col: 0 });
     }
 
     fn in_scroll_region(&self) -> bool {
@@ -640,7 +692,11 @@ impl Grid {
         let in_scroll_region = self.in_scroll_region();
         // need to account for clamping by both row_clamp_top and by
         // saturating_sub
-        let extra_lines = count.saturating_sub(self.pos.row);
+        let extra_lines = if in_scroll_region {
+            count.saturating_sub(self.pos.row)
+        } else {
+            0
+        };
         self.pos.row = self.pos.row.saturating_sub(count);
         let lines = self.row_clamp_top(in_scroll_region);
         self.scroll_down(lines + extra_lines);
@@ -677,17 +733,20 @@ impl Grid {
 
     pub fn col_wrap(&mut self, width: u16, wrap: bool) {
         if self.pos.col > self.size.cols - width {
-            let mut prev_pos = self.pos;
+            let prev_pos = self.pos;
             self.pos.col = 0;
             let scrolled = self.row_inc_scroll(1);
-            prev_pos.row -= scrolled;
             let new_pos = self.pos;
-            self.drawing_row_mut(prev_pos.row)
-                // we assume self.pos.row is always valid, and so prev_pos.row
-                // must be valid because it is always less than or equal to
-                // self.pos.row
-                .unwrap()
-                .wrap(wrap && prev_pos.row + 1 == new_pos.row);
+            // when the previous row has scrolled off the top of the grid (a
+            // one-row grid or scroll region) there is no row left to mark
+            if let Some(prev_row) = prev_pos.row.checked_sub(scrolled) {
+                self.drawing_row_mut(prev_row)
+                    // we assume self.pos.row is always valid, and so
+                    // prev_row must be valid because it is always less than
+                    // or equal to self.pos.row
+                    .unwrap()
+                    .wrap(wrap && prev_row + 1 == new_pos.row);
+            }
         }
     }
 

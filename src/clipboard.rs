@@ -31,6 +31,10 @@ pub fn copy_encoded(ty: &[u8], data: &[u8]) -> io::Result<()> {
 }
 
 fn write_copy(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    // An empty OSC 52 payload clears the clipboard, so a blank selection writes nothing.
+    if bytes.is_empty() {
+        return Ok(());
+    }
     writer.write_all(b"\x1b]52;cp;")?;
     // Each input chunk ends on a three-byte boundary, so padding occurs only
     // at the end. Encoding stays on the stack even for large selections.
@@ -239,7 +243,6 @@ mod tests {
     #[test]
     fn selection_encoding_matches_base64_vectors_and_copies_both_selections() {
         for (text, base64) in [
-            ("", ""),
             ("f", "Zg=="),
             ("fo", "Zm8="),
             ("foo", "Zm9v"),
@@ -254,6 +257,13 @@ mod tests {
             assert_eq!(output, format!("\x1b]52;cp;{base64}\x07").as_bytes());
             assert!(valid_base64(base64.as_bytes()));
         }
+    }
+
+    #[test]
+    fn empty_selection_writes_nothing() {
+        let mut output = Vec::new();
+        write_copy(&mut output, b"").unwrap();
+        assert!(output.is_empty());
     }
 
     #[test]

@@ -57,7 +57,9 @@ pub struct Screen {
     alternate_grid: crate::grid::Grid,
 
     attrs: crate::attrs::Attrs,
-    saved_attrs: crate::attrs::Attrs,
+    // DECSC slots for the primary and alternate buffers (as in xterm and
+    // kitty), indexed by whether the alternate screen is active
+    saved_attrs: [crate::attrs::Attrs; 2],
 
     modes: u8,
     mouse_protocol_mode: MouseProtocolMode,
@@ -76,7 +78,7 @@ impl Screen {
             alternate_grid: crate::grid::Grid::new(size, 0),
 
             attrs: crate::attrs::Attrs::default(),
-            saved_attrs: crate::attrs::Attrs::default(),
+            saved_attrs: Default::default(),
 
             modes: 0,
             mouse_protocol_mode: MouseProtocolMode::default(),
@@ -660,12 +662,17 @@ impl Screen {
 
     fn save_cursor(&mut self) {
         self.grid_mut().save_cursor();
-        self.saved_attrs = self.attrs.clone();
+        // the active OSC 8 link is not part of the saved cursor state
+        let slot = usize::from(self.mode(MODE_ALTERNATE_SCREEN));
+        self.saved_attrs[slot] = self.attrs.without_hyperlink();
     }
 
     fn restore_cursor(&mut self) {
         self.grid_mut().restore_cursor();
-        self.attrs = self.saved_attrs.clone();
+        let hyperlink = self.attrs.hyperlink.take();
+        let slot = usize::from(self.mode(MODE_ALTERNATE_SCREEN));
+        self.attrs = self.saved_attrs[slot].clone();
+        self.attrs.hyperlink = hyperlink;
     }
 
     fn set_mode(&mut self, mode: u8) {
@@ -712,7 +719,13 @@ impl Screen {
         let Ok(options) = std::str::from_utf8(options) else {
             return;
         };
-        if uri.is_empty() || options.chars().any(char::is_control) {
+        // vte keeps at most 16 OSC params ("8", the options and 14 URI
+        // parts) and drops the ';' separators after that, gluing the rest of
+        // the string onto the last one: with 14 parts the URI may be mangled
+        if uri.is_empty()
+            || uri.len() >= 14
+            || options.chars().any(char::is_control)
+        {
             return;
         }
         for part in uri {
@@ -765,6 +778,10 @@ impl Screen {
             .try_into()
             // width() can only return 0, 1, or 2
             .unwrap();
+        if width > size.cols {
+            // a wide character does not fit in a one-column terminal
+            return;
+        }
 
         // it doesn't make any sense to wrap if the last column in a row
         // didn't already have contents. don't try to handle the case where a
@@ -1118,6 +1135,7 @@ impl Screen {
             0 => self.grid_mut().erase_all_forward(attrs),
             1 => self.grid_mut().erase_all_backward(attrs),
             2 => self.grid_mut().erase_all(attrs),
+            3 => self.grid_mut().clear_scrollback(),
             _ => unhandled(self),
         }
     }

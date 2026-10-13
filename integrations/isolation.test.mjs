@@ -84,3 +84,67 @@ test("stale selection work is discarded and full u64 identity survives transport
     await rm(directory, { recursive: true, force: true });
   }
 }));
+
+// A Crit stand-in the reporter environment points at: closes the first `drop` connections
+// unanswered, then records and acknowledges each frame.
+async function crit(directory, drop = 0) {
+  const socket = path.join(directory, "agent.sock");
+  const frames = [];
+  let connections = 0;
+  const listener = net.createServer((stream) => {
+    if (++connections <= drop) return stream.destroy();
+    let frame = "";
+    stream.on("data", (data) => {
+      frame += data.toString();
+      if (!frame.endsWith("\n")) return;
+      frames.push(frame);
+      stream.end("\n");
+    });
+  });
+  await new Promise((resolve, reject) => {
+    listener.once("error", reject);
+    listener.listen(socket, resolve);
+  });
+  Object.assign(process.env, { CRIT_ENV: "1", CRIT_SESSION: "7", CRIT_SOCKET: socket, CRIT_AGENT_PID: "" });
+  return {
+    frames,
+    connections: () => connections,
+    close: async () => {
+      await new Promise((resolve) => listener.close(resolve));
+      await rm(directory, { recursive: true, force: true });
+    },
+  };
+}
+
+test("a frame lost to a stalled handshake is retried", () => isolated(async () => {
+  const server = await crit(await mkdtemp(path.join(tmpdir(), "crit-retry-")), 1);
+  try {
+    await createReporter().report("idle");
+    assert.equal(server.connections(), 2, "the unanswered frame is sent again");
+    assert.equal(server.frames.length, 1, "and delivered exactly once");
+    assert.equal(JSON.parse(server.frames[0]).state, "idle");
+  } finally {
+    await server.close();
+  }
+}));
+
+test("message truncation never splits a surrogate pair", () => isolated(async () => {
+  const server = await crit(await mkdtemp(path.join(tmpdir(), "crit-surrogate-")));
+  try {
+    const reporter = createReporter();
+    // Crit's strict JSON parser drops a whole frame that carries a lone surrogate.
+    const received = async (message) => {
+      const count = server.frames.length;
+      await reporter.report("blocked", message);
+      assert.equal(server.frames.length, count + 1, "frame delivered");
+      return JSON.parse(server.frames[count]).message;
+    };
+    const split = await received("a".repeat(511) + "\u{1F600} which file?");
+    assert.ok(split.isWellFormed());
+    assert.equal(split.length, 511, "the cut pair is dropped whole");
+    assert.equal((await received("a".repeat(510) + "\u{1F600} tail")).length, 512, "a pair that fits is kept");
+    assert.equal(await received("lone \uD800 surrogate"), "lone \uFFFD surrogate");
+  } finally {
+    await server.close();
+  }
+}));

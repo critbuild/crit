@@ -14,11 +14,24 @@ pub enum Event {
         session: u64,
         code: String,
     },
+    /// A pane's OSC 52 copy. Only the UI thread may write to the outer terminal.
+    Clipboard {
+        ty: Vec<u8>,
+        data: Vec<u8>,
+    },
+    /// The system clipboard, read off the UI thread: its text, or why it was unreadable.
+    /// `target` is the session that asked, or `None` for the dialog that was open then.
+    ClipboardText {
+        target: Option<u64>,
+        result: Result<String, String>,
+    },
     Agent(AgentUpdate),
     ProjectOpened {
         request: u64,
         result: Result<Project, String>,
         agent: Option<Agent>,
+        /// Open another tab for the folder instead of selecting the one it already has.
+        fresh_tab: bool,
     },
     IntentTargets {
         request: u64,
@@ -29,7 +42,7 @@ pub enum Event {
         result: Result<Plan, String>,
     },
     Projects {
-        base: PathBuf,
+        request: u64,
         projects: Vec<PathBuf>,
     },
     Created {
@@ -61,11 +74,13 @@ pub enum Event {
         preparation_error: Option<String>,
         result: Result<(Worktree, bool), String>,
     },
-    /// Background Git discovery; failures leave the last known metadata intact.
-    Metadata(Vec<Worktree>),
+    /// Background Git discovery: each repository that listed successfully, keyed by its common
+    /// directory. Failures leave the last known metadata intact.
+    Metadata(Vec<(PathBuf, Vec<Worktree>)>),
     Removed {
         tree: String,
-        result: Result<(), String>,
+        /// `Ok` carries why Docker could not be checked, when it could not.
+        result: Result<Option<String>, String>,
     },
     Environment {
         tree: String,

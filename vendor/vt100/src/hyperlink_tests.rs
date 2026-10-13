@@ -164,3 +164,54 @@ fn formatted_contents_and_diffs_roundtrip_cell_links() {
     assert_eq!(link(&replay, 0, 0), None);
     assert_eq!(link(&replay, 0, 2), Some(URI));
 }
+
+#[test]
+fn cursor_restore_does_not_resurrect_a_closed_link() {
+    let mut parser = Parser::new(5, 40, 0);
+    parser.process(
+        b"\x1b]8;;https://a.example/\x1b\\A\x1b7\x1b]8;;\x1b\\B\x1b8C\r\nD",
+    );
+    assert_eq!(link(&parser, 0, 0), Some("https://a.example/"));
+    assert_eq!(parser.screen().cell(0, 1).unwrap().contents(), "C");
+    assert_eq!(link(&parser, 0, 1), None);
+    assert_eq!(link(&parser, 1, 0), None);
+
+    // a link that is still open is not part of the saved cursor state
+    let mut parser = Parser::new(5, 40, 0);
+    parser.process(b"\x1b]8;;https://a.example/\x1b\\a\x1b7b\x1b8c");
+    assert_eq!(parser.screen().cell(0, 1).unwrap().contents(), "c");
+    assert_eq!(link(&parser, 0, 1), Some("https://a.example/"));
+}
+
+#[test]
+fn alternate_screen_link_does_not_leak_through_cursor_restore() {
+    let mut parser = Parser::new(5, 40, 0);
+    parser.process(
+        b"\x1b[?1049h\x1b[H\x1b]8;;https://tui.example/\x1b\\docs\x1b7\
+          \x1b]8;;\x1b\\\x1b[?1049l",
+    );
+    parser.process(b"\x1b[0m$ ls\r\nfile.txt");
+    assert_eq!(parser.screen().cell(0, 0).unwrap().contents(), "$");
+    assert_eq!(link(&parser, 0, 0), None);
+    assert_eq!(link(&parser, 1, 0), None);
+}
+
+#[test]
+fn osc8_uris_that_vte_may_have_truncated_are_ignored() {
+    let uri = |semicolons: usize| {
+        let mut uri = String::from("https://example.com/a");
+        for _ in 0..semicolons {
+            uri.push_str(";x");
+        }
+        uri
+    };
+    let linked = |semicolons: usize| {
+        let mut parser = Parser::new(3, 40, 0);
+        let osc = format!("\x1b]8;;{}\x1b\\L\x1b]8;;\x1b\\", uri(semicolons));
+        parser.process(osc.as_bytes());
+        link(&parser, 0, 0).map(str::to_owned)
+    };
+    assert_eq!(linked(12), Some(uri(12)));
+    assert_eq!(linked(14), None);
+    assert_eq!(linked(20), None);
+}
