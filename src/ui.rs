@@ -1,7 +1,7 @@
 use crate::{
     app::{
         App, COMMANDS, Confirm, IntentDialog, LayoutMode, Modal, Pane, Project, ProjectPicker,
-        Scrollbar, SplitDivider, TabHit, Workspace, project_slots,
+        Scrollbar, SplitDivider, TabHit, Workspace, WorktreeHit, WorktreeHitAction, project_slots,
     },
     integration::AgentState,
     updates::{State as UpdateState, TOOLS as UPDATE_TOOLS},
@@ -35,13 +35,32 @@ fn areas(app: &App, size: Size) -> ([Rect; 2], usize) {
     content.height = content
         .height
         .saturating_sub(notice_height(app.notice.as_deref(), size));
+    // The worktree pane takes columns from the window and the content alike, so a split
+    // that no longer fits beside it collapses; the notice rows keep the full width.
+    let pane = worktree_pane_width(app, size.width);
+    content.width -= pane;
     pane_areas(
         app.project.layout,
         app.project.secondary.is_some(),
         app.project.split_ratio,
-        size,
+        Size::new(size.width - pane, size.height),
         content,
     )
+}
+
+/// Narrowest window that draws the worktree pane; it leaves the terminal at least 34 columns.
+const WORKTREE_PANE_MIN_WINDOW: u16 = 60;
+/// Columns of a worktree pane cell (🗑 or ×): the glyph and a space on each side.
+const WORKTREE_CELL: u16 = 3;
+
+/// Columns the worktree pane takes from a window `width` wide: none while it is closed or the
+/// window is too narrow, where the terminal keeps the full width and the flag stays set.
+fn worktree_pane_width(app: &App, width: u16) -> u16 {
+    if app.worktree_pane.is_some() && width >= WORKTREE_PANE_MIN_WINDOW {
+        (width / 3).clamp(26, 40)
+    } else {
+        0
+    }
 }
 
 fn pane_areas(
@@ -121,10 +140,10 @@ fn split_divider(layout: LayoutMode, panes: [Rect; 2], count: usize) -> Option<S
 fn draw_split_handle(buffer: &mut Buffer, divider: SplitDivider, dragging: bool) {
     let color = if dragging { ACCENT } else { HEADER_DIVIDER };
     buffer[(divider.handle.x, divider.handle.y)]
-        .set_symbol("⟨")
+        .set_symbol("┤")
         .set_fg(color);
     buffer[(divider.handle.right() - 1, divider.handle.y)]
-        .set_symbol("⟩")
+        .set_symbol("├")
         .set_fg(color);
 }
 
@@ -182,6 +201,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         .buffer_mut()
         .set_style(bounds, Style::default().fg(FG).bg(BG));
     app.tab_hits.clear();
+    app.worktree_hits.clear();
+    app.worktree_area = None;
     app.panes.clear();
     if bounds.width < 30 || bounds.height < 10 {
         app.finish_split_drag();
@@ -195,6 +216,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let width = draw_key_mode(frame, app.native_keys, true);
     draw_tabs(frame, app, bounds.width.saturating_sub(width));
     let (regions, count) = areas(app, Size::new(bounds.width, bounds.height));
+    let pane_width = worktree_pane_width(app, bounds.width);
+    let content_width = bounds.width - pane_width;
     app.split_divider = split_divider(app.project.layout, regions, count);
     if app.split_divider.is_none() {
         app.finish_split_drag();
@@ -204,7 +227,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             frame.buffer_mut(),
             0,
             regions[0].bottom(),
-            bounds.width,
+            content_width,
             BORDER,
         );
     }
@@ -236,7 +259,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 frame.buffer_mut(),
                 bounds.x,
                 area.y + 1,
-                bounds.width,
+                content_width,
                 HEADER_DIVIDER,
             );
         }
@@ -258,6 +281,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 .set_fg(HEADER_DIVIDER);
         }
         draw_split_handle(frame.buffer_mut(), divider, app.split_drag.is_some());
+    }
+    if pane_width > 0 {
+        draw_worktree_pane(frame, app, pane_width, regions[count - 1].bottom());
     }
     if let Some(notice) = &app.notice {
         let height = notice_height(Some(notice), Size::new(bounds.width, bounds.height));
@@ -368,6 +394,198 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) {
     }
     tab_hits.truncate(end);
     tab_hits.drain(..start);
+}
+
+/// The longest prefix of `text`, in whole grapheme clusters, that fits `width` columns, and
+/// whether text was cut. A cut prefix leaves its last column free for `…`.
+fn clip_width(text: &str, width: usize) -> (&str, bool) {
+    if text.width() <= width {
+        return (text, false);
+    }
+    let mut used = 0;
+    for (offset, grapheme) in text.grapheme_indices(true) {
+        used += grapheme.width();
+        if used >= width {
+            return (&text[..offset], true);
+        }
+    }
+    (text, false)
+}
+
+/// Draws `text` within `width` columns, ending in `…` where it was cut; returns the next column.
+fn put_clipped(buffer: &mut Buffer, x: u16, y: u16, text: &str, width: u16, style: Style) -> u16 {
+    let (shown, cut) = clip_width(text, usize::from(width));
+    let (end, _) = buffer.set_stringn(x, y, shown, usize::from(width), style);
+    if cut {
+        let left = usize::from(width - (end - x));
+        return buffer.set_stringn(end, y, "…", left, style).0;
+    }
+    end
+}
+
+/// Which of `total` worktree rows show in `capacity` lines when scrolled to `scroll`: the first
+/// row, how many follow it, and whether `↑ n more` / `↓ n more` take a line at the top / bottom.
+/// The offset is clamped so the last row can still be reached.
+fn worktree_window(total: usize, capacity: usize, scroll: usize) -> (usize, usize, bool, bool) {
+    if total <= capacity {
+        return (0, total, false, false);
+    }
+    if capacity < 3 {
+        // No room for an indicator line beside a row.
+        return (scroll.min(total - capacity), capacity, false, false);
+    }
+    // Scrolled to the end, only the `↑` line shares the list with rows.
+    let first = scroll.min(total - (capacity - 1));
+    let above = first > 0;
+    let room = capacity - usize::from(above);
+    let below = first + room < total;
+    (first, room - usize::from(below), above, below)
+}
+
+/// The F2 sidebar: `width` columns at the right edge from row 1 down to `bottom`. A header
+/// names the project and holds the close cell; below it come one row per worktree of
+/// `project.trees`, each ending in a 🗑 cell, or the reason a non-Git project has none. Click
+/// cells are staged in `worktree_hits`, and the scroll offset is clamped to what fits.
+fn draw_worktree_pane(frame: &mut Frame, app: &mut App, width: u16, bottom: u16) {
+    let focused = app.focused_index();
+    let App {
+        project,
+        worktree_pane,
+        worktree_hits,
+        worktree_area,
+        ..
+    } = app;
+    let Some(pane) = worktree_pane else { return };
+    let area = Rect::new(
+        frame.area().width - width,
+        1,
+        width,
+        bottom.saturating_sub(1),
+    );
+    *worktree_area = Some(area);
+    let inner = Rect::new(area.x + 1, area.y, area.width - 1, area.height);
+    let list = Rect::new(
+        inner.x,
+        inner.y + 1,
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
+    let buffer = frame.buffer_mut();
+    for y in area.y..area.bottom() {
+        buffer[(area.x, y)].set_symbol("│").set_fg(BORDER);
+    }
+    if inner.is_empty() {
+        return;
+    }
+    let muted = Style::default().fg(MUTED);
+    let close = Rect::new(inner.right() - WORKTREE_CELL, inner.y, WORKTREE_CELL, 1);
+    worktree_hits.push(WorktreeHit {
+        area: close,
+        action: WorktreeHitAction::Close,
+    });
+    let (title, _) = buffer.set_stringn(
+        inner.x,
+        inner.y,
+        " Worktrees ",
+        usize::from(close.x - inner.x),
+        Style::default().fg(FG).bold(),
+    );
+    put_clipped(
+        buffer,
+        title,
+        inner.y,
+        &project.name,
+        close.x - title,
+        muted,
+    );
+    buffer.set_string(close.x, inner.y, " × ", muted);
+    if project.repository.is_none() {
+        frame.render_widget(
+            Paragraph::new("Not a Git project.\nOpen a Git folder to manage worktrees.")
+                .style(muted)
+                .wrap(Wrap { trim: true }),
+            Rect::new(list.x + 1, list.y, list.width - 1, list.height),
+        );
+        return;
+    }
+    let total = project.trees.len();
+    let (first, count, above, below) =
+        worktree_window(total, usize::from(list.height), pane.scroll);
+    pane.scroll = first;
+    let more = usize::from(list.width) - 1;
+    let mut y = list.y;
+    if above {
+        buffer.set_stringn(list.x + 1, y, format!("↑ {first} more"), more, muted);
+        y += 1;
+    }
+    for index in first..first + count {
+        let tree = &project.trees[index];
+        let open = project
+            .workspaces
+            .iter()
+            .any(|workspace| workspace.tree.id == tree.id);
+        // The label and markers share the room left of the trash cell, after a margin column.
+        let text = Rect::new(list.x, y, list.width - WORKTREE_CELL, 1);
+        let trash = Rect::new(text.right(), y, WORKTREE_CELL, 1);
+        let markers = [
+            (open, " ●", GREEN),
+            (tree.is_main, " main", MUTED),
+            (tree.locked, " locked", AMBER),
+            (tree.prunable, " missing", AMBER),
+        ];
+        let markers_width: u16 = markers
+            .iter()
+            .filter(|marker| marker.0)
+            .map(|marker| marker.1.width() as u16)
+            .sum();
+        let current = tree.id == project.workspaces[focused].tree.id;
+        let mut x = put_clipped(
+            buffer,
+            text.x + 1,
+            y,
+            // A bare repository has neither branch nor commit, so `label` would say "terminal".
+            if tree.bare {
+                "bare repository"
+            } else {
+                tree.label()
+            },
+            (text.width - 1).saturating_sub(markers_width),
+            Style::default().fg(if current { ACCENT } else { FG }),
+        );
+        for (_, marker, color) in markers.iter().filter(|marker| marker.0) {
+            let style = Style::default().fg(*color);
+            x = buffer
+                .set_stringn(
+                    x,
+                    y,
+                    marker,
+                    usize::from(text.right().saturating_sub(x)),
+                    style,
+                )
+                .0;
+        }
+        // Rows that cannot be deleted dim the cell; clicking it says why.
+        let removable = !(tree.is_main || tree.locked || tree.bare);
+        buffer.set_string(
+            trash.x,
+            y,
+            " 🗑 ",
+            Style::default().fg(if removable { MUTED } else { BORDER }),
+        );
+        worktree_hits.push(WorktreeHit {
+            area: text,
+            action: WorktreeHitAction::Open(index),
+        });
+        worktree_hits.push(WorktreeHit {
+            area: trash,
+            action: WorktreeHitAction::Remove(index),
+        });
+        y += 1;
+    }
+    if below {
+        let hidden = total - first - count;
+        buffer.set_stringn(list.x + 1, y, format!("↓ {hidden} more"), more, muted);
+    }
 }
 
 fn draw_workspace(
@@ -599,8 +817,11 @@ fn line_horizontal(buffer: &mut Buffer, x: u16, y: u16, width: u16, color: Color
 fn draw_key_mode(frame: &mut Frame, native_keys: bool, has_project: bool) -> u16 {
     let mode = if native_keys {
         " F12  KITTY KEYS "
+    } else if has_project && frame.area().width >= 64 {
+        " F1 ASK · F2 WORKTREES · F12 CRIT KEYS "
     } else if has_project {
-        " F1 ASK · F12 CRIT KEYS "
+        // Keeps at least 15 columns for the tabs, even at the 30-column minimum.
+        " F1 · F2 · F12 "
     } else {
         " F12  CRIT KEYS "
     };
@@ -1156,14 +1377,20 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
         );
         return;
     }
+    // A checkout deleted from the worktree pane may have no tab to close or keep.
+    let tabless = matches!(modal, Modal::Removal { tree, .. }
+        if !app.project.workspaces.iter().any(|workspace| workspace.tree.id == *tree));
+    let kept = if tabless {
+        "Checkout kept."
+    } else {
+        "Tab and checkout kept."
+    };
     let removal_message = match modal {
-        Modal::Removal { error, .. } => Some(
-            error
-                .as_deref()
-                .unwrap_or(
-                    "Checking and removing worktree…\nThe tab will close on success.\nEsc hides this; removal continues.",
-                ),
-        ),
+        Modal::Removal { error, .. } => Some(error.as_deref().unwrap_or(if tabless {
+            "Checking and removing worktree…\nEsc hides this; removal continues."
+        } else {
+            "Checking and removing worktree…\nThe tab will close on success.\nEsc hides this; removal continues."
+        })),
         _ => None,
     };
     let desired = if let Some(message) = removal_message {
@@ -1173,7 +1400,7 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
             .map(str::width)
             .max()
             .unwrap_or(0)
-            .max("Tab and checkout kept.".width())
+            .max(kept.width())
             .min(60) as u16;
         let mut rows = 0_u16;
         notice_chunks(
@@ -1201,7 +1428,7 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
             draw_notice(frame, removal_message.unwrap(), message_area);
             if failed {
                 frame.render_widget(
-                    Paragraph::new("Tab and checkout kept.").style(Style::default().fg(AMBER)),
+                    Paragraph::new(kept).style(Style::default().fg(AMBER)),
                     Rect::new(inner.x, inner.bottom() - 2, inner.width, 1),
                 );
                 frame.render_widget(
@@ -1315,6 +1542,7 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
             *selected,
         ),
         Modal::Confirm(confirm) => {
+            let named;
             let message = match confirm {
                 Confirm::Quit => {
                     "Exit Crit; stop sessions?\nSaved chats reopen.\nDocker/checkouts stay."
@@ -1326,8 +1554,18 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
                 Confirm::StopEnvironment => {
                     "Stop this worktree's Docker?\nOther worktrees unaffected.\nVolumes remain."
                 }
-                Confirm::RemoveWorktree => {
+                Confirm::RemoveWorktree { tree: None } => {
                     "Delete this checkout?\nIgnored files go with it.\nDirty/main/locked refused.\nStop Docker first.\nBranch remains."
+                }
+                Confirm::RemoveWorktree { tree: Some(tree) } => {
+                    // The branch shares one line with the question, so the warnings keep their rows.
+                    let room = usize::from(inner.width).saturating_sub("Delete worktree ?".width());
+                    let (label, cut) = clip_width(tree.label(), room);
+                    let ellipsis = if cut { "…" } else { "" };
+                    named = format!(
+                        "Delete worktree {label}{ellipsis}?\nIgnored files go with it.\nDirty/main/locked refused.\nStop Docker first.\nBranch remains."
+                    );
+                    named.as_str()
                 }
             };
             draw_confirmation(frame, inner, message);
@@ -1511,6 +1749,7 @@ mod tests {
             repository: None,
             name: "test".into(),
             workspaces: vec![test_workspace()],
+            trees: Vec::new(),
             active: 0,
             secondary: Some(0),
             secondary_session: Some(1),
@@ -2215,6 +2454,84 @@ mod tests {
                 .unwrap();
             let cursor = terminal.get_cursor_position().unwrap();
             assert!(cursor.y < size.height - height);
+        }
+    }
+
+    #[test]
+    fn key_mode_hint_lists_f2_and_compacts_on_narrow_frames() {
+        // The pane's trash cell relies on this glyph taking one column, not two.
+        assert_eq!("🗑".width(), 1);
+        let hint = |width: u16, native_keys: bool, has_project: bool| {
+            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
+            let mut used = 0;
+            terminal
+                .draw(|frame| used = draw_key_mode(frame, native_keys, has_project))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let row: String = (0..width)
+                .map(|column| buffer[(column, 0)].symbol())
+                .collect();
+            (used, row)
+        };
+        for width in [64, 80, 200] {
+            let (used, row) = hint(width, false, true);
+            assert_eq!(used, 39);
+            assert!(
+                row.ends_with(" F1 ASK · F2 WORKTREES · F12 CRIT KEYS "),
+                "{row:?}"
+            );
+        }
+        // Below 64 columns the tab bar keeps at least 15, so a focused tab fits at 30.
+        for width in [30, 50, 63] {
+            let (used, row) = hint(width, false, true);
+            assert_eq!(used, 15);
+            assert!(row.ends_with(" F1 · F2 · F12 "), "{row:?}");
+            assert!(width - used >= 15);
+        }
+        // Native mode and the project chooser keep their labels.
+        assert_eq!(hint(100, true, true).0, 17);
+        assert_eq!(hint(100, false, false).0, 16);
+    }
+
+    #[test]
+    fn clip_width_cuts_between_graphemes_and_leaves_a_column_for_the_ellipsis() {
+        assert_eq!(clip_width("main", 4), ("main", false));
+        assert_eq!(clip_width("main", 9), ("main", false));
+        assert_eq!(clip_width("feature/login", 8), ("feature", true));
+        assert_eq!(clip_width("abc", 0), ("", true));
+        // A wide character is never split, and neither is a base with its combining mark.
+        assert_eq!(clip_width("界界界", 5), ("界界", true));
+        assert_eq!(clip_width("界界界", 4), ("界", true));
+        assert_eq!(clip_width("e\u{301}xy", 2), ("e\u{301}", true));
+        assert_eq!(clip_width("e\u{301}xy", 1), ("", true));
+        let (text, _) = clip_width("日本語のブランチ", 7);
+        assert!(text.width() <= 6 && "日本語のブランチ".starts_with(text));
+    }
+
+    #[test]
+    fn worktree_window_reserves_indicator_lines_and_clamps_the_scroll() {
+        // Everything fits: no indicators, and an offset has nothing to scroll.
+        assert_eq!(worktree_window(0, 5, 0), (0, 0, false, false));
+        assert_eq!(worktree_window(3, 5, 9), (0, 3, false, false));
+        assert_eq!(worktree_window(5, 5, 1), (0, 5, false, false));
+        // Ten rows in five lines: `↓` at the top of the list, both in the middle, `↑` at the end.
+        assert_eq!(worktree_window(10, 5, 0), (0, 4, false, true));
+        assert_eq!(worktree_window(10, 5, 3), (3, 3, true, true));
+        assert_eq!(worktree_window(10, 5, 6), (6, 4, true, false));
+        assert_eq!(worktree_window(10, 5, 99), (6, 4, true, false));
+        // Every row is reachable, and the lines always add up.
+        for total in 0..30 {
+            for capacity in 0..12 {
+                let mut seen = vec![false; total];
+                for scroll in 0..total + 2 {
+                    let (first, count, above, below) = worktree_window(total, capacity, scroll);
+                    assert!(first + count <= total);
+                    assert!(count + usize::from(above) + usize::from(below) <= capacity);
+                    seen[first..first + count].fill(true);
+                    assert_eq!(above, first > 0 && capacity >= 3 && total > capacity);
+                }
+                assert!(seen.iter().all(|&shown| shown) || capacity == 0);
+            }
         }
     }
 }

@@ -34,7 +34,9 @@ New terminal or any folder. F1 opens Ask Crit. Ctrl+D in an agent opens its
 workspace shell without stopping it;
 Ctrl+D in a shell keeps normal EOF behavior, and native mode passes it through.
 Ctrl+Shift+T then Enter opens a new home tab. The menu also offers other
-folders and worktrees; switch projects from the tab bar, F1, or F2.
+folders and worktrees; switch projects from the tab bar, F1, or F1 then F2.
+F2 opens a worktree pane on the right: click a branch to open or focus its tab,
+click 🗑 to delete the checkout (confirmation required), × or F2 closes it.
 Ctrl+Shift+, or . opens a split picker:
 New worktree creates a separate checkout; Split terminal opens another session
 in the same folder. Existing branch/worktree opens a destination picker.
@@ -86,8 +88,8 @@ APPEARANCE
   Click or drag it to review history or return to live output at the bottom.
   Mouse-aware apps receive the wheel normally; Shift+wheel scrolls Crit's
   history instead. Typing or pasting returns to live output.
-  Side-by-side panes use adjacent edge rails, with ⟨ on the left and ⟩ on
-  the right, and no blank column between them. Drag either arrow without changing focus.
+  Side-by-side panes use adjacent edge rails, with ┤ on the left and ├ on
+  the right, and no blank column between them. Drag either grip without changing focus.
   Each pane keeps a usable minimum width; the proportion follows window resizing
   and is saved per project. Narrow windows show one pane until both fit again.
 
@@ -165,14 +167,44 @@ PROJECTS
   splits reopen both sessions in the same workspace, with their focus and ratio.
   Saved projects, worktrees, splits, focused panes and selected sessions reopen.
 
+WORKTREE PANE
+  F2 toggles a pane on the right that lists this project's worktrees; the hint
+  at the right end of the tab bar names the key. Click a branch to open its tab,
+  or to focus the tab that is already open. Click × in the header, or press F2
+  again, to close it. The pane is mouse-only, so keyboard focus stays in your
+  terminal session and you can keep typing with it open. In native Kitty mode
+  F2 goes to the terminal like every key except F12, and Ask Crit keeps F2 for
+  manual controls.
+  Windows narrower than 60 columns hide the pane and give the terminal its full
+  width; it returns when the window is wide enough. While it shows, the
+  terminal (and any split) lays out in the remaining width. It belongs to the
+  window and is not saved.
+  The list is live: it refreshes with the one-second Git poll, so branches and
+  worktrees created, switched or removed elsewhere appear without reopening it.
+  Each row shows the branch (detached HEAD when there is none) and markers:
+  ● a tab is open, main, locked, missing (checkout deleted outside Git; it
+  cannot be opened). The focused tab's row is highlighted. Long lists scroll
+  with the wheel over the pane, with ↑ n more / ↓ n more marking hidden rows.
+  🗑 at the end of a row asks for confirmation, then deletes the checkout under
+  the same rules as Close tab, Yes, delete worktree: it must be clean, unlocked
+  and not the main checkout, with its Docker environment stopped. The branch
+  stays, ignored files go with the checkout, and an open tab closes. Dimmed 🗑
+  cells (main, locked) only explain why that checkout cannot be deleted.
+  A project outside Git shows \"Not a Git project.\" in the pane instead.
+
 RESTORE
   Crit checkpoints workspace changes and exact OMP/OpenCode chat references in
   $XDG_STATE_HOME/crit/workspace.json (default ~/.local/state/crit/workspace.json).
   Metadata is owner-private; chat contents stay in the agents' own stores.
   All saved agent sessions reopen, including those in background tabs/projects.
   OMP resumes its exact session file; OpenCode resumes its exact session ID.
+  An agent with no remembered chat continues its folder's newest one: OMP with
+  its own --continue, OpenCode with the newest chat started in that exact folder
+  that no other saved pane names (a new chat if there is none).
   Switching chats inside an agent updates its saved reference. Closing a session
   or tab removes it from the saved workspace, without deleting chat history.
+  A shell running an OMP or OpenCode TUI in the foreground at exit reopens as
+  that agent, continuing that folder's newest chat; the shell is not restored.
   Shells reopen fresh in their worktrees; running processes, unsent input and
   terminal scrollback are not restored. Docker log followers are not reopened.
   --fresh skips restoration and starts a new saved workspace; use it with

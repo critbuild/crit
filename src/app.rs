@@ -22,7 +22,7 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::VecDeque,
     fmt::Write as _,
     io::{self, IsTerminal, Write},
     path::{Path, PathBuf},
@@ -40,13 +40,18 @@ pub enum LayoutMode {
     Vertical,
     Horizontal,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub enum Confirm {
     Quit,
-    CloseWorktree { selected: usize },
+    CloseWorktree {
+        selected: usize,
+    },
     CloseSession,
     StopEnvironment,
-    RemoveWorktree,
+    /// Delete a checkout: `None` is the focused worktree, `Some` the one a worktree pane row names.
+    RemoveWorktree {
+        tree: Option<Worktree>,
+    },
 }
 
 pub struct ProjectPicker {
@@ -248,6 +253,7 @@ pub const COMMANDS: &[(&str, IntentCommand)] = &[
     ("Split side by side", IntentCommand::SplitVertical),
     ("Split top and bottom", IntentCommand::SplitHorizontal),
     ("Full width", IntentCommand::FullWidth),
+    ("Toggle worktree pane", IntentCommand::Worktrees),
     (
         "Start isolated environment",
         IntentCommand::StartEnvironment,
@@ -438,10 +444,35 @@ pub struct TabHit {
     pub workspace: Option<usize>,
 }
 
+/// The F2 sidebar listing the project's worktrees. It is driven by the mouse; keyboard focus
+/// stays in the terminal, and nothing about it is saved with the workspace.
+#[derive(Default)]
+pub struct WorktreePane {
+    /// Index into `Project::trees` of the first listed row; `ui::draw` clamps it to the rows that fit.
+    pub scroll: usize,
+}
+
+/// What a click on a worktree pane cell does; indices are into `Project::trees`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WorktreeHitAction {
+    Open(usize),
+    Remove(usize),
+    Close,
+}
+
+/// A clickable cell of the worktree pane, staged by `ui::draw`.
+pub struct WorktreeHit {
+    pub area: Rect,
+    pub action: WorktreeHitAction,
+}
+
 pub struct Project {
     pub repository: Option<worktree::Repository>,
     pub name: String,
     pub workspaces: Vec<Workspace>,
+    /// Every checkout Git lists for the repository, opened or not, in Git's order; empty outside
+    /// Git. The metadata poll keeps it current, and the worktree pane shows it.
+    pub trees: Vec<Worktree>,
     pub active: usize,
     pub secondary: Option<usize>,
     /// Independent session in the second pane when both panes share a workspace.
@@ -464,7 +495,7 @@ impl Project {
     }
 
     fn from_repository(path: PathBuf, repository: worktree::Repository) -> Result<Self> {
-        let mut trees = worktree::list(&repository)?;
+        let trees = worktree::list(&repository)?;
         let active = trees
             .iter()
             .enumerate()
@@ -473,11 +504,12 @@ impl Project {
             .map(|(index, _)| index)
             .context("folder is not inside a checked-out worktree")?;
         let name = project_name(&trees[0].path, &repository.common_dir);
-        let tree = trees.swap_remove(active);
+        let tree = trees[active].clone();
         Ok(Self {
             repository: Some(repository),
             name,
             workspaces: vec![Workspace::new(tree)],
+            trees,
             active: 0,
             secondary: None,
             secondary_session: None,
@@ -508,6 +540,7 @@ impl Project {
             repository: None,
             name,
             workspaces: vec![Workspace::new(tree)],
+            trees: Vec::new(),
             active: 0,
             secondary: None,
             secondary_session: None,
@@ -598,6 +631,12 @@ pub struct App {
     pub split_drag: Option<u16>,
     pub selection: Option<Selection>,
     pub tab_hits: Vec<TabHit>,
+    /// The worktree sidebar while it is open, even where the window is too narrow to draw it.
+    pub worktree_pane: Option<WorktreePane>,
+    /// Click cells of the worktree pane in the last frame (capacity reused across frames).
+    pub worktree_hits: Vec<WorktreeHit>,
+    /// Where the last frame drew the worktree pane; every mouse event inside it is the pane's.
+    pub worktree_area: Option<Rect>,
     pub interaction_visible: bool,
     pub should_quit: bool,
     default_agent: String,
@@ -748,7 +787,11 @@ impl App {
         self.metadata_checked = Instant::now();
         let mut changed = false;
         let mut moved = false;
-        for project in std::iter::once(&mut self.project).chain(&mut self.saved_projects) {
+        let pane_open = self.worktree_pane.is_some();
+        for (slot, project) in std::iter::once(&mut self.project)
+            .chain(&mut self.saved_projects)
+            .enumerate()
+        {
             let Some(trees) = project
                 .common_dir()
                 .and_then(|common_dir| listings.iter().find(|(listed, _)| listed == common_dir))
@@ -756,6 +799,11 @@ impl App {
             else {
                 continue;
             };
+            if project.trees != *trees {
+                project.trees.clone_from(trees);
+                // Only the current project's list can be on screen, and only with the pane open.
+                changed |= slot == 0 && pane_open;
+            }
             for index in 0..project.workspaces.len() {
                 let current = &project.workspaces[index];
                 if let Some(tree) = trees
@@ -801,6 +849,7 @@ impl App {
         self.split_drag = None;
         self.selection = None;
         self.tab_hits.clear();
+        self.worktree_hits.clear();
         self.state_dirty = true;
     }
 
@@ -808,6 +857,109 @@ impl App {
         if self.split_drag.take().is_some() {
             self.state_dirty = true;
         }
+    }
+
+    /// Opens or closes the worktree pane. The terminal's width changes with it, so the last
+    /// frame's hit targets are dropped; the pane is never saved, so no save is requested.
+    fn set_worktree_pane(&mut self, open: bool) {
+        if open == self.worktree_pane.is_some() {
+            return;
+        }
+        self.worktree_pane = open.then(WorktreePane::default);
+        self.worktree_area = None;
+        let pending_save = self.state_dirty;
+        self.workspace_changed();
+        self.state_dirty = pending_save;
+    }
+
+    /// Lists a checkout Git just created or reported, ahead of the next metadata poll.
+    fn note_tree(&mut self, project: &Path, tree: &Worktree) {
+        if let Some(project) = std::iter::once(&mut self.project)
+            .chain(&mut self.saved_projects)
+            .find(|open| open.common_dir() == Some(project))
+            && !project.trees.iter().any(|known| known.id == tree.id)
+        {
+            project.trees.push(tree.clone());
+        }
+    }
+
+    /// A mouse event inside the worktree pane. None of it reaches a terminal.
+    fn worktree_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> Result<bool> {
+        match mouse.kind {
+            MouseEventKind::Moved => return Ok(false),
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                if let Some(pane) = &mut self.worktree_pane {
+                    pane.scroll = if mouse.kind == MouseEventKind::ScrollUp {
+                        pane.scroll.saturating_sub(1)
+                    } else {
+                        (pane.scroll + 1).min(self.project.trees.len().saturating_sub(1))
+                    };
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let hit = self
+                    .worktree_hits
+                    .iter()
+                    .find(|hit| hit.area.contains((mouse.column, mouse.row).into()))
+                    .map(|hit| hit.action);
+                if let Some(action) = hit {
+                    self.worktree_click(action)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    /// The listing can change between frames, so a click's index is looked up afresh and a
+    /// stale one names nothing.
+    fn worktree_click(&mut self, action: WorktreeHitAction) -> Result<()> {
+        match action {
+            WorktreeHitAction::Close => self.set_worktree_pane(false),
+            WorktreeHitAction::Open(index) => {
+                let Some(tree) = self.project.trees.get(index) else {
+                    return Ok(());
+                };
+                if !tree.is_checkout() {
+                    let message = if tree.prunable {
+                        "This checkout is missing on disk; delete it or recreate the branch."
+                    } else {
+                        "A bare repository has no files to open."
+                    };
+                    self.set_notice(message);
+                    return Ok(());
+                }
+                // The same reuse rule as `open_project`: one tab per checkout.
+                let workspace = match self
+                    .project
+                    .workspaces
+                    .iter()
+                    .position(|workspace| workspace.tree.id == tree.id)
+                {
+                    Some(workspace) => workspace,
+                    None => {
+                        self.project.workspaces.push(Workspace::new(tree.clone()));
+                        self.project.workspaces.len() - 1
+                    }
+                };
+                self.select_workspace(workspace, None)?;
+            }
+            WorktreeHitAction::Remove(index) => {
+                let Some(tree) = self.project.trees.get(index) else {
+                    return Ok(());
+                };
+                if tree.is_main || tree.bare {
+                    self.set_notice("The main checkout cannot be removed.");
+                } else if tree.locked {
+                    self.set_notice("This worktree is locked.");
+                } else {
+                    self.modal = Some(Modal::Confirm(Confirm::RemoveWorktree {
+                        tree: Some(tree.clone()),
+                    }));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn open_link(&self, uri: String) -> Result<()> {
@@ -915,7 +1067,12 @@ impl App {
                                     secondary_session = Some(saved_index);
                                 }
                                 restore::SavedSession {
-                                    kind: session.kind.clone(),
+                                    // A shell running an agent's TUI reopens as that agent.
+                                    kind: match session.kind.as_str() {
+                                        "shell" => session.foreground_agent().unwrap_or("shell"),
+                                        kind => kind,
+                                    }
+                                    .into(),
                                     resume: session.resume.clone(),
                                 }
                             })
@@ -1609,6 +1766,7 @@ impl App {
             SplitVertical => self.split(LayoutMode::Vertical)?,
             SplitHorizontal => self.split(LayoutMode::Horizontal)?,
             FullWidth => self.full_width(),
+            Worktrees => self.action(Action::Worktrees)?,
             StartEnvironment => self.env(index, EnvironmentOp::Up)?,
             StopEnvironment => self.modal = Some(Modal::Confirm(Confirm::StopEnvironment)),
             RestartEnvironment => self.env(index, EnvironmentOp::Restart)?,
@@ -1654,7 +1812,9 @@ impl App {
             }
             CloseWorktree => self.action(Action::CloseWorktree)?,
             CloseSession => self.action(Action::CloseSession)?,
-            RemoveWorktree => self.modal = Some(Modal::Confirm(Confirm::RemoveWorktree)),
+            RemoveWorktree => {
+                self.modal = Some(Modal::Confirm(Confirm::RemoveWorktree { tree: None }))
+            }
             Quit => self.action(Action::Quit)?,
             ToggleNative => self.action(Action::ToggleNative)?,
         }
@@ -1677,6 +1837,7 @@ impl App {
                 }
             }
             Action::Launcher => self.open_intent()?,
+            Action::Worktrees => self.set_worktree_pane(self.worktree_pane.is_none()),
             Action::Quit => self.modal = Some(Modal::Confirm(Confirm::Quit)),
             Action::NewTab => {
                 self.modal = Some(Modal::NewTab {
@@ -1786,7 +1947,7 @@ impl App {
                     if error.is_some() && key.code == KeyCode::Enter {
                         self.modal = Some(Modal::Confirm(match confirm {
                             Confirm::CloseWorktree { .. } => Confirm::CloseWorktree { selected: 2 },
-                            other => *other,
+                            other => other.clone(),
                         }));
                         retain = false;
                     }
@@ -2017,34 +2178,49 @@ impl App {
                                 self.workspace_changed();
                             }
                             Confirm::StopEnvironment => self.env(index, EnvironmentOp::Down)?,
-                            Confirm::CloseWorktree { .. } | Confirm::RemoveWorktree => {
-                                let workspace = self.focused();
-                                let tree = workspace.tree.id.clone();
+                            Confirm::CloseWorktree { .. } | Confirm::RemoveWorktree { .. } => {
+                                // The worktree pane names the checkout it deletes, which need
+                                // not be the focused one, or have a tab at all.
+                                let (target, open) = match confirm {
+                                    Confirm::RemoveWorktree { tree: Some(tree) } => (
+                                        tree.clone(),
+                                        self.project
+                                            .workspaces
+                                            .iter()
+                                            .position(|workspace| workspace.tree.id == tree.id),
+                                    ),
+                                    _ => (self.focused().tree.clone(), Some(index)),
+                                };
+                                let tree = target.id.clone();
                                 let result = (|| -> Result<()> {
                                     let repository = self.git_repository()?;
                                     anyhow::ensure!(
-                                        !workspace.tree.is_main,
+                                        !target.is_main,
                                         "This is the main checkout, not a linked worktree. Choose Yes to close the tab without deleting the repository."
                                     );
                                     anyhow::ensure!(
-                                        !workspace.pending,
+                                        !open.is_some_and(
+                                            |open| self.project.workspaces[open].pending
+                                        ),
                                         "An environment operation is still running. Wait for it to finish, then try again."
                                     );
                                     self.jobs
                                         .try_send(Job::Remove {
                                             repository: repository.clone(),
-                                            tree: workspace.tree.clone(),
+                                            tree: target,
                                         })
                                         .context("command queue is busy")
                                 })();
-                                if result.is_ok() {
+                                if result.is_ok()
+                                    && let Some(open) = open
+                                {
                                     // Docker must not start on this checkout while Git removes it.
-                                    self.project.workspaces[index].pending = true;
+                                    self.project.workspaces[open].pending = true;
                                 }
                                 self.notice = None;
                                 self.modal = Some(Modal::Removal {
                                     tree,
-                                    confirm: *confirm,
+                                    confirm: confirm.clone(),
                                     error: result.err().map(|error| format!("{error:#}")),
                                 });
                             }
@@ -2299,6 +2475,11 @@ impl App {
                     self.forward_capture(mouse, id, body)?;
                     return Ok(true);
                 }
+                if let Some(area) = self.worktree_area
+                    && area.contains((mouse.column, mouse.row).into())
+                {
+                    return self.worktree_mouse(mouse);
+                }
                 if let Some(hit) = self
                     .tab_hits
                     .iter()
@@ -2395,6 +2576,7 @@ impl App {
                 self.selection = None;
                 self.mouse_capture = None;
                 self.tab_hits.clear();
+                self.worktree_hits.clear();
             }
             // Pointer motion over a dialog changes nothing worth a frame.
             Event::Input(crossterm::event::Event::Mouse(mouse))
@@ -2616,6 +2798,7 @@ impl App {
                 match result {
                     Ok(tree) => {
                         self.workspace_changed();
+                        self.note_tree(&project, &tree);
                         let has_compose = compose::has_config(&tree);
                         if self.project.common_dir() != Some(project.as_path()) {
                             let mut not_started = false;
@@ -2791,6 +2974,9 @@ impl App {
             } => {
                 // Esc hides the progress dialog, so the result can arrive without it.
                 let waiting = matches!(&self.modal, Some(Modal::OpeningSplit { request: pending }) if *pending == request);
+                if let Ok((tree, _)) = &result {
+                    self.note_tree(&project, tree);
+                }
                 if self.project.common_dir() != Some(project.as_path()) {
                     // The project was left while the checkout opened: only report it.
                     if waiting {
@@ -2874,6 +3060,17 @@ impl App {
             Event::Removed { tree, result } => match result {
                 Ok(warning) => {
                     self.workspace_changed();
+                    // The progress dialog is this removal's, whichever tab (if any) held the
+                    // checkout, and the pane stops listing it now instead of at the next poll.
+                    if matches!(&self.modal, Some(Modal::Removal { tree: pending, .. }) if *pending == tree)
+                    {
+                        self.modal = None;
+                    }
+                    for project in
+                        std::iter::once(&mut self.project).chain(&mut self.saved_projects)
+                    {
+                        project.trees.retain(|listed| listed.id != tree);
+                    }
                     if let Some(index) = self
                         .project
                         .workspaces
@@ -3468,17 +3665,25 @@ fn restore_projects(
     size: ratatui::layout::Size,
     next_session: &mut u64,
 ) -> (Option<(Project, Vec<Project>)>, Vec<String>) {
-    // One `opencode db` call covers every saved OpenCode chat; OMP chats are read per file.
-    let opencode_ids: Vec<&str> = snapshot
+    // One `opencode db` call covers every saved OpenCode chat and the newest chat of each
+    // folder whose OpenCode pane remembers none; OMP chats are read per file.
+    let mut opencode_ids = Vec::new();
+    let mut opencode_folders = Vec::new();
+    for workspace in snapshot
         .projects
         .iter()
         .flat_map(|project| &project.workspaces)
-        .flat_map(|workspace| &workspace.sessions)
-        .filter(|session| session.kind == "opencode")
-        .filter_map(|session| session.resume.as_deref())
-        .collect();
-    let opencode_chats =
-        integration::existing_opencode_chats(&opencode_ids).map_err(|error| format!("{error:#}"));
+    {
+        for session in &workspace.sessions {
+            match (session.kind.as_str(), session.resume.as_deref()) {
+                ("opencode", Some(identity)) => opencode_ids.push(identity),
+                ("opencode", None) => opencode_folders.extend(workspace.path.to_str()),
+                _ => {}
+            }
+        }
+    }
+    let opencode_chats = integration::opencode_chats(&opencode_ids, &opencode_folders)
+        .map_err(|error| format!("{error:#}"));
     let mut skipped = Vec::new();
     let mut projects = Vec::with_capacity(snapshot.projects.len());
     let mut current = None;
@@ -3512,7 +3717,7 @@ fn restore_projects(
 /// reopened adds a line to `skipped`.
 fn restore_project(
     saved: &restore::SavedProject,
-    opencode_chats: &Result<HashSet<String>, String>,
+    opencode_chats: &Result<integration::OpencodeChats, String>,
     socket: &Path,
     tx: &SyncSender<Event>,
     size: ratatui::layout::Size,
@@ -3550,13 +3755,24 @@ fn restore_project(
         workspace.source = saved_workspace.source.clone();
         let mut sessions = Vec::with_capacity(saved_workspace.sessions.len());
         for saved_session in &saved_workspace.sessions {
+            // An agent that remembers no chat picks up its folder's newest one.
+            let resume = match (saved_session.kind.as_str(), saved_session.resume.as_deref()) {
+                (_, Some(identity)) => Some(integration::Resume::Chat(identity)),
+                ("omp", None) => Some(integration::Resume::Continue),
+                ("opencode", None) => opencode_chats
+                    .as_ref()
+                    .ok()
+                    .and_then(|chats| chats.latest.get(path.to_str()?))
+                    .map(|chat| integration::Resume::Chat(chat.as_str())),
+                _ => None,
+            };
             let spawned = check_resume(saved_session, opencode_chats).and_then(|()| {
                 let id = *next_session;
                 *next_session += 1;
                 Session::spawn(
                     id,
                     &saved_session.kind,
-                    saved_session.resume.as_deref(),
+                    resume,
                     &workspace.tree.path,
                     socket,
                     tx.clone(),
@@ -3627,7 +3843,7 @@ fn restore_project(
 /// up at once in `opencode`.
 fn check_resume(
     session: &restore::SavedSession,
-    opencode: &Result<HashSet<String>, String>,
+    opencode: &Result<integration::OpencodeChats, String>,
 ) -> Result<()> {
     let Some(identity) = session.resume.as_deref() else {
         return Ok(());
@@ -3636,7 +3852,7 @@ fn check_resume(
     if session.kind == "opencode" {
         match opencode {
             Ok(chats) => anyhow::ensure!(
-                chats.contains(identity),
+                chats.existing.contains(identity),
                 "saved OpenCode chat does not exist: {identity}"
             ),
             Err(error) => anyhow::bail!("{error}"),
@@ -3833,6 +4049,9 @@ pub fn run(
         mouse_capture: None,
         selection: None,
         tab_hits: Vec::new(),
+        worktree_pane: None,
+        worktree_hits: Vec::new(),
+        worktree_area: None,
         interaction_visible: true,
         should_quit: false,
         default_agent: agent.into(),
@@ -3929,6 +4148,8 @@ pub fn run(
             }
         }
     }
+    // An agent started in a shell does not mark the state dirty; recheck before the final save.
+    app.state_dirty = true;
     app.checkpoint(&mut store);
     signal_handle.close();
     drop(app);
@@ -4383,7 +4604,7 @@ mod tests {
 
     #[test]
     fn split_grip_drag_resizes_both_panes_without_changing_focus() {
-        // Either pane-edge arrow must grab without a one-column jump.
+        // Either pane-edge grip must grab without a one-column jump.
         for grab in 0..2 {
             let (mut app, _queued, _events) = interaction_app();
             app.project.layout = LayoutMode::Vertical;
@@ -5516,7 +5737,7 @@ mod tests {
         app.project.workspaces[0].sessions.push(session);
         app.modal = Some(Modal::Removal {
             tree: "main".into(),
-            confirm: Confirm::RemoveWorktree,
+            confirm: Confirm::RemoveWorktree { tree: None },
             error: None,
         });
         let key = |code| {
@@ -5812,6 +6033,7 @@ mod tests {
             repository: app.project.repository.clone(),
             name: "fixture".into(),
             workspaces: vec![Workspace::new(app.project.workspaces[1].tree.clone())],
+            trees: Vec::new(),
             active: 0,
             secondary: None,
             secondary_session: None,
@@ -6173,6 +6395,7 @@ mod tests {
             split_drag: None,
             project: Project {
                 secondary_session: None,
+                trees: Vec::new(),
                 repository: Some(worktree::Repository {
                     root: root.clone(),
                     common_dir: root.join(".git"),
@@ -6210,6 +6433,9 @@ mod tests {
             mouse_capture: None,
             selection: None,
             tab_hits: Vec::new(),
+            worktree_pane: None,
+            worktree_hits: Vec::new(),
+            worktree_area: None,
             interaction_visible: true,
             should_quit: false,
             default_agent: "shell".into(),
@@ -6961,6 +7187,9 @@ mod tests {
             mouse_capture: None,
             selection: None,
             tab_hits: Vec::new(),
+            worktree_pane: None,
+            worktree_hits: Vec::new(),
+            worktree_area: None,
             interaction_visible: true,
             should_quit: false,
             default_agent: "shell".into(),
@@ -7005,6 +7234,9 @@ mod tests {
             mouse_capture: None,
             selection: None,
             tab_hits: Vec::new(),
+            worktree_pane: None,
+            worktree_hits: Vec::new(),
+            worktree_area: None,
             interaction_visible: true,
             should_quit: false,
             default_agent: "omp".into(),
@@ -7079,6 +7311,7 @@ mod tests {
         let (jobs, queued) = mpsc::sync_channel(8);
         let project = |name: &str, order: u64, branches: &[&str]| Project {
             secondary_session: None,
+            trees: Vec::new(),
             repository: None,
             name: name.into(),
             workspaces: branches
@@ -7117,6 +7350,9 @@ mod tests {
             mouse_capture: None,
             selection: None,
             tab_hits: Vec::new(),
+            worktree_pane: None,
+            worktree_hits: Vec::new(),
+            worktree_area: None,
             interaction_visible: true,
             should_quit: false,
             default_agent: "shell".into(),
@@ -7222,6 +7458,7 @@ mod tests {
             split_drag: None,
             project: Project {
                 secondary_session: None,
+                trees: Vec::new(),
                 repository: Some(worktree::Repository {
                     root: root.clone(),
                     common_dir: root.join(".git"),
@@ -7259,6 +7496,9 @@ mod tests {
             mouse_capture: None,
             selection: None,
             tab_hits: Vec::new(),
+            worktree_pane: None,
+            worktree_hits: Vec::new(),
+            worktree_area: None,
             interaction_visible: true,
             should_quit: false,
             default_agent: "shell".into(),
@@ -7499,8 +7739,620 @@ mod tests {
             .tab_hits
             .iter()
             .find(|hit| hit.project.is_none() && hit.workspace == Some(app.focused_index()))
-            .expect("the focused workspace has no click target in the 6-column tab bar");
-        // The key-mode label takes the last 24 of 30 columns.
-        assert!(hit.area.width > 0 && hit.area.right() <= 6);
+            .expect("the focused workspace has no click target in the 15-column tab bar");
+        // The compact key-mode label takes the last 15 of 30 columns.
+        assert!(hit.area.width > 0 && hit.area.right() <= 15);
+    }
+
+    /// `interaction_app()` listing four checkouts: its two tabs, an unopened `feature/login`
+    /// whose folder exists, and a locked `frozen`.
+    fn worktree_pane_app(directory: &Path) -> (App, mpsc::Receiver<Job>, mpsc::Receiver<Event>) {
+        let (mut app, queued, events) = interaction_app();
+        let mut trees: Vec<Worktree> = app
+            .project
+            .workspaces
+            .iter()
+            .map(|workspace| workspace.tree.clone())
+            .collect();
+        std::fs::create_dir(directory.join("feature")).unwrap();
+        for (branch, path, locked) in [
+            ("feature/login", directory.join("feature"), false),
+            ("frozen", PathBuf::from("/interaction-fixture/frozen"), true),
+        ] {
+            trees.push(Worktree {
+                id: branch.into(),
+                path,
+                branch: branch.into(),
+                head: String::new(),
+                is_main: false,
+                locked,
+                bare: false,
+                prunable: false,
+            });
+        }
+        app.project.trees = trees;
+        (app, queued, events)
+    }
+
+    fn key_event(code: KeyCode) -> Event {
+        Event::Input(crossterm::event::Event::Key(KeyEvent::new(
+            code,
+            KeyModifiers::NONE,
+        )))
+    }
+
+    /// One frame the way the main loop makes it: sessions sized first, then the screen.
+    fn draw_frame(app: &mut App, terminal: &mut Terminal<ratatui::backend::TestBackend>) {
+        ui::resize_sessions(app, terminal.size().unwrap()).unwrap();
+        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+    }
+
+    fn screen_row(terminal: &Terminal<ratatui::backend::TestBackend>, row: u16) -> String {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.width)
+            .map(|column| buffer[(column, row)].symbol())
+            .collect()
+    }
+
+    fn screen_rows(terminal: &Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
+        (0..terminal.backend().buffer().area.height)
+            .map(|row| screen_row(terminal, row))
+            .collect()
+    }
+
+    /// What the worktree pane of a 100-column window shows on `row`: the cells right of its
+    /// border, which sits at column 67.
+    fn pane_row(terminal: &Terminal<ratatui::backend::TestBackend>, row: u16) -> String {
+        screen_row(terminal, row).chars().skip(68).collect()
+    }
+
+    /// A left press on the first cell of the worktree pane cell that does `action`.
+    fn press_worktree_cell(app: &mut App, action: WorktreeHitAction) -> bool {
+        let area = app
+            .worktree_hits
+            .iter()
+            .find(|hit| hit.action == action)
+            .unwrap_or_else(|| panic!("the frame has no {action:?} cell"))
+            .area;
+        app.handle(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            area.x + 1,
+            area.y,
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn worktree_pane_toggles_and_lists_the_project_trees() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = worktree_pane_app(directory.path());
+        let session = sleeping_session(&app, directory.path(), 1);
+        let parser = session.parser.clone();
+        app.project.workspaces[0].sessions.push(session);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+
+        draw_frame(&mut app, &mut terminal);
+        assert!(app.worktree_area.is_none() && app.worktree_hits.is_empty());
+        assert_eq!(parser.lock().screen().size(), (27, 98));
+        assert!(screen_row(&terminal, 0).ends_with(" F1 ASK · F2 WORKTREES · F12 CRIT KEYS "));
+
+        app.state_dirty = false;
+        assert!(app.handle(key_event(KeyCode::F(2))).unwrap());
+        assert!(app.worktree_pane.is_some());
+        assert!(
+            !app.state_dirty,
+            "the pane is not part of the saved workspace"
+        );
+        draw_frame(&mut app, &mut terminal);
+        // A third of 100 columns, with the terminal keeping the other 67.
+        assert_eq!(app.worktree_area, Some(Rect::new(67, 1, 33, 29)));
+        assert_eq!(parser.lock().screen().size(), (27, 65));
+        let buffer = terminal.backend().buffer();
+        assert!((1..30).all(|row| buffer[(67, row)].symbol() == "│"));
+        // The header divider ends where the terminal does.
+        assert_eq!(buffer[(66, 2)].symbol(), "─");
+        assert!((2..6).all(|row| buffer[(98, row)].symbol() == "🗑"));
+        // Main and locked rows dim the cell; the other rows leave it as it is.
+        assert_eq!(buffer[(98, 2)].fg, buffer[(98, 5)].fg);
+        assert_eq!(buffer[(98, 3)].fg, buffer[(98, 4)].fg);
+        assert_ne!(buffer[(98, 2)].fg, buffer[(98, 3)].fg);
+        // The focused tab's row stands out from the others.
+        assert_ne!(buffer[(69, 2)].fg, buffer[(69, 3)].fg);
+        assert_eq!(buffer[(69, 3)].fg, buffer[(69, 4)].fg);
+        let header = pane_row(&terminal, 1);
+        assert!(header.contains("Worktrees fixture"), "{header:?}");
+        assert!(header.trim_end().ends_with('×'), "{header:?}");
+        assert!(pane_row(&terminal, 2).contains("main ● main"));
+        assert!(pane_row(&terminal, 3).contains("other ●"));
+        assert!(!pane_row(&terminal, 3).contains("main"));
+        assert!(pane_row(&terminal, 4).contains("feature/login"));
+        assert!(!pane_row(&terminal, 4).contains('●'));
+        assert!(pane_row(&terminal, 5).contains("frozen locked"));
+
+        assert_eq!(app.worktree_hits.len(), 9);
+        for index in 0..4 {
+            let row = 2 + index as u16;
+            for (action, area) in [
+                (WorktreeHitAction::Open(index), Rect::new(68, row, 29, 1)),
+                (WorktreeHitAction::Remove(index), Rect::new(97, row, 3, 1)),
+            ] {
+                let hit = app.worktree_hits.iter().find(|hit| hit.action == action);
+                assert_eq!(hit.map(|hit| hit.area), Some(area), "{action:?}");
+            }
+        }
+        let close: Vec<_> = app
+            .worktree_hits
+            .iter()
+            .filter(|hit| hit.action == WorktreeHitAction::Close)
+            .collect();
+        assert_eq!(close.len(), 1);
+        assert_eq!(close[0].area, Rect::new(97, 1, 3, 1));
+
+        // F2 again closes it and gives the terminal its width back.
+        assert!(app.handle(key_event(KeyCode::F(2))).unwrap());
+        assert!(app.worktree_pane.is_none());
+        assert!(app.worktree_area.is_none() && app.worktree_hits.is_empty());
+        draw_frame(&mut app, &mut terminal);
+        assert!(app.worktree_hits.is_empty());
+        assert_eq!(parser.lock().screen().size(), (27, 98));
+        assert_ne!(terminal.backend().buffer()[(67, 5)].symbol(), "│");
+
+        // A resize drops the cells of the frame before it; the × cell closes the pane.
+        app.handle(key_event(KeyCode::F(2))).unwrap();
+        draw_frame(&mut app, &mut terminal);
+        assert!(!app.worktree_hits.is_empty());
+        app.handle(Event::Input(crossterm::event::Event::Resize(100, 30)))
+            .unwrap();
+        assert!(app.worktree_hits.is_empty());
+        draw_frame(&mut app, &mut terminal);
+        assert!(press_worktree_cell(&mut app, WorktreeHitAction::Close));
+        assert!(app.worktree_pane.is_none());
+    }
+
+    #[test]
+    fn worktree_pane_is_hidden_on_narrow_terminals() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = worktree_pane_app(directory.path());
+        let session = sleeping_session(&app, directory.path(), 1);
+        let parser = session.parser.clone();
+        app.project.workspaces[0].sessions.push(session);
+        app.worktree_pane = Some(WorktreePane::default());
+        for (width, columns) in [(50, 48), (59, 57)] {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, 20)).unwrap();
+            draw_frame(&mut app, &mut terminal);
+            // The flag stays set, but nothing is drawn and the terminal keeps its width.
+            assert!(app.worktree_pane.is_some());
+            assert!(app.worktree_area.is_none());
+            assert!(app.worktree_hits.is_empty());
+            assert_eq!(parser.lock().screen().size(), (17, columns));
+            let hint = screen_row(&terminal, 0);
+            assert!(hint.ends_with(" F1 · F2 · F12 "), "{hint:?}");
+        }
+        // 60 columns is the first width that shows it, leaving 34 for the terminal.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        draw_frame(&mut app, &mut terminal);
+        assert_eq!(app.worktree_area, Some(Rect::new(34, 1, 26, 19)));
+        assert_eq!(parser.lock().screen().size(), (17, 32));
+    }
+
+    #[test]
+    fn worktree_pane_shares_the_width_with_split_panes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = worktree_pane_app(directory.path());
+        app.project.layout = LayoutMode::Vertical;
+        app.project.secondary = Some(1);
+        app.worktree_pane = Some(WorktreePane::default());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        draw_frame(&mut app, &mut terminal);
+        assert_eq!(app.panes.len(), 2);
+        assert_eq!(app.worktree_area, Some(Rect::new(67, 1, 33, 23)));
+        assert!(app.panes[1].body.right() < 67);
+        // The divider's grip is a pair of box-drawing tees, which Kitty draws aligned with the
+        // rails beside them.
+        let handle = app.split_divider.expect("two panes share a divider").handle;
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(handle.x, handle.y)].symbol(), "┤");
+        assert_eq!(buffer[(handle.right() - 1, handle.y)].symbol(), "├");
+        // At 85 columns the 57 left beside the pane cannot hold two panes; unlike a
+        // notice, the pane may collapse the split.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(85, 24)).unwrap();
+        draw_frame(&mut app, &mut terminal);
+        assert_eq!(app.panes.len(), 1);
+        app.worktree_pane = None;
+        draw_frame(&mut app, &mut terminal);
+        assert_eq!(app.panes.len(), 2);
+    }
+
+    #[test]
+    fn clicking_a_row_opens_or_focuses_its_tab() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = worktree_pane_app(directory.path());
+        // Both tabs already have a session, so selecting one starts nothing.
+        for (id, workspace) in (1..).zip(0..2) {
+            let session = sleeping_session(&app, directory.path(), id);
+            app.project.workspaces[workspace].sessions.push(session);
+        }
+        app.next_session = 3;
+        app.worktree_pane = Some(WorktreePane::default());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut app, &mut terminal);
+
+        // An unopened checkout gets a tab, with the default agent, and the focus.
+        assert!(press_worktree_cell(&mut app, WorktreeHitAction::Open(2)));
+        assert_eq!(app.project.workspaces.len(), 3);
+        assert_eq!(app.focused().tree.id, "feature/login");
+        assert_eq!(app.focused().sessions.len(), 1);
+        assert!(
+            app.worktree_hits.is_empty(),
+            "the old frame's cells are gone"
+        );
+
+        // An open tab only takes the focus: no second tab or session.
+        draw_frame(&mut app, &mut terminal);
+        press_worktree_cell(&mut app, WorktreeHitAction::Open(0));
+        assert_eq!(app.project.workspaces.len(), 3);
+        assert_eq!(app.focused().tree.id, "main");
+        assert_eq!(app.project.workspaces[0].sessions.len(), 1);
+
+        // A checkout missing on disk cannot open; it says so.
+        app.project.trees[3].prunable = true;
+        draw_frame(&mut app, &mut terminal);
+        press_worktree_cell(&mut app, WorktreeHitAction::Open(3));
+        assert_eq!(app.project.workspaces.len(), 3);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("This checkout is missing on disk; delete it or recreate the branch.")
+        );
+
+        // The listing can change between frames: a click on a row that is gone does nothing.
+        draw_frame(&mut app, &mut terminal);
+        let stale = app
+            .worktree_hits
+            .iter()
+            .find(|hit| hit.action == WorktreeHitAction::Open(3))
+            .unwrap()
+            .area;
+        app.project.trees.truncate(2);
+        app.handle(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            stale.x + 1,
+            stale.y,
+        ))
+        .unwrap();
+        assert_eq!(app.project.workspaces.len(), 3);
+        assert_eq!(app.focused().tree.id, "main");
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn trash_asks_for_confirmation_then_queues_removal_for_that_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, queued, _events) = worktree_pane_app(directory.path());
+        app.worktree_pane = Some(WorktreePane::default());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut app, &mut terminal);
+
+        // A checkout with no tab: the dialog names its branch, and nothing runs before `y`.
+        assert!(press_worktree_cell(&mut app, WorktreeHitAction::Remove(2)));
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Confirm(Confirm::RemoveWorktree { tree: Some(tree) })) if tree.id == "feature/login"
+        ));
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let rows = screen_rows(&terminal);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Delete worktree feature/login?")),
+            "{rows:#?}"
+        );
+        assert!(rows.iter().any(|row| row.contains("Branch remains.")));
+        assert!(queued.try_recv().is_err());
+        app.handle(key_event(KeyCode::Char('y'))).unwrap();
+        let Job::Remove { tree, .. } = queued.recv().unwrap() else {
+            panic!("expected a removal");
+        };
+        assert_eq!(tree.id, "feature/login");
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Removal { tree, error: None, .. }) if tree == "feature/login"
+        ));
+        // No tab will close, so the progress dialog does not promise one.
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let rows = screen_rows(&terminal);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Checking and removing worktree"))
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("tab will close")),
+            "{rows:#?}"
+        );
+        assert!(
+            app.project
+                .workspaces
+                .iter()
+                .all(|workspace| !workspace.pending)
+        );
+        // Success dismisses the progress dialog and the row, though no tab was involved.
+        app.handle(Event::Removed {
+            tree: "feature/login".into(),
+            result: Ok(None),
+        })
+        .unwrap();
+        assert!(app.modal.is_none());
+        assert!(
+            app.project
+                .trees
+                .iter()
+                .all(|tree| tree.id != "feature/login")
+        );
+        assert_eq!(app.project.workspaces.len(), 2);
+
+        // An open tab that is not focused: the row picks the checkout, not the focus.
+        draw_frame(&mut app, &mut terminal);
+        press_worktree_cell(&mut app, WorktreeHitAction::Remove(1));
+        app.handle(key_event(KeyCode::Char('y'))).unwrap();
+        let Job::Remove { tree, .. } = queued.recv().unwrap() else {
+            panic!("expected a removal");
+        };
+        assert_eq!(tree.id, "other");
+        assert!(app.project.workspaces[1].pending);
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let rows = screen_rows(&terminal);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("The tab will close on success.")),
+            "{rows:#?}"
+        );
+        assert_eq!(app.focused().tree.id, "main");
+        app.handle(Event::Removed {
+            tree: "other".into(),
+            result: Ok(None),
+        })
+        .unwrap();
+        assert!(app.modal.is_none(), "the dialog was this removal's");
+        assert_eq!(app.project.workspaces.len(), 1);
+        assert_eq!(app.focused().tree.id, "main");
+
+        // The main and locked rows only explain why they stay.
+        draw_frame(&mut app, &mut terminal);
+        press_worktree_cell(&mut app, WorktreeHitAction::Remove(0));
+        assert!(app.modal.is_none());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("The main checkout cannot be removed.")
+        );
+        draw_frame(&mut app, &mut terminal);
+        press_worktree_cell(&mut app, WorktreeHitAction::Remove(1));
+        assert!(app.modal.is_none());
+        assert_eq!(app.notice.as_deref(), Some("This worktree is locked."));
+        assert!(queued.try_recv().is_err());
+    }
+
+    #[test]
+    fn removal_commands_still_target_the_focused_checkout() {
+        let (mut app, queued, _events) = interaction_app();
+        app.project.active = 1;
+        app.run_command(IntentCommand::RemoveWorktree).unwrap();
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Confirm(Confirm::RemoveWorktree { tree: None }))
+        ));
+        app.modal_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(queued.recv().unwrap(), Job::Remove { tree, .. } if tree.id == "other"));
+        assert!(app.project.workspaces[1].pending);
+    }
+
+    #[test]
+    fn worktree_pane_scrolls_long_lists_with_the_wheel() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = worktree_pane_app(directory.path());
+        for number in 0..12 {
+            let mut tree = app.project.trees[2].clone();
+            tree.id = format!("extra-{number}");
+            tree.branch = format!("extra-{number}");
+            app.project.trees.push(tree);
+        }
+        app.worktree_pane = Some(WorktreePane::default());
+        // A header and ten list lines for sixteen worktrees.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+        draw_frame(&mut app, &mut terminal);
+        assert!(pane_row(&terminal, 2).contains("main ● main"));
+        assert!(pane_row(&terminal, 10).contains("extra-4"));
+        assert!(pane_row(&terminal, 11).contains("↓ 7 more"));
+        let opens = |app: &App| {
+            app.worktree_hits
+                .iter()
+                .filter(|hit| matches!(hit.action, WorktreeHitAction::Open(_)))
+                .count()
+        };
+        assert_eq!(opens(&app), 9);
+
+        let wheel = |app: &mut App, kind| app.handle(mouse_event(kind, 80, 5)).unwrap();
+        for _ in 0..3 {
+            assert!(wheel(&mut app, MouseEventKind::ScrollDown));
+        }
+        draw_frame(&mut app, &mut terminal);
+        assert!(pane_row(&terminal, 2).contains("↑ 3 more"));
+        assert!(pane_row(&terminal, 3).contains("frozen"));
+        assert!(pane_row(&terminal, 11).contains("↓ 5 more"));
+        assert_eq!(opens(&app), 8);
+
+        // Scrolling past the end stops at the last row, and one notch back moves at once.
+        for _ in 0..20 {
+            wheel(&mut app, MouseEventKind::ScrollDown);
+        }
+        draw_frame(&mut app, &mut terminal);
+        assert!(pane_row(&terminal, 2).contains("↑ 7 more"));
+        assert!(pane_row(&terminal, 11).contains("extra-11"));
+        assert_eq!(app.worktree_pane.as_ref().unwrap().scroll, 7);
+        wheel(&mut app, MouseEventKind::ScrollUp);
+        draw_frame(&mut app, &mut terminal);
+        assert!(pane_row(&terminal, 2).contains("↑ 6 more"));
+        assert!(pane_row(&terminal, 11).contains("↓ 2 more"));
+    }
+
+    #[test]
+    fn worktree_pane_mouse_events_never_reach_the_terminal() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = worktree_pane_app(directory.path());
+        let output = directory.path().join("received");
+        let session = recording_session(1, directory.path(), app.tx.clone(), &output);
+        app.project.workspaces[0].sessions.push(session);
+        app.worktree_pane = Some(WorktreePane::default());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut app, &mut terminal);
+        let pane = app.worktree_area.unwrap();
+        let body = app.panes[0].body;
+        assert!(body.right() <= pane.x);
+        // On the border, on a list row and on blank space, whatever the event is the pane's.
+        for (column, row) in [
+            (pane.x, pane.y + 4),
+            (pane.x + 3, pane.y + 3),
+            (pane.x + 5, pane.bottom() - 2),
+        ] {
+            for kind in [
+                MouseEventKind::Down(MouseButton::Right),
+                MouseEventKind::Down(MouseButton::Middle),
+                MouseEventKind::ScrollUp,
+                MouseEventKind::ScrollDown,
+                MouseEventKind::Moved,
+                MouseEventKind::Drag(MouseButton::Left),
+                MouseEventKind::Up(MouseButton::Left),
+            ] {
+                app.handle(mouse_event(kind, column, row)).unwrap();
+            }
+        }
+        assert!(app.mouse_capture.is_none());
+        assert!(
+            !app.handle(mouse_event(MouseEventKind::Moved, pane.x + 3, pane.y + 3))
+                .unwrap()
+        );
+        // Anything the program had received would come before this click, the one thing
+        // that reaches it.
+        app.handle(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            body.x + 2,
+            body.y + 2,
+        ))
+        .unwrap();
+        wait_for_file(&output, b"\x1b[<0;3;3M");
+    }
+
+    #[test]
+    fn worktree_pane_explains_projects_outside_git() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        app.project = Project::terminal(directory.path()).unwrap();
+        app.worktree_pane = Some(WorktreePane::default());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        draw_frame(&mut app, &mut terminal);
+        let rows: Vec<String> = (1..6).map(|row| pane_row(&terminal, row)).collect();
+        assert!(rows[0].contains("Worktrees"), "{rows:?}");
+        for expected in ["Not a Git project.", "Open a Git folder", "worktrees."] {
+            assert!(rows.iter().any(|row| row.contains(expected)), "{rows:?}");
+        }
+        let actions: Vec<_> = app.worktree_hits.iter().map(|hit| hit.action).collect();
+        assert_eq!(actions, [WorktreeHitAction::Close]);
+    }
+
+    #[test]
+    fn worktree_list_follows_the_git_poll_and_new_checkouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = worktree_pane_app(directory.path());
+        let common_dir = PathBuf::from("/interaction-fixture/.git");
+        let poll = |app: &mut App, trees: Vec<Worktree>| {
+            app.handle(Event::Metadata(vec![(common_dir.clone(), trees)]))
+                .unwrap()
+        };
+        // The same listing changes nothing, so it asks for no frame.
+        let listed = app.project.trees.clone();
+        assert!(!poll(&mut app, listed.clone()));
+        // A worktree gone or added elsewhere is kept at the next poll, with no frame to draw
+        // while the pane is closed...
+        let mut next = listed;
+        next.remove(3);
+        let mut fresh = next[2].clone();
+        fresh.id = "fresh".into();
+        fresh.branch = "fresh".into();
+        next.push(fresh);
+        assert!(!poll(&mut app, next.clone()));
+        assert_eq!(app.project.trees, next);
+        // ...and with a frame for the pane that lists it.
+        app.worktree_pane = Some(WorktreePane::default());
+        let mut later = next.clone();
+        later.pop();
+        assert!(poll(&mut app, later.clone()));
+        assert_eq!(app.project.trees, later);
+        assert!(!poll(&mut app, later));
+
+        // A checkout made here is listed at once, and once, ahead of the next poll.
+        let created = Worktree {
+            id: "created".into(),
+            path: directory.path().join("feature"),
+            branch: "created".into(),
+            head: String::new(),
+            is_main: false,
+            locked: false,
+            bare: false,
+            prunable: false,
+        };
+        for _ in 0..2 {
+            app.handle(Event::Created {
+                project: common_dir.clone(),
+                source: PathBuf::from("/interaction-fixture"),
+                preparation_error: None,
+                agent: None,
+                split: None,
+                result: Ok(created.clone()),
+            })
+            .unwrap();
+            let listed = app.project.trees.iter().filter(|tree| tree.id == "created");
+            assert_eq!(listed.count(), 1);
+        }
+    }
+
+    #[test]
+    fn f2_belongs_to_the_terminal_in_native_mode_and_to_the_launcher_in_ask_crit() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, queued, _events) = interaction_app();
+        let output = directory.path().join("received");
+        let session = recording_session(1, directory.path(), app.tx.clone(), &output);
+        app.project.workspaces[0].sessions.push(session);
+        // Native mode forwards every key but F12, F2 included.
+        app.native_keys = true;
+        app.handle(key_event(KeyCode::F(2))).unwrap();
+        assert!(app.worktree_pane.is_none());
+        wait_for_file(&output, b"\x1bOQ");
+        app.native_keys = false;
+
+        // Ask Crit keeps F2 for its manual controls, whose entry toggles the pane.
+        app.open_intent().unwrap();
+        queued.recv().unwrap();
+        app.handle(key_event(KeyCode::F(2))).unwrap();
+        assert!(matches!(app.modal, Some(Modal::Commands { .. })));
+        assert!(app.worktree_pane.is_none());
+        let selected = COMMANDS
+            .iter()
+            .position(|(_, command)| *command == IntentCommand::Worktrees)
+            .unwrap();
+        app.modal = Some(Modal::Commands { selected });
+        app.handle(key_event(KeyCode::Enter)).unwrap();
+        assert!(app.modal.is_none());
+        assert!(app.worktree_pane.is_some());
+        app.run_command(IntentCommand::Worktrees).unwrap();
+        assert!(app.worktree_pane.is_none());
+
+        // Only a plain F2 is the pane's.
+        for modifiers in [KeyModifiers::SHIFT, KeyModifiers::CONTROL] {
+            app.handle(Event::Input(crossterm::event::Event::Key(KeyEvent::new(
+                KeyCode::F(2),
+                modifiers,
+            ))))
+            .unwrap();
+            assert!(app.worktree_pane.is_none());
+        }
     }
 }

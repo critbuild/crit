@@ -13,7 +13,7 @@ pub struct Repository {
     pub common_dir: PathBuf,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Worktree {
     pub id: String,
     pub path: PathBuf,

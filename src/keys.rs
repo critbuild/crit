@@ -17,6 +17,7 @@ pub const HELP: &str = "Crit shortcuts (same as Kitty's terminal/window actions)
   Ctrl+Shift+L            Cycle full / vertical / horizontal layout
   F1                     Ask Crit in natural language (Haiku 5.5)
   F1 then F2             Manual controls: Up/Down and Enter, no AI needed
+  F2                     Toggle the worktree pane (click a row to open, 🗑 to delete)
   F10                    Exit Crit (confirmation required)
 
 The agent keeps running when Ctrl+D selects a shell. In a shell, Ctrl+D remains
@@ -43,7 +44,7 @@ ordinary typing go to the focused terminal.
 Typing or pasting returns a scrolled terminal to its live output.
 Wheel scrolls history unless the app captures it; Shift+wheel scrolls Crit history.
 Click or drag the right-edge scrollbar; its bottom returns to live output.
-Drag either pane-edge arrow (⟨ / ⟩) or the divider to resize side-by-side panes.
+Drag either pane-edge grip (┤ / ├) or the divider to resize side-by-side panes.
 Split widths keep their proportion on window resize and restore with the project.
 Esc cancels a pending project open or worktree listing without switching tabs.
 Below 30x10, UI input pauses except Esc and F12; enlarge the terminal to resume.
@@ -58,6 +59,7 @@ Answer follow-up questions in the same box; ordinary terminal input is unchanged
 pub enum Action {
     ToggleNative,
     Launcher,
+    Worktrees,
     Quit,
     NewTab,
     CloseWorktree,
@@ -86,6 +88,7 @@ pub fn action(key: KeyEvent) -> Option<Action> {
     match key.code {
         F(12) if key.modifiers.is_empty() => Some(ToggleNative),
         F(1) if key.modifiers.is_empty() => Some(Action::Launcher),
+        F(2) if key.modifiers.is_empty() => Some(Worktrees),
         F(10) if key.modifiers.is_empty() => Some(Quit),
         Tab if ctrl && !shift => Some(NextWorktree),
         Tab | BackTab if ctrl && shift => Some(PreviousWorktree),
@@ -252,6 +255,20 @@ mod tests {
             )),
             Some(Action::NewTab)
         );
+    }
+    #[test]
+    fn f2_toggles_the_worktree_pane_only_without_modifiers() {
+        assert_eq!(
+            action(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)),
+            Some(Action::Worktrees)
+        );
+        for modifiers in [
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+        ] {
+            assert_eq!(action(KeyEvent::new(KeyCode::F(2), modifiers)), None);
+        }
     }
     #[test]
     fn ctrl_d_remains_terminal_input_when_not_switching_from_an_agent() {

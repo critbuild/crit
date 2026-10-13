@@ -1,6 +1,6 @@
 use crate::{
     event::Event,
-    integration::{self, AgentState},
+    integration::{self, AgentState, Resume},
     keys, kitty,
 };
 use anyhow::{Context, Result, bail};
@@ -53,7 +53,7 @@ impl Session {
     pub fn spawn(
         id: u64,
         kind: &str,
-        resume: Option<&str>,
+        resume: Option<Resume<'_>>,
         cwd: &Path,
         socket: &Path,
         tx: SyncSender<Event>,
@@ -202,7 +202,10 @@ impl Session {
                 AgentState::Unknown
             },
             message: None,
-            resume: resume.map(str::to_owned),
+            resume: match resume {
+                Some(Resume::Chat(identity)) => Some(identity.to_owned()),
+                _ => None,
+            },
             parser,
             dirty,
             alive,
@@ -299,6 +302,17 @@ impl Session {
         let mut bytes = Vec::new();
         write_mouse(&mut bytes, event, column, row, mode, encoding)?;
         self.send(bytes)
+    }
+
+    /// The agent whose TUI this pane's shell runs in the foreground, if any.
+    pub fn foreground_agent(&self) -> Option<&'static str> {
+        let group = self.master.process_group_leader()?;
+        let shell = self.pid? as libc::pid_t;
+        // The shell at its own prompt runs no agent; a group outside the pane is not its own.
+        if group == shell || unsafe { libc::getsid(group) } != shell {
+            return None;
+        }
+        integration::adopted_agent(group)
     }
 
     /// Queue bytes for the PTY without waiting on the child. A full queue means

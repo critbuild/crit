@@ -398,14 +398,24 @@ fn relocate_plugins(plugins: &mut [Value], base: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The chat a launched agent opens; no `Resume` starts a new one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Resume<'a> {
+    /// This exact chat: an OMP session file or an OpenCode session ID.
+    Chat(&'a str),
+    /// The agent's own `--continue`. OMP's picks the newest chat of the working folder;
+    /// OpenCode's searches the whole project, so restore names that folder's chat instead.
+    Continue,
+}
+
 /// Return launch-scoped injection; inherited auth, profiles and plugin discovery stay intact.
 /// `resume` is passed through unchecked: callers validate it first (`validate_resume`, plus
-/// `existing_opencode_chats` for OpenCode), because restore checks every chat up front.
+/// `opencode_chats` for OpenCode), because restore checks every chat up front.
 pub fn command(
     kind: &str,
     session: u64,
     socket: &Path,
-    resume: Option<&str>,
+    resume: Option<Resume<'_>>,
 ) -> Result<(String, Vec<String>, Vec<(String, String)>)> {
     if !matches!(kind, "omp" | "opencode") {
         bail!("unsupported agent {kind:?}; expected omp or opencode");
@@ -424,7 +434,7 @@ pub fn command(
         ),
         ("CRIT_AGENT_PID".into(), String::new()),
     ];
-    if let Some(identity) = resume {
+    if let Some(Resume::Chat(identity)) = resume {
         env.push(("CRIT_RESUME_ID".into(), identity.into()));
     }
     let mut args = Vec::new();
@@ -439,12 +449,16 @@ pub fn command(
                 .context("extension path is not UTF-8")?
                 .into(),
         );
-        if let Some(identity) = resume {
-            args.extend(["--resume".into(), identity.into()]);
+        match resume {
+            Some(Resume::Chat(identity)) => args.extend(["--resume".into(), identity.into()]),
+            Some(Resume::Continue) => args.push("--continue".into()),
+            None => {}
         }
     } else {
-        if let Some(identity) = resume {
-            args.extend(["--session".into(), identity.into()]);
+        match resume {
+            Some(Resume::Chat(identity)) => args.extend(["--session".into(), identity.into()]),
+            Some(Resume::Continue) => args.push("--continue".into()),
+            None => {}
         }
         let mut config = parse_config(
             &std::env::var("OPENCODE_CONFIG_CONTENT").unwrap_or_else(|_| "{}".into()),
@@ -499,8 +513,8 @@ pub fn command(
 }
 
 /// Refuses a saved chat identity that cannot be resumed. For OMP it also reads the chat
-/// file's header. OpenCode keeps chats in its database, which `existing_opencode_chats`
-/// checks for all of them at once.
+/// file's header. OpenCode keeps chats in its database, which `opencode_chats` checks for
+/// all of them at once.
 pub fn validate_resume(kind: &str, identity: &str) -> Result<()> {
     use std::io::BufRead;
     if !valid_identity(identity) {
@@ -551,12 +565,22 @@ fn valid_identity(identity: &str) -> bool {
     !identity.is_empty() && identity.len() <= 4096 && !identity.contains('\0')
 }
 
-/// Which of `ids` exist in OpenCode's database, from a single `opencode db` call: the CLI
-/// takes about 0.6 s to start, so one call per chat would freeze a restore for seconds.
-/// An identity that cannot be a chat identity is never reported as existing.
-pub fn existing_opencode_chats(ids: &[&str]) -> Result<HashSet<String>> {
-    let Some(query) = opencode_chat_query(ids) else {
-        return Ok(HashSet::new());
+/// What a restore needs from OpenCode's database. One `opencode db` call answers all of it:
+/// the CLI takes about 0.6 s to start, so one call per chat would freeze a restore for seconds.
+#[derive(Debug, Default)]
+pub struct OpencodeChats {
+    /// The saved chat identities that still exist.
+    pub existing: HashSet<String>,
+    /// Folder → its newest top-level, unarchived chat that no saved identity names.
+    pub latest: HashMap<String, String>,
+}
+
+/// Looks up which saved chats `ids` exist, and the newest chat of each of `folders`, whose
+/// panes remember none. A value that cannot be an identity or folder is never asked about.
+pub fn opencode_chats(ids: &[&str], folders: &[&str]) -> Result<OpencodeChats> {
+    let mut chats = OpencodeChats::default();
+    let Some(query) = opencode_chat_query(ids, folders) else {
+        return Ok(chats);
     };
     // OpenCode's missing-session TUI route falls back to Home, so a missing chat must be
     // caught here. The query returns only the IDs that exist.
@@ -569,25 +593,133 @@ pub fn existing_opencode_chats(ids: &[&str]) -> Result<HashSet<String>> {
     }
     let rows: Value =
         serde_json::from_slice(&output.stdout).context("reading OpenCode chat existence result")?;
-    Ok(rows
+    for row in rows
         .as_array()
         .context("OpenCode chat existence result is not a list")?
-        .iter()
-        .filter_map(|row| row["id"].as_str().map(str::to_owned))
-        .collect())
+    {
+        let Some(id) = row["id"].as_str() else {
+            continue;
+        };
+        // Saved chats come back without a folder.
+        match row["folder"].as_str() {
+            Some(folder) => {
+                chats.latest.insert(folder.to_owned(), id.to_owned());
+            }
+            None => {
+                chats.existing.insert(id.to_owned());
+            }
+        }
+    }
+    Ok(chats)
 }
 
-/// `None` when no identity qualifies; each valid identity appears once, quoted for SQL.
-fn opencode_chat_query(ids: &[&str]) -> Option<String> {
+/// `None` when nothing qualifies. Saved `ids` come back with a NULL folder, then each folder
+/// with its newest top-level, unarchived chat other than those `ids`, which their own panes
+/// reopen. Each valid value appears once, quoted for SQL.
+fn opencode_chat_query(ids: &[&str], folders: &[&str]) -> Option<String> {
+    let ids = sql_list(ids);
+    let folders = sql_list(folders);
+    let saved = (!ids.is_empty())
+        .then(|| format!("SELECT id, NULL AS folder FROM session WHERE id IN ({ids})"));
+    if folders.is_empty() {
+        return saved;
+    }
+    let unclaimed = if ids.is_empty() {
+        String::new()
+    } else {
+        format!(" AND id NOT IN ({ids})")
+    };
+    let latest = format!(
+        "SELECT id, directory AS folder FROM (SELECT id, directory, row_number() OVER \
+         (PARTITION BY directory ORDER BY time_updated DESC) AS position FROM session \
+         WHERE directory IN ({folders}) AND parent_id IS NULL AND time_archived IS NULL\
+         {unclaimed}) WHERE position = 1"
+    );
+    Some(match saved {
+        Some(saved) => format!("{saved} UNION ALL {latest}"),
+        None => latest,
+    })
+}
+
+/// The valid `values`, each once, as a quoted SQL list.
+fn sql_list(values: &[&str]) -> String {
     let mut seen = HashSet::new();
-    let quoted: Vec<String> = ids
+    values
         .iter()
         .copied()
-        .filter(|id| valid_identity(id) && seen.insert(*id))
-        .map(|id| format!("'{}'", id.replace('\'', "''")))
-        .collect();
-    (!quoted.is_empty())
-        .then(|| format!("SELECT id FROM session WHERE id IN ({})", quoted.join(",")))
+        .filter(|value| valid_identity(value) && seen.insert(*value))
+        .map(|value| format!("'{}'", value.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// OpenCode's subcommands; with one, `opencode` is not running its interactive TUI.
+const OPENCODE_COMMANDS: &[&str] = &[
+    "acp",
+    "agent",
+    "attach",
+    "auth",
+    "completion",
+    "db",
+    "debug",
+    "export",
+    "github",
+    "import",
+    "mcp",
+    "models",
+    "plug",
+    "plugin",
+    "pr",
+    "providers",
+    "run",
+    "serve",
+    "session",
+    "stats",
+    "uninstall",
+    "upgrade",
+    "web",
+];
+
+/// The agent whose interactive TUI runs in process group `group`, so the shell pane running
+/// it can reopen as that agent. Every member counts, because launchers such as npm's
+/// `opencode` wrapper run the real binary as their child.
+pub fn adopted_agent(group: libc::pid_t) -> Option<&'static str> {
+    let mut cmdline = Vec::new();
+    fs::read_dir("/proc").ok()?.flatten().find_map(|entry| {
+        let pid: libc::pid_t = entry.file_name().to_str()?.parse().ok()?;
+        if unsafe { libc::getpgid(pid) } != group {
+            return None;
+        }
+        cmdline.clear();
+        fs::File::open(entry.path().join("cmdline"))
+            .and_then(|mut file| file.read_to_end(&mut cmdline))
+            .ok()?;
+        let argv = cmdline
+            .strip_suffix(&[0])
+            .unwrap_or(&cmdline)
+            .split(|byte| *byte == 0)
+            .map(std::str::from_utf8)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?;
+        agent_tui(&argv)
+    })
+}
+
+/// `"opencode"` or `"omp"` when `argv` starts that agent's interactive TUI: OpenCode without a
+/// subcommand or `--mini`, OMP without positional arguments such as a prompt.
+fn agent_tui(argv: &[&str]) -> Option<&'static str> {
+    let (program, args) = argv.split_first()?;
+    match program.rsplit('/').next() {
+        Some("opencode")
+            if !args
+                .iter()
+                .any(|arg| *arg == "--mini" || OPENCODE_COMMANDS.contains(arg)) =>
+        {
+            Some("opencode")
+        }
+        Some("omp") if args.iter().all(|arg| arg.starts_with('-')) => Some("omp"),
+        _ => None,
+    }
 }
 
 fn substitute_tui_config(text: &str, base: &Path) -> Result<String> {
@@ -702,16 +834,101 @@ mod tests {
     #[test]
     fn opencode_batch_query_escapes_and_dedupes() {
         assert_eq!(
-            opencode_chat_query(&["ses_a", "it's", "ses_a", "", "nul\0", "ses_b"]).as_deref(),
-            Some("SELECT id FROM session WHERE id IN ('ses_a','it''s','ses_b')")
+            opencode_chat_query(&["ses_a", "it's", "ses_a", "", "nul\0", "ses_b"], &[]).as_deref(),
+            Some("SELECT id, NULL AS folder FROM session WHERE id IN ('ses_a','it''s','ses_b')")
         );
-        assert_eq!(opencode_chat_query(&[]), None);
-        assert_eq!(opencode_chat_query(&["", &"x".repeat(4097)]), None);
+        // Folders without a remembered chat ask for their newest chat no saved pane names.
+        assert_eq!(
+            opencode_chat_query(&["ses_a"], &["/w/it's", "/w/b", "/w/it's", ""]).as_deref(),
+            Some(
+                "SELECT id, NULL AS folder FROM session WHERE id IN ('ses_a') UNION ALL \
+                 SELECT id, directory AS folder FROM (SELECT id, directory, row_number() OVER \
+                 (PARTITION BY directory ORDER BY time_updated DESC) AS position FROM session \
+                 WHERE directory IN ('/w/it''s','/w/b') AND parent_id IS NULL AND \
+                 time_archived IS NULL AND id NOT IN ('ses_a')) WHERE position = 1"
+            )
+        );
+        assert_eq!(
+            opencode_chat_query(&[], &["/w/b"]).as_deref(),
+            Some(
+                "SELECT id, directory AS folder FROM (SELECT id, directory, row_number() OVER \
+                 (PARTITION BY directory ORDER BY time_updated DESC) AS position FROM session \
+                 WHERE directory IN ('/w/b') AND parent_id IS NULL AND time_archived IS NULL) \
+                 WHERE position = 1"
+            )
+        );
+        assert_eq!(opencode_chat_query(&[], &[]), None);
+        assert_eq!(
+            opencode_chat_query(&["", &"x".repeat(4097)], &["nul\0"]),
+            None
+        );
         // Nothing to ask means no `opencode` call at all.
-        assert!(existing_opencode_chats(&[]).unwrap().is_empty());
+        let chats = opencode_chats(&[], &[]).unwrap();
+        assert!(chats.existing.is_empty() && chats.latest.is_empty());
         // Resume validation no longer asks OpenCode; only the identity is checked here.
         assert!(validate_resume("opencode", "ses_a").is_ok());
         assert!(validate_resume("opencode", "").is_err());
+    }
+
+    #[test]
+    fn only_interactive_agent_tuis_are_adopted() {
+        assert_eq!(agent_tui(&["opencode"]), Some("opencode"));
+        assert_eq!(
+            agent_tui(&["/bin/opencode", "-s", "ses_a", "-m", "p/m", "."]),
+            Some("opencode")
+        );
+        assert_eq!(agent_tui(&["opencode", "run", "hi"]), None);
+        assert_eq!(
+            agent_tui(&["opencode", "--log-level", "INFO", "serve"]),
+            None
+        );
+        assert_eq!(agent_tui(&["opencode", "--mini"]), None);
+        // npm's launcher is not the agent; its child, the real binary, is.
+        assert_eq!(
+            agent_tui(&["node", "/lib/node_modules/opencode-ai/bin/opencode"]),
+            None
+        );
+        assert_eq!(agent_tui(&["omp"]), Some("omp"));
+        assert_eq!(agent_tui(&["/usr/bin/omp", "--continue"]), Some("omp"));
+        assert_eq!(agent_tui(&["omp", "update"]), None);
+        assert_eq!(agent_tui(&["omp", "-p", "a prompt"]), None);
+        assert_eq!(agent_tui(&["fish"]), None);
+        assert_eq!(agent_tui(&[]), None);
+    }
+
+    #[test]
+    fn any_member_of_the_foreground_group_can_be_the_agent() {
+        use std::os::unix::process::CommandExt;
+        let temp = tempfile::tempdir().unwrap();
+        let agent = temp.path().join("opencode");
+        std::os::unix::fs::symlink("/bin/sleep", &agent).unwrap();
+        // A launcher whose child is the agent, as npm's wrapper is.
+        let mut launcher = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(format!("'{}' 60 & wait", agent.display()))
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let mut plain = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = launcher.id() as libc::pid_t;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while adopted_agent(group).is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the launched agent was never found"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(adopted_agent(group), Some("opencode"));
+        assert_eq!(adopted_agent(plain.id() as libc::pid_t), None);
+        unsafe { libc::kill(-group, libc::SIGKILL) };
+        let _ = plain.kill();
+        let _ = launcher.wait();
+        let _ = plain.wait();
     }
 
     #[test]
