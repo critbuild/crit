@@ -43,7 +43,7 @@ pub enum LayoutMode {
 #[derive(Clone, Copy)]
 pub enum Confirm {
     Quit,
-    CloseWorktree,
+    CloseWorktree { selected: usize },
     CloseSession,
     StopEnvironment,
     RemoveWorktree,
@@ -303,16 +303,30 @@ pub enum Modal {
         trees: Vec<Worktree>,
         selected: usize,
     },
-    /// `selected == 0` is "new worktree"; `selected - 1` indexes `workspaces`.
     Split {
         layout: LayoutMode,
         selected: usize,
+    },
+    ExistingSplit {
+        layout: LayoutMode,
+        choices: Vec<worktree::SplitTarget>,
+        selected: usize,
+        error: Option<String>,
+    },
+    /// An accepted checkout operation must finish before leaving the picker.
+    OpeningSplit {
+        request: u64,
     },
     Preview {
         urls: Vec<(String, String)>,
         selected: usize,
     },
     Confirm(Confirm),
+    Removal {
+        tree: String,
+        confirm: Confirm,
+        error: Option<String>,
+    },
 }
 
 pub struct Workspace {
@@ -335,11 +349,7 @@ impl Workspace {
         }
     }
     pub fn label(&self) -> &str {
-        if self.tree.branch.is_empty() {
-            "terminal"
-        } else {
-            &self.tree.branch
-        }
+        self.tree.label()
     }
     pub fn state(&self) -> AgentState {
         if self.sessions.iter().any(|s| s.state == AgentState::Blocked) {
@@ -356,6 +366,8 @@ impl Workspace {
 
 pub struct Pane {
     pub workspace: usize,
+    pub session: usize,
+    pub secondary: bool,
     pub body: Rect,
     pub scrollbar: Option<Scrollbar>,
 }
@@ -426,6 +438,8 @@ pub struct Project {
     pub workspaces: Vec<Workspace>,
     pub active: usize,
     pub secondary: Option<usize>,
+    /// Independent session in the second pane when both panes share a workspace.
+    pub secondary_session: Option<usize>,
     pub focus_secondary: bool,
     pub layout: LayoutMode,
     pub split_ratio: u16,
@@ -460,6 +474,7 @@ impl Project {
             workspaces: vec![Workspace::new(tree)],
             active: 0,
             secondary: None,
+            secondary_session: None,
             focus_secondary: false,
             layout: LayoutMode::Full,
             split_ratio: restore::default_split_ratio(),
@@ -487,6 +502,7 @@ impl Project {
             workspaces: vec![Workspace::new(tree)],
             active: 0,
             secondary: None,
+            secondary_session: None,
             focus_secondary: false,
             layout: LayoutMode::Full,
             split_ratio: restore::default_split_ratio(),
@@ -514,6 +530,16 @@ impl Project {
         }
     }
 
+    pub fn pane_session(&self, secondary: bool) -> usize {
+        if secondary {
+            if let Some(session) = self.secondary_session {
+                return session;
+            }
+            return self.workspaces[self.secondary.unwrap_or(self.active)].selected;
+        }
+        self.workspaces[self.active].selected
+    }
+
     fn close_workspace(&mut self, index: usize) {
         self.workspaces.remove(index);
         self.active = if self.active > index {
@@ -528,9 +554,12 @@ impl Project {
                 Some(if s > index { s - 1 } else { s })
             }
         });
-        if self.secondary == Some(self.active) || self.secondary.is_none() {
+        if self.secondary.is_none()
+            || (self.secondary == Some(self.active) && self.secondary_session.is_none())
+        {
             self.layout = LayoutMode::Full;
             self.secondary = None;
+            self.secondary_session = None;
             self.focus_secondary = false;
         }
     }
@@ -555,6 +584,8 @@ pub struct App {
     next_request: u64,
     pending_creations: VecDeque<(PathBuf, String, Modal)>,
     state_dirty: bool,
+    metadata_pending: bool,
+    metadata_checked: Instant,
     socket: PathBuf,
     tx: SyncSender<Event>,
     jobs: SyncSender<Job>,
@@ -585,6 +616,20 @@ enum Job {
         request: u64,
         repository: worktree::Repository,
     },
+    SplitTargets {
+        request: u64,
+        repository: worktree::Repository,
+        focused: String,
+        layout: LayoutMode,
+    },
+    OpenSplit {
+        request: u64,
+        repository: worktree::Repository,
+        layout: LayoutMode,
+        choices: Vec<worktree::SplitTarget>,
+        selected: usize,
+    },
+    RefreshMetadata(Vec<worktree::Repository>),
     Environment {
         tree: Worktree,
         operation: EnvironmentOp,
@@ -641,6 +686,47 @@ fn environment_summary(label: &str, environment: &compose::Environment) -> Strin
 }
 
 impl App {
+    const METADATA_INTERVAL: Duration = Duration::from_secs(1);
+
+    fn refresh_metadata(&mut self) {
+        if self.metadata_pending || self.metadata_checked.elapsed() < Self::METADATA_INTERVAL {
+            return;
+        }
+        self.metadata_checked = Instant::now();
+        let repositories: Vec<_> = std::iter::once(&self.project)
+            .chain(&self.saved_projects)
+            .filter_map(|project| project.repository.clone())
+            .collect();
+        if !repositories.is_empty()
+            && self
+                .jobs
+                .try_send(Job::RefreshMetadata(repositories))
+                .is_ok()
+        {
+            self.metadata_pending = true;
+        }
+    }
+
+    fn apply_metadata(&mut self, trees: Vec<Worktree>) -> bool {
+        self.metadata_pending = false;
+        self.metadata_checked = Instant::now();
+        let mut changed = false;
+        for workspace in self.all_workspaces_mut() {
+            let Some(tree) = trees
+                .iter()
+                .find(|tree| tree.id == workspace.tree.id && tree.path == workspace.tree.path)
+            else {
+                continue;
+            };
+            if workspace.tree.branch != tree.branch || workspace.tree.head != tree.head {
+                workspace.tree.branch.clone_from(&tree.branch);
+                workspace.tree.head.clone_from(&tree.head);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     fn workspace_changed(&mut self) {
         // Hit targets belong to the last frame, not the newly selected topology.
         self.panes.clear();
@@ -695,42 +781,60 @@ impl App {
                 if slot.is_none() {
                     active_project = index;
                 }
+                let mut secondary_session = None;
+                let workspaces = project
+                    .workspaces
+                    .iter()
+                    .enumerate()
+                    .map(|(workspace_index, workspace)| {
+                        let mut selected = 0;
+                        let sessions = workspace
+                            .sessions
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, session)| {
+                                matches!(session.kind.as_str(), "omp" | "opencode" | "shell")
+                            })
+                            .enumerate()
+                            .map(|(saved_index, (index, session))| {
+                                if index == workspace.selected {
+                                    selected = saved_index;
+                                }
+                                if workspace_index == project.active
+                                    && Some(index) == project.secondary_session
+                                {
+                                    secondary_session = Some(saved_index);
+                                }
+                                restore::SavedSession {
+                                    kind: session.kind.clone(),
+                                    resume: session.resume.clone(),
+                                }
+                            })
+                            .collect();
+                        restore::SavedWorkspace {
+                            path: workspace.tree.path.clone(),
+                            source: workspace.source.clone(),
+                            sessions,
+                            selected,
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                // Non-restorable sessions (for example Docker logs) must never
+                // turn a saved split into two views of the same terminal.
+                let keep_split = project.secondary_session.is_none()
+                    || secondary_session
+                        .is_some_and(|selected| selected != workspaces[project.active].selected);
                 restore::SavedProject {
-                    workspaces: project
-                        .workspaces
-                        .iter()
-                        .map(|workspace| {
-                            let mut selected = 0;
-                            let sessions = workspace
-                                .sessions
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, session)| {
-                                    matches!(session.kind.as_str(), "omp" | "opencode" | "shell")
-                                })
-                                .enumerate()
-                                .map(|(saved_index, (index, session))| {
-                                    if index == workspace.selected {
-                                        selected = saved_index;
-                                    }
-                                    restore::SavedSession {
-                                        kind: session.kind.clone(),
-                                        resume: session.resume.clone(),
-                                    }
-                                })
-                                .collect();
-                            restore::SavedWorkspace {
-                                path: workspace.tree.path.clone(),
-                                source: workspace.source.clone(),
-                                sessions,
-                                selected,
-                            }
-                        })
-                        .collect(),
+                    workspaces,
                     active: project.active,
-                    secondary: project.secondary,
-                    focus_secondary: project.focus_secondary,
-                    layout: match project.layout {
+                    secondary: project.secondary.filter(|_| keep_split),
+                    secondary_session: secondary_session.filter(|_| keep_split),
+                    focus_secondary: keep_split && project.focus_secondary,
+                    layout: match if keep_split {
+                        project.layout
+                    } else {
+                        LayoutMode::Full
+                    } {
                         LayoutMode::Full => restore::SavedLayout::Full,
                         LayoutMode::Vertical => restore::SavedLayout::Vertical,
                         LayoutMode::Horizontal => restore::SavedLayout::Horizontal,
@@ -775,9 +879,29 @@ impl App {
     pub fn focused(&self) -> &Workspace {
         &self.project.workspaces[self.focused_index()]
     }
+    pub fn focused_session_index(&self) -> usize {
+        self.project
+            .pane_session(self.project.layout != LayoutMode::Full && self.project.focus_secondary)
+    }
     pub fn focused_session(&self) -> Option<&Session> {
-        let workspace = self.focused();
-        workspace.sessions.get(workspace.selected)
+        self.focused().sessions.get(self.focused_session_index())
+    }
+
+    fn select_session(&mut self, selected: usize) {
+        let index = self.focused_index();
+        if self.project.secondary_session.is_some() {
+            let other = self.project.pane_session(!self.project.focus_secondary);
+            if selected == other {
+                self.project.focus_secondary = !self.project.focus_secondary;
+            } else if self.project.focus_secondary {
+                self.project.secondary_session = Some(selected);
+            } else {
+                self.project.workspaces[index].selected = selected;
+            }
+        } else {
+            self.project.workspaces[index].selected = selected;
+        }
+        self.workspace_changed();
     }
     fn set_notice(&mut self, message: impl Into<String>) {
         self.notice = Some(message.into());
@@ -868,9 +992,7 @@ impl App {
             self.project.workspaces.push(Workspace::new(tree));
             self.project.workspaces.len() - 1
         };
-        self.project.layout = LayoutMode::Full;
-        self.project.secondary = None;
-        self.project.focus_secondary = false;
+        self.full_width();
         self.modal = None;
         self.notice = None;
         self.select_workspace(index, agent)
@@ -897,8 +1019,13 @@ impl App {
         self.next_session += 1;
         let workspace = &mut self.project.workspaces[index];
         workspace.sessions.push(session);
-        workspace.selected = workspace.sessions.len() - 1;
-        self.state_dirty = true;
+        let selected = workspace.sessions.len() - 1;
+        if index == self.focused_index() {
+            self.select_session(selected);
+        } else {
+            self.project.workspaces[index].selected = selected;
+            self.state_dirty = true;
+        }
         Ok(())
     }
     fn select_shell(&mut self) -> Result<()> {
@@ -909,8 +1036,7 @@ impl App {
             .iter()
             .position(|session| session.kind == "shell" && session.alive.load(Ordering::Acquire))
         {
-            workspace.selected = selected;
-            self.state_dirty = true;
+            self.select_session(selected);
             Ok(())
         } else {
             self.spawn(index, "shell", None)
@@ -928,7 +1054,17 @@ impl App {
             return Ok(());
         }
         self.workspace_changed();
-        if self.project.layout != LayoutMode::Full && self.project.secondary == Some(index) {
+        if let Some(selected) = self.project.secondary_session
+            && index != self.project.active
+        {
+            if !self.project.focus_secondary {
+                self.project.workspaces[self.project.active].selected = selected;
+            }
+            self.project.secondary_session = None;
+        }
+        if self.project.secondary_session.is_some() {
+            // Selecting the shared tab keeps its currently focused terminal.
+        } else if self.project.layout != LayoutMode::Full && self.project.secondary == Some(index) {
             self.project.focus_secondary = true;
         } else if self.project.active == index {
             self.project.focus_secondary = false;
@@ -944,7 +1080,7 @@ impl App {
                 .iter()
                 .position(|session| session.kind == kind && session.alive.load(Ordering::Acquire))
             {
-                self.project.workspaces[index].selected = selected;
+                self.select_session(selected);
             } else {
                 self.spawn(index, kind, None)?;
             }
@@ -978,10 +1114,13 @@ impl App {
         Ok(())
     }
     fn full_width(&mut self) {
+        let selected = self.focused_session_index();
         self.workspace_changed();
         self.project.active = self.focused_index();
+        self.project.workspaces[self.project.active].selected = selected;
         self.project.layout = LayoutMode::Full;
         self.project.secondary = None;
+        self.project.secondary_session = None;
         self.project.focus_secondary = false;
     }
 
@@ -990,24 +1129,36 @@ impl App {
             self.full_width();
             return Ok(());
         }
-        self.git_repository()?;
-        self.modal = Some(if self.project.workspaces.len() < 2 {
-            Modal::NewWorktree {
-                input: String::new(),
-                split: Some(layout),
-            }
-        } else {
-            Modal::Split {
-                layout,
-                selected: 0,
-            }
+        self.modal = Some(Modal::Split {
+            layout,
+            selected: 0,
         });
+        Ok(())
+    }
+
+    fn split_terminal(&mut self, layout: LayoutMode) -> Result<()> {
+        let index = self.focused_index();
+        self.ensure_session(index)?;
+        let selected = self.focused_session_index();
+        let kind = match self.focused_session().map(|session| session.kind.as_str()) {
+            Some("omp") => "omp",
+            Some("opencode") => "opencode",
+            _ => "shell",
+        };
+        self.spawn(index, kind, None)?;
+        let secondary = self.project.workspaces[index].sessions.len() - 1;
+        self.workspace_changed();
+        self.project.workspaces[index].selected = selected;
+        self.project.active = index;
+        self.project.secondary = Some(index);
+        self.project.secondary_session = Some(secondary);
+        self.project.focus_secondary = true;
+        self.project.layout = layout;
         Ok(())
     }
     /// Shows `index` next to the focused worktree; `focus_new` moves focus into it.
     fn split_with(&mut self, layout: LayoutMode, index: usize, focus_new: bool) -> Result<()> {
-        self.workspace_changed();
-        self.project.active = self.focused_index();
+        self.full_width();
         self.project.secondary = Some(index);
         self.project.focus_secondary = focus_new;
         self.project.layout = layout;
@@ -1345,7 +1496,12 @@ impl App {
             Action::ToggleNative => {
                 self.native_keys = !self.native_keys;
                 self.state_dirty = true;
-                self.modal = None;
+                if !matches!(
+                    &self.modal,
+                    Some(Modal::Removal { .. } | Modal::OpeningSplit { .. })
+                ) {
+                    self.modal = None;
+                }
                 if self.use_kitty {
                     kitty::set_native(&mut io::stdout(), self.native_keys)?;
                 }
@@ -1358,7 +1514,9 @@ impl App {
                     selected: 0,
                 })
             }
-            Action::CloseWorktree => self.modal = Some(Modal::Confirm(Confirm::CloseWorktree)),
+            Action::CloseWorktree => {
+                self.modal = Some(Modal::Confirm(Confirm::CloseWorktree { selected: 2 }))
+            }
             Action::NewSession => self.modal = Some(Modal::NewSession { selected: 0 }),
             Action::CloseSession => self.modal = Some(Modal::Confirm(Confirm::CloseSession)),
             Action::NextWorktree | Action::PreviousWorktree => {
@@ -1394,8 +1552,7 @@ impl App {
             Action::FocusSession(index) => {
                 let focused = self.focused_index();
                 if index < self.project.workspaces[focused].sessions.len() {
-                    self.project.workspaces[focused].selected = index;
-                    self.state_dirty = true;
+                    self.select_session(index);
                 }
             }
             Action::SplitVertical => self.split(LayoutMode::Vertical)?,
@@ -1416,13 +1573,33 @@ impl App {
         let Some(mut modal) = self.modal.take() else {
             return Ok(());
         };
-        if key.code == KeyCode::Esc {
+        if key.code == KeyCode::Esc
+            && !matches!(
+                &modal,
+                Modal::Removal { error: None, .. } | Modal::OpeningSplit { .. }
+            )
+        {
+            if let Modal::ExistingSplit { layout, .. } = modal {
+                self.modal = Some(Modal::Split {
+                    layout,
+                    selected: 2,
+                });
+            }
             return Ok(());
         }
         let mut retain = true;
         let result = (|| -> Result<()> {
             match &mut modal {
-                Modal::Loading { .. } => {}
+                Modal::Loading { .. } | Modal::OpeningSplit { .. } => {}
+                Modal::Removal { confirm, error, .. } => {
+                    if error.is_some() && key.code == KeyCode::Enter {
+                        self.modal = Some(Modal::Confirm(match confirm {
+                            Confirm::CloseWorktree { .. } => Confirm::CloseWorktree { selected: 2 },
+                            other => *other,
+                        }));
+                        retain = false;
+                    }
+                }
                 Modal::Intent(dialog) => match key.code {
                     KeyCode::F(1) => retain = false,
                     KeyCode::F(2) => {
@@ -1526,20 +1703,70 @@ impl App {
                     }
                 }
                 Modal::Split { layout, selected } => {
-                    navigate(key, selected, self.project.workspaces.len() + 1);
+                    navigate(key, selected, 3);
                     if key.code == KeyCode::Enter {
                         if *selected == 0 {
+                            self.git_repository()?;
                             self.modal = Some(Modal::NewWorktree {
                                 input: String::new(),
                                 split: Some(*layout),
                             });
-                            retain = false;
-                        } else if *selected - 1 != self.focused_index() {
-                            self.split_with(*layout, *selected - 1, false)?;
-                            retain = false;
+                        } else if *selected == 1 {
+                            self.split_terminal(*layout)?;
                         } else {
-                            self.set_notice("Choose a different worktree for the second pane.");
+                            let repository = self.focused_repository()?;
+                            let request = self.new_request();
+                            self.jobs
+                                .try_send(Job::SplitTargets {
+                                    request,
+                                    repository,
+                                    focused: self.focused().tree.id.clone(),
+                                    layout: *layout,
+                                })
+                                .context("command queue is busy")?;
+                            self.modal = Some(Modal::Loading {
+                                request,
+                                message: "Loading branches and worktrees...",
+                                retry: None,
+                            });
                         }
+                        retain = false;
+                    }
+                }
+                Modal::ExistingSplit {
+                    layout,
+                    choices,
+                    selected,
+                    error,
+                } => {
+                    let previous = *selected;
+                    navigate(key, selected, choices.len());
+                    if previous != *selected {
+                        *error = None;
+                    }
+                    if key.code == KeyCode::Enter && *selected < choices.len() {
+                        let repository = self.focused_repository()?;
+                        let request = self.new_request();
+                        let job = Job::OpenSplit {
+                            request,
+                            repository,
+                            layout: *layout,
+                            choices: std::mem::take(choices),
+                            selected: *selected,
+                        };
+                        if let Err(failure) = self.jobs.try_send(job) {
+                            let (mpsc::TrySendError::Full(job)
+                            | mpsc::TrySendError::Disconnected(job)) = failure;
+                            if let Job::OpenSplit {
+                                choices: returned, ..
+                            } = job
+                            {
+                                *choices = returned;
+                            }
+                            anyhow::bail!("command queue is busy");
+                        }
+                        self.modal = Some(Modal::OpeningSplit { request });
+                        retain = false;
                     }
                 }
                 Modal::Preview { urls, selected } => {
@@ -1572,11 +1799,23 @@ impl App {
                     }
                 }
                 Modal::Confirm(confirm) => {
-                    if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                    if let Confirm::CloseWorktree { selected } = confirm {
+                        navigate(key, selected, 3);
+                    }
+                    let choice = match key.code {
+                        KeyCode::Char('y' | 'Y') => Some(0),
+                        KeyCode::Char('n' | 'N') => Some(2),
+                        KeyCode::Enter => match confirm {
+                            Confirm::CloseWorktree { selected } => Some(*selected),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if let Some(choice @ (0 | 1)) = choice {
                         let index = self.focused_index();
                         match confirm {
                             Confirm::Quit => self.should_quit = true,
-                            Confirm::CloseWorktree => {
+                            Confirm::CloseWorktree { .. } if choice == 0 => {
                                 retain = false;
                                 self.close_workspace();
                                 if !self.should_quit {
@@ -1584,40 +1823,57 @@ impl App {
                                 }
                             }
                             Confirm::CloseSession => {
+                                let selected = self.focused_session_index();
+                                let other = self.project.secondary_session.map(|_| {
+                                    self.project.pane_session(!self.project.focus_secondary)
+                                });
                                 let workspace = &mut self.project.workspaces[index];
                                 if !workspace.sessions.is_empty() {
-                                    workspace.sessions.remove(workspace.selected);
-                                    workspace.selected = workspace
-                                        .selected
-                                        .min(workspace.sessions.len().saturating_sub(1));
+                                    workspace.sessions.remove(selected);
+                                    workspace.selected = other.map_or_else(
+                                        || selected.min(workspace.sessions.len().saturating_sub(1)),
+                                        |other| other - usize::from(other > selected),
+                                    );
                                 }
-                                self.state_dirty = true;
+                                if other.is_some() {
+                                    self.project.layout = LayoutMode::Full;
+                                    self.project.secondary = None;
+                                    self.project.secondary_session = None;
+                                    self.project.focus_secondary = false;
+                                }
+                                self.workspace_changed();
                             }
                             Confirm::StopEnvironment => self.env(index, EnvironmentOp::Down)?,
-                            Confirm::RemoveWorktree => {
+                            Confirm::CloseWorktree { .. } | Confirm::RemoveWorktree => {
                                 let workspace = self.focused();
-                                if workspace.pending
-                                    || workspace
-                                        .environment
-                                        .as_ref()
-                                        .is_some_and(|e| !e.services.is_empty())
-                                {
-                                    self.set_notice(
-                                        "Stop this environment before removing its checkout.",
+                                let tree = workspace.tree.id.clone();
+                                let result = (|| -> Result<()> {
+                                    let repository = self.git_repository()?;
+                                    anyhow::ensure!(
+                                        !workspace.tree.is_main,
+                                        "This is the main checkout, not a linked worktree. Choose Yes to close the tab without deleting the repository."
                                     );
-                                } else {
+                                    anyhow::ensure!(
+                                        !workspace.pending,
+                                        "An environment operation is still running. Wait for it to finish, then try again."
+                                    );
                                     self.jobs
                                         .try_send(Job::Remove {
-                                            repository: self.git_repository()?.clone(),
+                                            repository: repository.clone(),
                                             tree: workspace.tree.clone(),
                                         })
-                                        .context("command queue is busy")?;
-                                    self.set_notice("Checking and removing worktree...");
-                                }
+                                        .context("command queue is busy")
+                                })();
+                                self.notice = None;
+                                self.modal = Some(Modal::Removal {
+                                    tree,
+                                    confirm: *confirm,
+                                    error: result.err().map(|error| format!("{error:#}")),
+                                });
                             }
                         }
                         retain = false;
-                    } else if matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N')) {
+                    } else if choice == Some(2) {
                         retain = false;
                     }
                 }
@@ -1653,7 +1909,12 @@ impl App {
                 Event::Input(crossterm::event::Event::Key(key))
                     if keys::action(*key) == Some(Action::ToggleNative) => {}
                 Event::Input(crossterm::event::Event::Key(key))
-                    if key.code == KeyCode::Esc && key.kind != KeyEventKind::Release =>
+                    if key.code == KeyCode::Esc
+                        && key.kind != KeyEventKind::Release
+                        && !matches!(
+                            &self.modal,
+                            Some(Modal::Removal { error: None, .. } | Modal::OpeningSplit { .. })
+                        ) =>
                 {
                     self.modal = None;
                     return Ok(true);
@@ -1822,7 +2083,7 @@ impl App {
                     ) {
                         if let Some((session, bar)) = self.panes.iter().find_map(|pane| {
                             let workspace = self.project.workspaces.get(pane.workspace)?;
-                            let session = workspace.sessions.get(workspace.selected)?;
+                            let session = workspace.sessions.get(pane.session)?;
                             (session.id == id).then_some((session, pane.scrollbar?))
                         }) {
                             session.scroll_to(bar.offset_at(mouse.row, grab));
@@ -1850,14 +2111,19 @@ impl App {
                         || p.scrollbar
                             .is_some_and(|bar| bar.track.contains((mouse.column, mouse.row).into()))
                 }) {
-                    let (index, body, scrollbar) = (pane.workspace, pane.body, pane.scrollbar);
+                    let (index, selected, secondary, body, scrollbar) = (
+                        pane.workspace,
+                        pane.session,
+                        pane.secondary,
+                        pane.body,
+                        pane.scrollbar,
+                    );
                     if matches!(mouse.kind, crossterm::event::MouseEventKind::Down(_)) {
-                        self.project.focus_secondary = self.project.secondary == Some(index)
-                            && self.project.layout != LayoutMode::Full;
+                        self.project.focus_secondary = secondary;
                         self.state_dirty = true;
                     }
                     let workspace = &self.project.workspaces[index];
-                    if let Some(session) = workspace.sessions.get(workspace.selected) {
+                    if let Some(session) = workspace.sessions.get(selected) {
                         if let Some(bar) = scrollbar
                             .filter(|bar| bar.track.contains((mouse.column, mouse.row).into()))
                         {
@@ -1917,11 +2183,12 @@ impl App {
                 self.tab_hits.clear();
             }
             Event::Input(_) => {}
+            Event::Metadata(trees) => return Ok(self.apply_metadata(trees)),
             Event::Dirty(id) => {
                 return Ok(self.panes.iter().any(|p| {
                     self.project.workspaces[p.workspace]
                         .sessions
-                        .get(self.project.workspaces[p.workspace].selected)
+                        .get(p.session)
                         .is_some_and(|s| s.id == id)
                 }));
             }
@@ -2218,6 +2485,91 @@ impl App {
                     }
                 }
             }
+            Event::SplitTargets {
+                request,
+                project,
+                layout,
+                result,
+            } => {
+                if self.project.common_dir() == Some(project.as_path())
+                    && matches!(&self.modal, Some(Modal::Loading { request: pending, .. }) if *pending == request)
+                {
+                    match result {
+                        Ok(choices) => {
+                            self.modal = Some(Modal::ExistingSplit {
+                                layout,
+                                choices,
+                                selected: 0,
+                                error: None,
+                            })
+                        }
+                        Err(error) => {
+                            self.modal = Some(Modal::Split {
+                                layout,
+                                selected: 2,
+                            });
+                            self.set_notice(error);
+                        }
+                    }
+                }
+            }
+            Event::SplitOpened {
+                request,
+                project,
+                layout,
+                choices,
+                selected,
+                source,
+                preparation_error,
+                result,
+            } => {
+                if self.project.common_dir() != Some(project.as_path())
+                    || !matches!(&self.modal, Some(Modal::OpeningSplit { request: pending }) if *pending == request)
+                {
+                    return Ok(false);
+                }
+                match result {
+                    Ok((tree, created)) if tree.id != self.focused().tree.id => {
+                        let index = if let Some(index) = self
+                            .project
+                            .workspaces
+                            .iter()
+                            .position(|workspace| workspace.tree.id == tree.id)
+                        {
+                            index
+                        } else {
+                            let mut workspace = Workspace::new(tree);
+                            workspace.source = preparation_error.as_ref().map(|_| source);
+                            self.project.workspaces.push(workspace);
+                            self.project.workspaces.len() - 1
+                        };
+                        self.modal = None;
+                        if created
+                            && preparation_error.is_none()
+                            && compose::has_config(&self.project.workspaces[index].tree)
+                            && !self.project.workspaces[index].pending
+                        {
+                            self.env(index, EnvironmentOp::Up)?;
+                        }
+                        self.split_with(layout, index, false)?;
+                        if let Some(error) = preparation_error {
+                            self.set_notice(format!("Worktree created; local environment preparation failed: {error}. Fix the files, then start its environment again."));
+                        }
+                    }
+                    result => {
+                        let error = match result {
+                            Err(error) => error,
+                            Ok(_) => "This checkout is already in the focused pane. Choose another, or go back and use Split terminal.".to_owned(),
+                        };
+                        self.modal = Some(Modal::ExistingSplit {
+                            layout,
+                            choices,
+                            selected,
+                            error: Some(error),
+                        });
+                    }
+                }
+            }
             Event::Removed { tree, result } => match result {
                 Ok(()) => {
                     self.workspace_changed();
@@ -2259,7 +2611,19 @@ impl App {
                     }
                     self.set_notice("Checkout removed; Git branch and Docker volumes retained.");
                 }
-                Err(error) => self.set_notice(error),
+                Err(error) => {
+                    if let Some(Modal::Removal {
+                        tree: pending,
+                        error: failure,
+                        ..
+                    }) = &mut self.modal
+                        && *pending == tree
+                    {
+                        *failure = Some(error);
+                    } else {
+                        self.set_notice(error);
+                    }
+                }
             },
             Event::Error(error) => self.set_notice(error),
             Event::Shutdown => self.should_quit = true,
@@ -2443,13 +2807,47 @@ fn start_worker(tx: SyncSender<Event>) -> Result<SyncSender<Job>> {
                         result: worktree::list(&repository).map_err(|e| format!("{e:#}")),
                         project: repository.common_dir,
                     },
+                    Job::SplitTargets { request, repository, focused, layout } => Event::SplitTargets {
+                        request,
+                        layout,
+                        result: worktree::split_targets(&repository, &focused).map_err(|error| format!("{error:#}")),
+                        project: repository.common_dir,
+                    },
+                    Job::OpenSplit { request, repository, layout, choices, selected } => {
+                        let result = choices.get(selected)
+                            .context("Selected split target is no longer available")
+                            .and_then(|target| worktree::open_split_target(&repository, target))
+                            .map_err(|error| format!("{error:#}"));
+                        let preparation_error = result.as_ref().ok()
+                            .filter(|(_, created)| *created)
+                            .and_then(|(tree, _)| prepare_local_environment(&repository.root, tree).err())
+                            .map(|error| format!("{error:#}"));
+                        Event::SplitOpened {
+                            request, layout, choices, selected,
+                            project: repository.common_dir,
+                            source: repository.root,
+                            preparation_error,
+                            result,
+                        }
+                    }
+                    Job::RefreshMetadata(repositories) => {
+                        let mut trees = Vec::new();
+                        for repository in repositories {
+                            // Checkout can temporarily make Git metadata unreadable.
+                            // Keep the previous labels and retry without notice spam.
+                            if let Ok(found) = worktree::list(&repository) {
+                                trees.extend(found);
+                            }
+                        }
+                        Event::Metadata(trees)
+                    }
                     Job::Remove { repository, tree } => {
                         let result = (|| -> Result<()> {
                             if compose::has_config(&tree)
                                 && !compose::status(&tree)?.services.is_empty()
                             {
                                 anyhow::bail!(
-                                    "Stop this worktree's Docker environment before removing it"
+                                    "Stop this worktree's Docker environment first: Esc, then F1 → F2 → Stop environment."
                                 );
                             }
                             worktree::remove(&repository, &tree)
@@ -2672,6 +3070,7 @@ fn restore_projects(
         }
         project.active = saved.active;
         project.secondary = saved.secondary;
+        project.secondary_session = saved.secondary_session;
         project.focus_secondary = saved.focus_secondary;
         project.layout = match saved.layout {
             restore::SavedLayout::Full => LayoutMode::Full,
@@ -2846,6 +3245,8 @@ pub fn run(
         next_request: 1,
         pending_creations: VecDeque::new(),
         state_dirty: true,
+        metadata_pending: false,
+        metadata_checked: Instant::now() - App::METADATA_INTERVAL,
         socket: server.socket_path.clone(),
         tx: tx.clone(),
         jobs,
@@ -2871,6 +3272,7 @@ pub fn run(
     let mut last_draw = Instant::now() - frame_interval;
     let mut redraw = true;
     while !app.should_quit {
+        app.refresh_metadata();
         redraw |= app.checkpoint(&mut store);
         if redraw && last_draw.elapsed() >= frame_interval {
             ui::resize_sessions(&mut app, terminal.size()?)?;
@@ -2887,8 +3289,9 @@ pub fn run(
                 Err(_) => break,
             }
         } else {
-            match rx.recv() {
+            match rx.recv_timeout(App::METADATA_INTERVAL) {
                 Ok(event) => Some(event),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(_) => break,
             }
         };
@@ -2924,6 +3327,317 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_panes_route_focus_resize_and_close_to_distinct_sessions() {
+        for close_secondary in [false, true] {
+            let (mut app, _queued, _events) = interaction_app();
+            let directory = tempfile::tempdir().unwrap();
+            for id in 1..=2 {
+                app.project.workspaces[0].sessions.push(
+                    Session::spawn(
+                        id,
+                        "shell",
+                        None,
+                        directory.path(),
+                        &app.socket,
+                        app.tx.clone(),
+                        10,
+                        40,
+                        Some(("/bin/sleep".into(), vec!["30".into()])),
+                    )
+                    .unwrap(),
+                );
+            }
+            app.project.layout = LayoutMode::Vertical;
+            app.project.secondary = Some(0);
+            app.project.secondary_session = Some(1);
+            app.project.split_ratio = 6_000;
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+            ui::resize_sessions(&mut app, ratatui::layout::Size::new(120, 24)).unwrap();
+            terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+            for pane in &app.panes {
+                assert_eq!(
+                    app.project.workspaces[0].sessions[pane.session]
+                        .parser
+                        .lock()
+                        .screen()
+                        .size(),
+                    (pane.body.height, pane.body.width)
+                );
+            }
+            assert!(app.handle(Event::Dirty(1)).unwrap());
+            assert!(app.handle(Event::Dirty(2)).unwrap());
+            for side in [1, 0] {
+                let body = app.panes[side].body;
+                app.handle(Event::Input(crossterm::event::Event::Mouse(
+                    crossterm::event::MouseEvent {
+                        kind: MouseEventKind::Down(MouseButton::Left),
+                        column: body.x + 1,
+                        row: body.y + 1,
+                        modifiers: KeyModifiers::NONE,
+                    },
+                )))
+                .unwrap();
+                assert_eq!(app.focused_session().unwrap().id, side as u64 + 1);
+            }
+            app.project.focus_secondary = true;
+            ui::resize_sessions(&mut app, ratatui::layout::Size::new(40, 10)).unwrap();
+            assert_eq!(
+                app.focused_session().unwrap().parser.lock().screen().size(),
+                (7, 38)
+            );
+            // Selecting a session already visible in the peer moves focus, not its PTY.
+            app.action(Action::FocusSession(0)).unwrap();
+            assert!(!app.project.focus_secondary);
+            assert_eq!(app.project.secondary_session, Some(1));
+            app.project.focus_secondary = close_secondary;
+            let peer = if close_secondary { 1 } else { 2 };
+            app.action(Action::CloseSession).unwrap();
+            app.modal_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+                .unwrap();
+            assert_eq!(app.focused_session().unwrap().id, peer);
+            assert_eq!(app.focused().sessions.len(), 1);
+            assert!(app.project.layout == LayoutMode::Full);
+            assert!(app.project.secondary.is_none());
+            assert!(app.project.secondary_session.is_none());
+        }
+    }
+
+    #[test]
+    fn shared_snapshot_remaps_sessions_and_never_restores_duplicate_terminals() {
+        let (mut app, _queued, _events) = interaction_app();
+        let directory = tempfile::tempdir().unwrap();
+        app.project.workspaces.truncate(1);
+        for id in 1..=3 {
+            app.project.workspaces[0].sessions.push(
+                Session::spawn(
+                    id,
+                    "shell",
+                    None,
+                    directory.path(),
+                    &app.socket,
+                    app.tx.clone(),
+                    10,
+                    40,
+                    Some(("/bin/sleep".into(), vec!["30".into()])),
+                )
+                .unwrap(),
+            );
+        }
+        app.project.workspaces[0].sessions[0].kind = "logs".into();
+        app.project.workspaces[0].selected = 1;
+        app.project.layout = LayoutMode::Horizontal;
+        app.project.secondary = Some(0);
+        app.project.secondary_session = Some(2);
+        app.project.focus_secondary = true;
+        let store = restore::Store::open_in(directory.path()).unwrap();
+        let snapshot = app.snapshot();
+        assert_eq!(snapshot.projects[0].workspaces[0].selected, 0);
+        assert_eq!(snapshot.projects[0].secondary_session, Some(1));
+        store.save(&snapshot).unwrap();
+        assert_eq!(store.load().unwrap(), Some(snapshot));
+
+        app.project.secondary_session = Some(0);
+        let snapshot = app.snapshot();
+        assert_eq!(snapshot.projects[0].layout, restore::SavedLayout::Full);
+        assert!(snapshot.projects[0].secondary_session.is_none());
+        store.save(&snapshot).unwrap();
+        assert_eq!(store.load().unwrap(), Some(snapshot));
+    }
+
+    #[test]
+    fn deletion_refusal_survives_background_environment_completion() {
+        let (mut app, _queued, _events) = interaction_app();
+        app.project.active = 1;
+        app.project.workspaces[1].environment = Some(compose::Environment {
+            project: "crit-other".into(),
+            services: vec![compose::Service {
+                name: "web".into(),
+                state: "running".into(),
+                ..Default::default()
+            }],
+        });
+        app.action(Action::CloseWorktree).unwrap();
+        app.modal_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .unwrap();
+        app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        // The worker checks current Docker state, not the cached environment.
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Removal { error: None, .. })
+        ));
+        app.handle(Event::Removed {
+            tree: "other".into(),
+            result: Err("Docker environment is running".into()),
+        })
+        .unwrap();
+        assert!(
+            matches!(&app.modal, Some(Modal::Removal { tree, error: Some(_), .. }) if tree == "other")
+        );
+        app.handle(Event::Environment {
+            tree: "other".into(),
+            operation: EnvironmentOp::Probe,
+            prepared: false,
+            result: Ok(compose::Environment::default()),
+        })
+        .unwrap();
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Removal { error: Some(_), .. })
+        ));
+        assert_eq!(app.focused().tree.id, "other");
+        assert_eq!(app.project.workspaces.len(), 2);
+        app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.modal.is_none());
+        assert_eq!(app.project.workspaces.len(), 2);
+    }
+
+    #[test]
+    fn deletion_waits_for_result_and_keeps_a_failed_checkout_open() {
+        let (mut app, _queued, _events) = interaction_app();
+        app.project.active = 1;
+        app.action(Action::CloseWorktree).unwrap();
+        app.modal_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .unwrap();
+        app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        for visible in [true, false] {
+            app.interaction_visible = visible;
+            app.handle(Event::Input(crossterm::event::Event::Key(KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            ))))
+            .unwrap();
+            assert!(matches!(
+                &app.modal,
+                Some(Modal::Removal { error: None, .. })
+            ));
+            assert_eq!(app.project.workspaces.len(), 2);
+        }
+        app.handle(Event::Removed {
+            tree: "other".into(),
+            result: Err("local changes".into()),
+        })
+        .unwrap();
+        assert!(matches!(
+            &app.modal,
+            Some(Modal::Removal { error: Some(_), .. })
+        ));
+        assert_eq!(app.focused().tree.id, "other");
+        app.interaction_visible = true;
+        app.modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.modal.is_none());
+        assert_eq!(app.project.workspaces.len(), 2);
+    }
+
+    #[test]
+    fn metadata_events_update_tabs_and_split_headers_without_changing_topology() {
+        let (mut app, _queued, _events) = interaction_app();
+        let directory = tempfile::tempdir().unwrap();
+        let session = Session::spawn(
+            1,
+            "shell",
+            None,
+            directory.path(),
+            &directory.path().join("unused.sock"),
+            app.tx.clone(),
+            22,
+            100,
+            Some((
+                "/bin/sh".into(),
+                vec!["-c".into(), "IFS= read -r line".into()],
+            )),
+        )
+        .unwrap();
+        let parser = session.parser.clone();
+        let alive = session.alive.clone();
+        app.project.workspaces[0].sessions.push(session);
+        let (mut background, _, _) = interaction_app();
+        background.project.name = "background".into();
+        background.project.order = 1;
+        for workspace in &mut background.project.workspaces {
+            workspace.tree.id = format!("background-{}", workspace.tree.id);
+            workspace.tree.path = PathBuf::from("/background").join(&workspace.tree.id);
+        }
+        app.saved_projects.push(background.project);
+        app.project.layout = LayoutMode::Vertical;
+        app.project.secondary = Some(1);
+        app.project.focus_secondary = true;
+        app.project.split_ratio = 6_500;
+        app.notice = Some("preserve existing notice".into());
+        let mut switched = app.project.workspaces[0].tree.clone();
+        switched.branch = "switched".into();
+        let mut detached = app.project.workspaces[1].tree.clone();
+        detached.branch.clear();
+        detached.head = "0123456789abcdef".into();
+        let mut renamed = app.saved_projects[0].workspaces[0].tree.clone();
+        renamed.branch = "renamed".into();
+        assert!(
+            app.handle(Event::Metadata(vec![switched, detached, renamed]))
+                .unwrap()
+        );
+        assert_eq!(app.project.active, 0);
+        assert_eq!(app.project.secondary, Some(1));
+        assert!(app.project.focus_secondary);
+        assert!(app.project.layout == LayoutMode::Vertical);
+        assert_eq!(app.project.split_ratio, 6_500);
+        assert_eq!(app.saved_projects[0].workspaces[0].label(), "renamed");
+        assert_eq!(app.notice.as_deref(), Some("preserve existing notice"));
+        assert_eq!(app.project.workspaces[0].sessions.len(), 1);
+        assert_eq!(app.project.workspaces[0].selected, 0);
+        assert_eq!(app.project.workspaces[0].sessions[0].id, 1);
+        assert!(Arc::ptr_eq(
+            &app.project.workspaces[0].sessions[0].parser,
+            &parser
+        ));
+        assert!(Arc::ptr_eq(
+            &app.project.workspaces[0].sessions[0].alive,
+            &alive
+        ));
+
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(160, 24)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let row = |y| {
+            (0..160)
+                .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(row(0).contains("switched"));
+        assert!(row(0).contains("detached HEAD"));
+        assert!(row(0).contains("renamed"));
+        assert!(row(1).contains("switched"));
+        assert!(row(1).contains("detached HEAD"));
+        assert!(!app.handle(Event::Metadata(Vec::new())).unwrap());
+        assert_eq!(app.project.workspaces[1].label(), "detached HEAD");
+    }
+
+    #[test]
+    fn metadata_polling_keeps_only_one_refresh_in_flight() {
+        let (mut app, queued, _events) = interaction_app();
+        app.refresh_metadata();
+        assert!(matches!(
+            queued.try_recv().unwrap(),
+            Job::RefreshMetadata(_)
+        ));
+        app.metadata_checked = Instant::now() - App::METADATA_INTERVAL;
+        app.refresh_metadata();
+        assert!(queued.try_recv().is_err());
+        assert!(!app.handle(Event::Metadata(Vec::new())).unwrap());
+        app.refresh_metadata();
+        assert!(queued.try_recv().is_err());
+        app.metadata_checked = Instant::now() - App::METADATA_INTERVAL;
+        app.refresh_metadata();
+        assert!(matches!(
+            queued.try_recv().unwrap(),
+            Job::RefreshMetadata(_)
+        ));
+    }
 
     #[test]
     fn split_grip_drag_resizes_both_panes_without_changing_focus() {
@@ -3210,6 +3924,7 @@ mod tests {
             split_divider: None,
             split_drag: None,
             project: Project {
+                secondary_session: None,
                 repository: Some(worktree::Repository {
                     root: root.clone(),
                     common_dir: root.join(".git"),
@@ -3250,12 +3965,172 @@ mod tests {
             next_request: 1,
             pending_creations: VecDeque::new(),
             state_dirty: false,
+            metadata_pending: false,
+            metadata_checked: Instant::now() - App::METADATA_INTERVAL,
             socket: root.join("agent.sock"),
             tx,
             jobs,
             use_kitty: false,
         };
         (app, queued, events)
+    }
+
+    #[test]
+    fn existing_split_discovery_cannot_reopen_a_canceled_picker() {
+        let (mut app, queued, _events) = interaction_app();
+        app.modal = Some(Modal::Split {
+            layout: LayoutMode::Vertical,
+            selected: 2,
+        });
+        app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let Job::SplitTargets {
+            request,
+            repository,
+            layout,
+            ..
+        } = queued.recv().unwrap()
+        else {
+            panic!("expected discovery");
+        };
+        app.modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        app.modal = Some(Modal::Confirm(Confirm::Quit));
+        app.handle(Event::SplitTargets {
+            request,
+            project: repository.common_dir,
+            layout,
+            result: Ok(vec![worktree::SplitTarget::Branch("unused".into())]),
+        })
+        .unwrap();
+        assert!(matches!(app.modal, Some(Modal::Confirm(Confirm::Quit))));
+        assert_eq!(app.project.workspaces.len(), 2);
+        assert!(queued.try_recv().is_err());
+    }
+
+    #[test]
+    fn existing_split_keeps_choices_on_queue_failure_and_refusal() {
+        let (mut app, queued, _events) = interaction_app();
+        app.modal = Some(Modal::ExistingSplit {
+            layout: LayoutMode::Vertical,
+            choices: vec![worktree::SplitTarget::Branch("available".into())],
+            selected: 0,
+            error: None,
+        });
+        app.jobs.try_send(Job::Projects(PathBuf::new())).unwrap();
+        assert!(
+            app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .is_err()
+        );
+        let Some(Modal::ExistingSplit { choices, .. }) = &app.modal else {
+            panic!("picker lost");
+        };
+        assert!(
+            matches!(choices.as_slice(), [worktree::SplitTarget::Branch(branch)] if branch == "available")
+        );
+        queued.recv().unwrap();
+        app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let Job::OpenSplit {
+            request,
+            repository,
+            layout,
+            choices,
+            selected,
+        } = queued.recv().unwrap()
+        else {
+            panic!("expected opening");
+        };
+        app.modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        app.action(Action::ToggleNative).unwrap();
+        app.interaction_visible = false;
+        app.handle(Event::Input(crossterm::event::Event::Key(KeyEvent::new(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+        ))))
+        .unwrap();
+        assert!(
+            matches!(app.modal, Some(Modal::OpeningSplit { request: pending }) if pending == request)
+        );
+        app.handle(Event::SplitOpened {
+            request,
+            project: repository.common_dir,
+            source: repository.root,
+            layout,
+            choices,
+            selected,
+            preparation_error: None,
+            result: Err("branch no longer exists".into()),
+        })
+        .unwrap();
+        app.handle(Event::Environment {
+            tree: "main".into(),
+            operation: EnvironmentOp::Probe,
+            prepared: false,
+            result: Ok(compose::Environment {
+                project: "main".into(),
+                services: Vec::new(),
+            }),
+        })
+        .unwrap();
+        assert!(
+            matches!(&app.modal, Some(Modal::ExistingSplit { error: Some(error), .. }) if error == "branch no longer exists")
+        );
+        app.modal_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(app.modal, Some(Modal::Split { selected: 2, .. })));
+        assert_eq!(app.project.workspaces.len(), 2);
+        assert!(app.project.secondary.is_none());
+    }
+
+    #[test]
+    fn existing_split_reuses_sessions_and_keeps_the_focused_terminal_first() {
+        let (mut app, _queued, _events) = interaction_app();
+        let directory = tempfile::tempdir().unwrap();
+        for (workspace, id) in [(0, 1), (0, 2), (1, 3)] {
+            app.project.workspaces[workspace].sessions.push(
+                Session::spawn(
+                    id,
+                    "shell",
+                    None,
+                    directory.path(),
+                    &app.socket,
+                    app.tx.clone(),
+                    10,
+                    40,
+                    Some(("/bin/sleep".into(), vec!["30".into()])),
+                )
+                .unwrap(),
+            );
+        }
+        app.project.secondary = Some(0);
+        app.project.secondary_session = Some(1);
+        app.project.focus_secondary = true;
+        app.project.layout = LayoutMode::Vertical;
+        let tree = app.project.workspaces[1].tree.clone();
+        app.modal = Some(Modal::OpeningSplit { request: 7 });
+        app.handle(Event::SplitOpened {
+            request: 7,
+            project: app.project.common_dir().unwrap().to_owned(),
+            layout: LayoutMode::Horizontal,
+            choices: Vec::new(),
+            selected: 0,
+            source: app.project.path().to_owned(),
+            preparation_error: None,
+            result: Ok((tree, false)),
+        })
+        .unwrap();
+        assert_eq!(app.focused_session().unwrap().id, 2);
+        assert_eq!(app.project.workspaces.len(), 2);
+        assert_eq!(app.project.workspaces[0].sessions.len(), 2);
+        assert_eq!(app.project.workspaces[1].sessions.len(), 1);
+        assert_eq!(app.project.workspaces[1].sessions[0].id, 3);
+        assert_eq!(app.project.active, 0);
+        assert_eq!(app.project.secondary, Some(1));
+        assert!(app.project.secondary_session.is_none());
+        assert!(!app.project.focus_secondary);
+        assert!(app.project.layout == LayoutMode::Horizontal);
     }
 
     #[test]
@@ -3500,7 +4375,7 @@ mod tests {
     #[test]
     fn creation_completion_does_not_retarget_an_open_confirmation() {
         let (mut app, _queued, _events) = interaction_app();
-        app.modal = Some(Modal::Confirm(Confirm::CloseWorktree));
+        app.modal = Some(Modal::Confirm(Confirm::CloseWorktree { selected: 2 }));
         let mut tree = app.project.workspaces[1].tree.clone();
         tree.id = "created".into();
         app.handle(Event::Created {
@@ -3517,7 +4392,7 @@ mod tests {
         assert_eq!(app.project.workspaces.len(), 3);
         assert!(matches!(
             app.modal,
-            Some(Modal::Confirm(Confirm::CloseWorktree))
+            Some(Modal::Confirm(Confirm::CloseWorktree { .. }))
         ));
         app.modal_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE))
             .unwrap();
@@ -3656,7 +4531,7 @@ mod tests {
         app.project.secondary = Some(2);
         app.project.focus_secondary = true;
         app.project.layout = LayoutMode::Vertical;
-        app.modal = Some(Modal::Confirm(Confirm::CloseWorktree));
+        app.modal = Some(Modal::Confirm(Confirm::CloseWorktree { selected: 2 }));
         app.handle(Event::Removed {
             tree: "other".into(),
             result: Ok(()),
@@ -3667,7 +4542,7 @@ mod tests {
         assert_eq!(app.project.secondary, Some(1));
         assert!(matches!(
             app.modal,
-            Some(Modal::Confirm(Confirm::CloseWorktree))
+            Some(Modal::Confirm(Confirm::CloseWorktree { .. }))
         ));
     }
 
@@ -3766,6 +4641,8 @@ mod tests {
             next_request: 1,
             pending_creations: VecDeque::new(),
             state_dirty: false,
+            metadata_pending: false,
+            metadata_checked: Instant::now() - App::METADATA_INTERVAL,
             socket: parent.path().join("agent.sock"),
             tx,
             jobs,
@@ -3805,6 +4682,8 @@ mod tests {
             next_request: 1,
             pending_creations: VecDeque::new(),
             state_dirty: false,
+            metadata_pending: false,
+            metadata_checked: Instant::now() - App::METADATA_INTERVAL,
             socket: directory.path().join("agent.sock"),
             tx,
             jobs,
@@ -3828,7 +4707,6 @@ mod tests {
                     .contains("Open a Git project")
             );
         }
-        assert!(app.split(LayoutMode::Vertical).is_err());
         assert!(app.env(0, EnvironmentOp::Status).is_err());
         assert!(
             app.execute_intent(
@@ -3865,156 +4743,11 @@ mod tests {
     }
 
     #[test]
-    fn split_prompts_for_a_worktree_and_new_tab_offers_projects() {
-        let (tx, _events) = mpsc::sync_channel(8);
-        let (jobs, queued) = mpsc::sync_channel(8);
-        let root = PathBuf::from("/split-fixture");
-        let workspace = |branch: &str| {
-            Workspace::new(Worktree {
-                id: branch.into(),
-                path: root.join(branch),
-                branch: branch.into(),
-                head: String::new(),
-                is_main: branch == "main",
-                locked: false,
-            })
-        };
-        let mut app = App {
-            split_divider: None,
-            split_drag: None,
-            project: Project {
-                repository: Some(worktree::Repository {
-                    root: root.clone(),
-                    common_dir: root.join(".git"),
-                }),
-                name: "fixture".into(),
-                workspaces: vec![workspace("main")],
-                active: 0,
-                secondary: None,
-                focus_secondary: false,
-                layout: LayoutMode::Full,
-                order: 0,
-                split_ratio: restore::default_split_ratio(),
-            },
-            saved_projects: Vec::new(),
-            native_keys: false,
-            modal: None,
-            notice: None,
-            panes: Vec::new(),
-            scroll_drag: None,
-            selection: None,
-            tab_hits: Vec::new(),
-            interaction_visible: true,
-            should_quit: false,
-            default_agent: "shell".into(),
-            next_session: 1,
-            next_request: 1,
-            pending_creations: VecDeque::new(),
-            state_dirty: false,
-            socket: root.join("agent.sock"),
-            tx,
-            jobs,
-            use_kitty: false,
-        };
-        let press = |code| KeyEvent::new(code, KeyModifiers::NONE);
-
-        // One worktree: the split shortcut goes straight to naming a new one.
-        app.action(Action::SplitVertical).unwrap();
-        assert!(matches!(
-            app.modal,
-            Some(Modal::NewWorktree {
-                split: Some(LayoutMode::Vertical),
-                ..
-            })
-        ));
-        for c in "login-fix".chars() {
-            app.modal_key(press(KeyCode::Char(c))).unwrap();
-        }
-        app.modal_key(press(KeyCode::Enter)).unwrap();
-        assert!(app.modal.is_none());
-        assert!(matches!(
-            queued.recv().unwrap(),
-            Job::Create {
-                branch,
-                base: None,
-                agent: None,
-                split: Some(LayoutMode::Vertical),
-                ..
-            } if branch == "login-fix"
-        ));
-
-        // Two worktrees: the chooser leads with "new worktree" and keeps the
-        // existing ones selectable; the current one is rejected.
-        app.project.workspaces.push(workspace("other"));
-        app.action(Action::SplitHorizontal).unwrap();
-        assert!(matches!(
-            app.modal,
-            Some(Modal::Split {
-                layout: LayoutMode::Horizontal,
-                selected: 0
-            })
-        ));
-        app.modal_key(press(KeyCode::Down)).unwrap();
-        app.modal_key(press(KeyCode::Enter)).unwrap();
-        assert!(matches!(app.modal, Some(Modal::Split { selected: 1, .. })));
-        assert!(
-            app.notice
-                .as_deref()
-                .unwrap()
-                .contains("different worktree")
-        );
-        app.modal_key(press(KeyCode::Up)).unwrap();
-        app.modal_key(press(KeyCode::Enter)).unwrap();
-        assert!(matches!(
-            app.modal,
-            Some(Modal::NewWorktree {
-                split: Some(LayoutMode::Horizontal),
-                ..
-            })
-        ));
-        app.modal = None;
-        assert!(queued.try_recv().is_err());
-
-        // A split that is already showing toggles back to full width.
-        app.project.layout = LayoutMode::Vertical;
-        app.project.secondary = Some(1);
-        app.project.focus_secondary = true;
-        app.action(Action::SplitVertical).unwrap();
-        assert!(app.modal.is_none());
-        assert!(app.project.layout == LayoutMode::Full && !app.project.focus_secondary);
-
-        // The manual command still opens a plain worktree tab, never a split.
-        app.run_command(IntentCommand::NewWorktree).unwrap();
-        assert!(matches!(
-            app.modal,
-            Some(Modal::NewWorktree { split: None, .. })
-        ));
-
-        app.saved_projects.push(Project {
-            repository: None,
-            name: "Terminal".into(),
-            workspaces: vec![workspace("terminal")],
-            active: 0,
-            secondary: None,
-            focus_secondary: false,
-            layout: LayoutMode::Full,
-            order: 1,
-            split_ratio: restore::default_split_ratio(),
-        });
-        app.action(Action::NewTab).unwrap();
-        app.modal_key(press(KeyCode::End)).unwrap();
-        app.modal_key(press(KeyCode::Enter)).unwrap();
-        assert!(matches!(
-            app.modal,
-            Some(Modal::SwitchProject { selected: 0 })
-        ));
-    }
-
-    #[test]
     fn tab_bar_lists_every_open_project_in_opening_order_and_tabs_wrap_across_them() {
         let (tx, _events) = mpsc::sync_channel(8);
         let (jobs, queued) = mpsc::sync_channel(8);
         let project = |name: &str, order: u64, branches: &[&str]| Project {
+            secondary_session: None,
             repository: None,
             name: name.into(),
             workspaces: branches
@@ -4056,6 +4789,8 @@ mod tests {
             next_request: 1,
             pending_creations: VecDeque::new(),
             state_dirty: false,
+            metadata_pending: false,
+            metadata_checked: Instant::now() - App::METADATA_INTERVAL,
             socket: PathBuf::from("/tabs-fixture/agent.sock"),
             tx,
             jobs,
@@ -4150,6 +4885,7 @@ mod tests {
             split_divider: None,
             split_drag: None,
             project: Project {
+                secondary_session: None,
                 repository: Some(worktree::Repository {
                     root: root.clone(),
                     common_dir: root.join(".git"),
@@ -4190,6 +4926,8 @@ mod tests {
             next_request: 1,
             pending_creations: VecDeque::new(),
             state_dirty: false,
+            metadata_pending: false,
+            metadata_checked: Instant::now() - App::METADATA_INTERVAL,
             socket: root.join("agent.sock"),
             tx,
             jobs,

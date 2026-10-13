@@ -4,7 +4,7 @@ use std::io::{self, Write};
 pub const HELP: &str = "Crit shortcuts (same as Kitty's terminal/window actions)
   F12                    Toggle Crit / native Kitty shortcuts (persistent)
   Ctrl+Shift+T            New tab: Home selected; Enter opens it without typing
-  Ctrl+Shift+Q            Close worktree tab; retain checkout
+  Ctrl+Shift+Q            Close tab: Yes / Yes, delete worktree / No
   Ctrl+Tab / Ctrl+Shift+Right  Next tab (wraps into the next open project)
   Ctrl+Shift+Tab / Left   Previous tab
   Ctrl+Shift+Enter        New OMP / OpenCode / shell session
@@ -12,8 +12,8 @@ pub const HELP: &str = "Crit shortcuts (same as Kitty's terminal/window actions)
   Ctrl+Shift+W            Close focused session
   Ctrl+Shift+[ / ]        Previous / next session or split pane
   Ctrl+Shift+1..9 / 0     Focus session 1..10
-  Ctrl+Shift+,            Split worktrees side by side
-  Ctrl+Shift+.            Split worktrees top and bottom
+  Ctrl+Shift+,            Split side by side
+  Ctrl+Shift+.            Split top and bottom
   Ctrl+Shift+L            Cycle full / vertical / horizontal layout
   F1                     Ask Crit in natural language (Haiku 5.5)
   F1 then F2             Manual controls: Up/Down and Enter, no AI needed
@@ -21,6 +21,18 @@ pub const HELP: &str = "Crit shortcuts (same as Kitty's terminal/window actions)
 
 The agent keeps running when Ctrl+D selects a shell. In a shell, Ctrl+D remains
 normal EOF; native shortcut mode always forwards Ctrl+D to the focused terminal.
+Close-tab choices use Up/Down and Enter; No is selected by default. Esc cancels.
+Yes keeps the checkout; deletion requires a clean, unlocked, non-main worktree
+with its Docker environment stopped, and keeps the branch. Ordinary folders stay.
+Deletion shows progress or a persistent refusal; Enter goes back and Esc dismisses.
+Branch labels follow external Git switches and renames without restarting sessions.
+Split offers New worktree, Split terminal, and Existing branch/worktree.
+New worktree asks for a branch name.
+Split terminal opens an independent session in the same folder, including outside
+Git. No branch or checkout is created. Closing a split session keeps its peer alive.
+Existing branch/worktree opens a picker: choose a checkout or local branch with
+Up/Down and Enter; Esc goes back. Checkouts are reused; unchecked-out branches get
+their own worktree at their own commit. The first pane's branch/session stay put.
 Drag terminal text to select and copy it; Ctrl+Shift+C copies the selection again.
 Ctrl+Shift+V pastes through Kitty; Shift+Insert pastes its primary selection.
 Middle-click pastes the local desktop clipboard. Over SSH, use native terminal paste.

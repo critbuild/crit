@@ -1,10 +1,11 @@
 use crate::{
     app::{
-        App, COMMANDS, Confirm, IntentDialog, LayoutMode, Modal, Pane, ProjectPicker, Scrollbar,
-        SplitDivider, TabHit, Workspace, project_slots,
+        App, COMMANDS, Confirm, IntentDialog, LayoutMode, Modal, Pane, Project, ProjectPicker,
+        Scrollbar, SplitDivider, TabHit, Workspace, project_slots,
     },
     integration::AgentState,
     updates::{State as UpdateState, TOOLS as UPDATE_TOOLS},
+    worktree::SplitTarget,
 };
 use anyhow::Result;
 use ratatui::{
@@ -118,19 +119,27 @@ fn draw_split_handle(buffer: &mut Buffer, divider: SplitDivider, dragging: bool)
         .set_fg(color);
 }
 
+fn pane_target(project: &Project, pane: usize, count: usize) -> (usize, usize, bool) {
+    let secondary = if count == 1 {
+        project.layout != LayoutMode::Full && project.secondary.is_some() && project.focus_secondary
+    } else {
+        pane == 1
+    };
+    let workspace = if secondary {
+        project.secondary.unwrap_or(project.active)
+    } else {
+        project.active
+    };
+    (workspace, project.pane_session(secondary), secondary)
+}
+
 pub fn resize_sessions(app: &mut App, size: Size) -> Result<()> {
     let (areas, count) = areas(app, size);
     for (pane, area) in areas.iter().enumerate().take(count) {
-        let index = if count == 1 {
-            app.focused_index()
-        } else if pane == 0 {
-            app.project.active
-        } else {
-            app.project.secondary.unwrap_or(app.project.active)
-        };
+        let (index, selected, _) = pane_target(&app.project, pane, count);
         let rect = body(*area);
         let workspace = &mut app.project.workspaces[index];
-        if let Some(session) = workspace.sessions.get_mut(workspace.selected) {
+        if let Some(session) = workspace.sessions.get_mut(selected) {
             if app
                 .selection
                 .as_ref()
@@ -179,18 +188,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
     }
     for (pane, area) in regions.iter().copied().enumerate().take(count) {
-        let index = if count == 1 {
-            app.focused_index()
-        } else if pane == 0 {
-            app.project.active
-        } else {
-            app.project.secondary.unwrap_or(app.project.active)
-        };
-        let focused = app.focused_index() == index;
+        let (index, selected, secondary) = pane_target(&app.project, pane, count);
+        let focused = count == 1 || secondary == app.project.focus_secondary;
         let pane_body = body(area);
         let scrollbar = draw_workspace(
             frame,
             &app.project.workspaces[index],
+            selected,
             area,
             pane_body,
             focused,
@@ -199,6 +203,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
         app.panes.push(Pane {
             workspace: index,
+            session: selected,
+            secondary,
             body: pane_body,
             scrollbar,
         });
@@ -345,6 +351,7 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) {
 fn draw_workspace(
     frame: &mut Frame,
     workspace: &Workspace,
+    selected: usize,
     area: Rect,
     body: Rect,
     focused: bool,
@@ -356,7 +363,7 @@ fn draw_workspace(
     }
     let exited = workspace
         .sessions
-        .get(workspace.selected)
+        .get(selected)
         .filter(|session| session.state == AgentState::Exited);
     let mut header = Vec::new();
     let label = Span::styled(
@@ -367,7 +374,7 @@ fn draw_workspace(
     );
     for (index, session) in workspace.sessions.iter().enumerate() {
         let (_, color) = state_style(session.state);
-        let active = index == workspace.selected;
+        let active = index == selected;
         header.push(Span::styled(
             format!(
                 " {}{} {} · {}{} ",
@@ -380,12 +387,12 @@ fn draw_workspace(
             Style::default().fg(if active { color } else { MUTED }),
         ));
     }
-    let selected_width = header.get(workspace.selected).map_or(0, Span::width);
+    let selected_width = header.get(selected).map_or(0, Span::width);
     let label_width = label
         .width()
         .min(usize::from(area.width).saturating_sub(selected_width)) as u16;
     let session_width = area.width - label_width;
-    let mut start = workspace.selected.min(header.len());
+    let mut start = selected.min(header.len());
     let mut visible_width = selected_width;
     while start > 0 && visible_width + header[start - 1].width() <= usize::from(session_width) {
         start -= 1;
@@ -413,7 +420,7 @@ fn draw_workspace(
         Paragraph::new(Line::from(header)).scroll((0, scroll)),
         Rect::new(area.x + label_width, area.y, session_width, 1),
     );
-    if let Some(session) = workspace.sessions.get(workspace.selected) {
+    if let Some(session) = workspace.sessions.get(selected) {
         let mut parser = session.parser.lock();
         // Clear while holding the parser lock: output after this frame must wake us.
         session.dirty.store(false, Ordering::Release);
@@ -704,7 +711,12 @@ pub fn draw_project_chooser(
     );
     let height = notice_height(Some(notice), Size::new(bounds.width, bounds.height));
     let available = Rect::new(bounds.x, bounds.y, bounds.width, bounds.height - height);
-    let inner = modal_area_in(frame, available, " new terminal / open project ", 22);
+    let inner = modal_area_in(
+        frame,
+        available,
+        " new terminal / open project ",
+        Size::new(76, 22),
+    );
     project_folder(frame, inner, picker);
     draw_notice(
         frame,
@@ -878,14 +890,9 @@ fn intent_dialog(frame: &mut Frame, inner: Rect, dialog: &IntentDialog) {
     );
 }
 
-fn modal_area_in(
-    frame: &mut Frame,
-    bounds: Rect,
-    title: &'static str,
-    desired_height: u16,
-) -> Rect {
-    let width = bounds.width.saturating_sub(4).min(76);
-    let height = bounds.height.saturating_sub(2).min(desired_height);
+fn modal_area_in(frame: &mut Frame, bounds: Rect, title: &'static str, desired: Size) -> Rect {
+    let width = bounds.width.saturating_sub(4).min(desired.width);
+    let height = bounds.height.saturating_sub(2).min(desired.height);
     let area = Rect::new(
         bounds.x + (bounds.width - width) / 2,
         bounds.y + (bounds.height - height) / 2,
@@ -903,7 +910,126 @@ fn modal_area_in(
     inner
 }
 
+fn draw_split_picker(frame: &mut Frame, bounds: Rect, selected: usize) {
+    let existing = if bounds.width < 32 {
+        "Existing branch/tree"
+    } else {
+        "Existing branch/worktree"
+    };
+    let choices = ["New worktree", "Split terminal", existing];
+    let controls = "↑/↓ select · Enter · Esc";
+    let width = choices
+        .iter()
+        .map(|choice| choice.width() + 2)
+        .max()
+        .unwrap()
+        .max(controls.width());
+    let inner = modal_area_in(
+        frame,
+        bounds,
+        " split ",
+        Size::new(width as u16 + 2, choices.len() as u16 + 3),
+    );
+    choice_list(
+        frame,
+        Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(1),
+        ),
+        choices,
+        selected,
+    );
+    frame.render_widget(
+        Paragraph::new(controls).style(Style::default().fg(MUTED)),
+        Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+    );
+}
+
+fn draw_existing_split_picker(
+    frame: &mut Frame,
+    bounds: Rect,
+    choices: &[SplitTarget],
+    selected: usize,
+    error: Option<&str>,
+) {
+    let mut error_rows = 0_u16;
+    if let Some(error) = error {
+        notice_chunks(error, bounds.width.saturating_sub(6).min(74), |_| {
+            error_rows = error_rows.saturating_add(1);
+        });
+        error_rows = error_rows.clamp(1, 3);
+    }
+    let rows = if choices.is_empty() {
+        2
+    } else {
+        choices.len().min(17) as u16
+    };
+    let inner = modal_area_in(
+        frame,
+        bounds,
+        " existing branch / worktree ",
+        Size::new(76, (rows + error_rows + 3).min(20)),
+    );
+    let error_rows = error_rows.min(inner.height.saturating_sub(2));
+    let list = Rect::new(
+        inner.x,
+        inner.y,
+        inner.width,
+        inner.height.saturating_sub(error_rows + 1),
+    );
+    if choices.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No other branches or\nworktrees to open.")
+                .style(Style::default().fg(MUTED)),
+            list,
+        );
+    } else {
+        choice_list(
+            frame,
+            list,
+            choices.iter().map(|choice| match choice {
+                SplitTarget::Worktree(tree) => {
+                    format!("{}  {}", tree.branch, tree.path.display())
+                }
+                SplitTarget::Branch(branch) => format!("{branch}  (create worktree)"),
+            }),
+            selected,
+        );
+    }
+    if let Some(error) = error {
+        draw_notice(
+            frame,
+            error,
+            Rect::new(inner.x, list.bottom(), inner.width, error_rows),
+        );
+    }
+    frame.render_widget(
+        Paragraph::new("↑↓ choose · Enter · Esc").style(Style::default().fg(MUTED)),
+        Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+    );
+}
+
+fn draw_opening_split(frame: &mut Frame, bounds: Rect) {
+    let message = "Opening split…";
+    let inner = modal_area_in(
+        frame,
+        bounds,
+        " opening ",
+        Size::new(message.width() as u16 + 2, 3),
+    );
+    frame.render_widget(Paragraph::new(message), inner);
+}
+
 fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
+    let mut available = frame.area();
+    if app.notice.is_some() {
+        available.height = available.height.saturating_sub(notice_height(
+            app.notice.as_deref(),
+            Size::new(available.width, available.height),
+        ));
+    }
     let (title, desired_height) = match modal {
         Modal::Intent(_) => (" ask Crit ", 22),
         Modal::Commands { .. } => (" manual controls ", 24),
@@ -920,23 +1046,128 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
         Modal::OpenWorktree { trees, .. } => {
             (" open existing worktree ", (trees.len() as u16 + 4).min(20))
         }
-        Modal::Split { .. } => (
-            " choose second worktree ",
-            (app.project.workspaces.len() as u16 + 5).min(20),
-        ),
+        Modal::Split { selected, .. } => return draw_split_picker(frame, available, *selected),
+        Modal::ExistingSplit {
+            choices,
+            selected,
+            error,
+            ..
+        } => {
+            return draw_existing_split_picker(
+                frame,
+                available,
+                choices,
+                *selected,
+                error.as_deref(),
+            );
+        }
+        Modal::OpeningSplit { .. } => return draw_opening_split(frame, available),
         Modal::Preview { urls, .. } => (" open endpoint ", (urls.len() as u16 + 4).min(20)),
         Modal::Confirm(_) => (" confirm ", 9),
+        Modal::Removal { error, .. } => (
+            if error.is_some() {
+                " deletion blocked "
+            } else {
+                " deleting worktree "
+            },
+            0,
+        ),
     };
-    let mut available = frame.area();
-    if app.notice.is_some() {
-        available.height = available.height.saturating_sub(notice_height(
-            app.notice.as_deref(),
-            Size::new(available.width, available.height),
-        ));
+    if let Modal::Confirm(Confirm::CloseWorktree { selected }) = modal {
+        let prompt = "End this tab's sessions?";
+        let controls = "↑/↓ select · Enter · Esc";
+        let choices = ["Yes", "Yes, delete worktree", "No"];
+        let width = prompt.width().max(controls.width()).max(
+            choices
+                .iter()
+                .map(|choice| choice.width() + 2)
+                .max()
+                .unwrap(),
+        );
+        let inner = modal_area_in(
+            frame,
+            available,
+            " close tab ",
+            Size::new(width as u16 + 2, choices.len() as u16 + 4),
+        );
+        // Keep all three choices and the controls visible at the minimum size.
+        let show_prompt = inner.height >= choices.len() as u16 + 2;
+        if show_prompt {
+            frame.render_widget(
+                Paragraph::new(prompt),
+                Rect::new(inner.x, inner.y, inner.width, 1),
+            );
+        }
+        let top = inner.y + u16::from(show_prompt);
+        choice_list(
+            frame,
+            Rect::new(
+                inner.x,
+                top,
+                inner.width,
+                inner.bottom().saturating_sub(top + 1),
+            ),
+            choices.into_iter(),
+            *selected,
+        );
+        frame.render_widget(
+            Paragraph::new(controls).style(Style::default().fg(MUTED)),
+            Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+        );
+        return;
     }
-    let inner = modal_area_in(frame, available, title, desired_height);
+    let removal_message = match modal {
+        Modal::Removal { error, .. } => Some(
+            error
+                .as_deref()
+                .unwrap_or("Checking and removing worktree…\nThe tab will close on success."),
+        ),
+        _ => None,
+    };
+    let desired = if let Some(message) = removal_message {
+        let failed = matches!(modal, Modal::Removal { error: Some(_), .. });
+        let width = message
+            .lines()
+            .map(str::width)
+            .max()
+            .unwrap_or(0)
+            .max("Tab and checkout kept.".width())
+            .min(60) as u16;
+        let mut rows = 0_u16;
+        notice_chunks(
+            message,
+            width.min(available.width.saturating_sub(6)),
+            |_| {
+                rows = rows.saturating_add(1);
+            },
+        );
+        Size::new(width + 2, rows.saturating_add(if failed { 4 } else { 2 }))
+    } else {
+        Size::new(76, desired_height)
+    };
+    let inner = modal_area_in(frame, available, title, desired);
     match modal {
         Modal::Intent(dialog) => intent_dialog(frame, inner, dialog),
+        Modal::Removal { error, .. } => {
+            let failed = error.is_some();
+            let message_area = Rect::new(
+                inner.x,
+                inner.y,
+                inner.width,
+                inner.height.saturating_sub(if failed { 2 } else { 0 }),
+            );
+            draw_notice(frame, removal_message.unwrap(), message_area);
+            if failed {
+                frame.render_widget(
+                    Paragraph::new("Tab and checkout kept.").style(Style::default().fg(AMBER)),
+                    Rect::new(inner.x, inner.bottom() - 2, inner.width, 1),
+                );
+                frame.render_widget(
+                    Paragraph::new("Enter back · Esc dismiss").style(Style::default().fg(MUTED)),
+                    Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+                );
+            }
+        }
         Modal::Loading { message, .. } => {
             frame.render_widget(Paragraph::new(*message).wrap(Wrap { trim: false }), inner);
             frame.render_widget(
@@ -1032,24 +1263,9 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
                 .map(|tree| format!("{}  {}", tree.branch, tree.path.display())),
             *selected,
         ),
-        Modal::Split { selected, .. } => choice_list(
-            frame,
-            inner,
-            std::iter::once("New branch / worktree…".to_owned()).chain(
-                app.project.workspaces.iter().map(|workspace| {
-                    format!(
-                        "{}{}",
-                        workspace.tree.branch,
-                        if workspace.tree.id == app.focused().tree.id {
-                            " (current)"
-                        } else {
-                            ""
-                        }
-                    )
-                }),
-            ),
-            *selected,
-        ),
+        Modal::Split { .. } | Modal::ExistingSplit { .. } | Modal::OpeningSplit { .. } => {
+            unreachable!("split dialogs are rendered above")
+        }
         Modal::Preview { urls, selected } => choice_list(
             frame,
             inner,
@@ -1061,12 +1277,7 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
                 Confirm::Quit => {
                     "Exit Crit; stop sessions?\nSaved chats reopen.\nDocker/checkouts stay."
                 }
-                Confirm::CloseWorktree if app.project.repository.is_none() => {
-                    "Close tab; end its sessions?\nOther projects and sessions remain."
-                }
-                Confirm::CloseWorktree => {
-                    "Close tab; end its sessions?\nCheckout, branch and Docker remain."
-                }
+                Confirm::CloseWorktree { .. } => unreachable!("close tab is rendered above"),
                 Confirm::CloseSession => {
                     "End the focused session?\nOther sessions and Docker remain."
                 }
@@ -1193,13 +1404,13 @@ fn draw_notice(frame: &mut Frame, notice: &str, area: Rect) {
         );
     }
 }
-fn choice_list(
+fn choice_list<'a>(
     frame: &mut Frame,
     area: Rect,
-    items: impl Iterator<Item = String>,
+    items: impl IntoIterator<Item = impl Into<ListItem<'a>>>,
     selected: usize,
 ) {
-    let list = List::new(items.map(ListItem::new).collect::<Vec<_>>())
+    let list = List::new(items)
         .highlight_style(Style::default().fg(ACCENT).bg(BG))
         .highlight_symbol("› ");
     let mut state = ListState::default().with_selected(Some(selected));
@@ -1210,6 +1421,362 @@ fn choice_list(
 mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+
+    fn test_workspace() -> Workspace {
+        Workspace {
+            tree: crate::worktree::Worktree {
+                id: "terminal:test".into(),
+                path: ".".into(),
+                branch: String::new(),
+                head: String::new(),
+                is_main: false,
+                locked: false,
+            },
+            source: None,
+            sessions: Vec::new(),
+            selected: 0,
+            environment: None,
+            pending: false,
+        }
+    }
+
+    fn row_text(buffer: &Buffer, area: Rect, row: u16) -> String {
+        (area.x..area.right())
+            .map(|column| buffer[(column, row)].symbol())
+            .collect()
+    }
+
+    #[test]
+    fn pane_targets_keep_shared_workspace_sessions_independent_when_collapsed() {
+        let mut project = Project {
+            repository: None,
+            name: "test".into(),
+            workspaces: vec![test_workspace()],
+            active: 0,
+            secondary: Some(0),
+            secondary_session: Some(1),
+            focus_secondary: false,
+            layout: LayoutMode::Vertical,
+            split_ratio: crate::restore::default_split_ratio(),
+            order: 0,
+        };
+        for layout in [LayoutMode::Vertical, LayoutMode::Horizontal] {
+            project.layout = layout;
+            for focus_secondary in [false, true] {
+                project.focus_secondary = focus_secondary;
+                for size in [Size::new(80, 24), Size::new(30, 10), Size::new(80, 15)] {
+                    let (_, count) = pane_areas(layout, true, project.split_ratio, size);
+                    if count == 2 {
+                        assert_eq!(pane_target(&project, 0, count), (0, 0, false));
+                        assert_eq!(pane_target(&project, 1, count), (0, 1, true));
+                    } else {
+                        assert_eq!(
+                            pane_target(&project, 0, count),
+                            (0, usize::from(focus_secondary), focus_secondary)
+                        );
+                    }
+                }
+            }
+        }
+        project.workspaces.push(test_workspace());
+        project.workspaces[1].selected = 2;
+        project.secondary = Some(1);
+        project.secondary_session = None;
+        assert_eq!(pane_target(&project, 0, 2), (0, 0, false));
+        assert_eq!(pane_target(&project, 1, 2), (1, 2, true));
+        assert_eq!(pane_target(&project, 0, 1), (1, 2, true));
+        project.layout = LayoutMode::Full;
+        assert_eq!(pane_target(&project, 0, 1), (0, 0, false));
+    }
+
+    #[test]
+    fn shared_workspace_draws_each_sessions_header_output_cursor_and_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut workspace = test_workspace();
+        workspace.tree.path = directory.path().to_owned();
+        let (tx, _rx) = std::sync::mpsc::sync_channel(16);
+        let panes = [Rect::new(0, 1, 100, 12), Rect::new(100, 1, 100, 12)];
+        let bodies = panes.map(body);
+        for id in 1..=2 {
+            workspace.sessions.push(
+                crate::terminal::Session::spawn(
+                    id,
+                    "shell",
+                    None,
+                    directory.path(),
+                    &directory.path().join("unused.sock"),
+                    tx.clone(),
+                    bodies[0].height,
+                    bodies[0].width,
+                    Some(("/bin/cat".into(), Vec::new())),
+                )
+                .unwrap(),
+            );
+        }
+        workspace.sessions[0]
+            .parser
+            .lock()
+            .process(b"first transcript");
+        workspace.sessions[1]
+            .parser
+            .lock()
+            .process(b"second transcript\r\nsecond cursor");
+        let mut terminal = Terminal::new(TestBackend::new(200, 13)).unwrap();
+        for focused in 0..2 {
+            terminal
+                .draw(|frame| {
+                    for (selected, area) in panes.iter().copied().enumerate() {
+                        assert!(
+                            draw_workspace(
+                                frame,
+                                &workspace,
+                                selected,
+                                area,
+                                bodies[selected],
+                                selected == focused,
+                                true,
+                                None,
+                            )
+                            .is_none()
+                        );
+                    }
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            for selected in 0..2 {
+                let header = row_text(buffer, panes[selected], panes[selected].y);
+                assert!(header.contains(&format!("[shell {} ", selected + 1)));
+                assert_eq!(header.contains('›'), selected == focused);
+                assert!(!workspace.sessions[selected].dirty.load(Ordering::Acquire));
+            }
+            assert!(row_text(buffer, bodies[0], bodies[0].y).starts_with("first transcript"));
+            assert!(row_text(buffer, bodies[1], bodies[1].y).starts_with("second transcript"));
+            let (row, column) = workspace.sessions[focused]
+                .parser
+                .lock()
+                .screen()
+                .cursor_position();
+            let cursor = terminal.get_cursor_position().unwrap();
+            assert_eq!(
+                (cursor.x, cursor.y),
+                (bodies[focused].x + column, bodies[focused].y + row)
+            );
+        }
+        let mut selection = crate::selection::Selection::new(
+            workspace.sessions[1].id,
+            bodies[1],
+            workspace.sessions[1].parser.lock().screen(),
+            bodies[1].x,
+            bodies[1].y,
+        );
+        selection.update(bodies[1].x + 5, bodies[1].y);
+        workspace.sessions[1]
+            .parser
+            .lock()
+            .process(b"\x1b[Hchanged");
+        terminal
+            .draw(|frame| {
+                for (selected, area) in panes.iter().copied().enumerate() {
+                    draw_workspace(
+                        frame,
+                        &workspace,
+                        selected,
+                        area,
+                        bodies[selected],
+                        selected == 0,
+                        true,
+                        Some(&selection),
+                    );
+                }
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(row_text(buffer, bodies[1], bodies[1].y).starts_with("second transcript"));
+        assert_eq!(selection.text(), "second");
+        assert_eq!(buffer[(bodies[1].x, bodies[1].y)].bg, ACCENT);
+        assert_ne!(buffer[(bodies[0].x, bodies[0].y)].bg, ACCENT);
+        let cursor = terminal.get_cursor_position().unwrap();
+        assert_eq!((cursor.x, cursor.y), (bodies[0].x + 16, bodies[0].y));
+
+        workspace.sessions[1].state = AgentState::Exited;
+        workspace.sessions[1].message = Some("test exit".into());
+        for row in 0..30 {
+            workspace.sessions[1]
+                .parser
+                .lock()
+                .process(format!("history {row}\r\n").as_bytes());
+        }
+        terminal
+            .draw(|frame| {
+                for (selected, area) in panes.iter().copied().enumerate() {
+                    let bar = draw_workspace(
+                        frame,
+                        &workspace,
+                        selected,
+                        area,
+                        bodies[selected],
+                        selected == 1,
+                        true,
+                        None,
+                    );
+                    assert_eq!(bar.is_some(), selected == 1);
+                    if let Some(bar) = bar {
+                        assert_eq!(bar.track.x, bodies[selected].right());
+                    }
+                }
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert!(!row_text(buffer, panes[0], panes[0].y).contains("Exited ("));
+        assert!(row_text(buffer, panes[1], panes[1].y).contains("Exited (test exit)"));
+    }
+
+    #[test]
+    fn split_picker_keeps_every_selection_and_controls_inside_available_space() {
+        for size in [Size::new(30, 10), Size::new(80, 24)] {
+            for notice in [None, Some("progress\nprogress\nprogress")] {
+                let bounds = Rect::new(0, 0, size.width, size.height - notice_height(notice, size));
+                let mut terminal =
+                    Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
+                let mut selected_rows = Vec::new();
+                for selected in 0..3 {
+                    terminal
+                        .draw(|frame| draw_split_picker(frame, bounds, selected))
+                        .unwrap();
+                    let buffer = terminal.backend().buffer();
+                    let row = (0..bounds.bottom())
+                        .find(|&row| row_text(buffer, bounds, row).contains('›'))
+                        .expect("selected split action must be visible");
+                    selected_rows.push(row);
+                    assert!((row + 1..bounds.bottom()).any(|row| {
+                        let text = row_text(buffer, bounds, row);
+                        text.contains("Enter") && text.contains("Esc")
+                    }));
+                    for row in bounds.bottom()..size.height {
+                        assert!(row_text(buffer, buffer.area, row).trim().is_empty());
+                    }
+                }
+                assert!(selected_rows.windows(2).all(|rows| rows[0] < rows[1]));
+            }
+        }
+    }
+
+    #[test]
+    fn existing_split_picker_keeps_navigation_and_errors_visible_during_scroll() {
+        let choices: Vec<_> = (0..30)
+            .map(|index| SplitTarget::Branch(format!("branch-{index:02}")))
+            .collect();
+        for size in [Size::new(30, 10), Size::new(80, 24)] {
+            for notice in [None, Some("progress\nprogress\nprogress")] {
+                let bounds = Rect::new(0, 0, size.width, size.height - notice_height(notice, size));
+                let mut terminal =
+                    Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
+                for error in [
+                    None,
+                    Some("Opening failed:\ncheckout unavailable\ntry another target"),
+                ] {
+                    for selected in [0, 1, 15, 29, 28, 0] {
+                        terminal
+                            .draw(|frame| {
+                                draw_existing_split_picker(
+                                    frame, bounds, &choices, selected, error,
+                                );
+                            })
+                            .unwrap();
+                        let buffer = terminal.backend().buffer();
+                        let rows: Vec<_> = (0..bounds.bottom())
+                            .map(|row| row_text(buffer, bounds, row))
+                            .collect();
+                        assert!(rows.iter().any(|row| {
+                            row.contains('›') && row.contains(&format!("branch-{selected:02}"))
+                        }));
+                        assert!(
+                            rows.iter()
+                                .any(|row| row.contains("Enter") && row.contains("Esc"))
+                        );
+                        if error.is_some() {
+                            assert!(rows.iter().any(|row| row.contains("try another target")));
+                        }
+                        for row in bounds.bottom()..size.height {
+                            assert!(row_text(buffer, buffer.area, row).trim().is_empty());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn existing_split_picker_distinguishes_paths_and_creation_without_filling_screen() {
+        let mut first = test_workspace().tree;
+        first.branch = "detached".into();
+        first.path = "/repo/one".into();
+        let mut second = first.clone();
+        second.path = "/repo/two".into();
+        let choices = [
+            SplitTarget::Worktree(first),
+            SplitTarget::Worktree(second),
+            SplitTarget::Branch("topic".into()),
+        ];
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| {
+                let bounds = frame.area();
+                draw_existing_split_picker(frame, bounds, &choices, 2, None);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<_> = (0..buffer.area.height)
+            .map(|row| row_text(buffer, buffer.area, row))
+            .filter(|row| !row.trim().is_empty())
+            .collect();
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("detached") && row.contains("/repo/one"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("detached") && row.contains("/repo/two"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("topic") && row.contains("create"))
+        );
+        assert!(rows.len() < buffer.area.height as usize / 2);
+    }
+
+    #[test]
+    fn empty_split_picker_remains_navigable_and_opening_has_no_cancel_hint() {
+        let size = Size::new(30, 10);
+        let bounds = Rect::new(
+            0,
+            0,
+            size.width,
+            size.height - notice_height(Some("progress\nprogress\nprogress"), size),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
+        terminal
+            .draw(|frame| draw_existing_split_picker(frame, bounds, &[], 0, Some("No repository")))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<_> = (0..bounds.bottom())
+            .map(|row| row_text(buffer, bounds, row))
+            .collect();
+        assert!(rows.iter().any(|row| row.contains("No other")));
+        assert!(rows.iter().any(|row| row.contains("No repository")));
+        assert!(rows.iter().any(|row| row.contains("Esc")));
+        terminal
+            .draw(|frame| draw_opening_split(frame, bounds))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<_> = (0..size.height)
+            .map(|row| row_text(buffer, buffer.area, row))
+            .filter(|row| !row.trim().is_empty())
+            .collect();
+        assert!(rows.iter().any(|row| row.contains("Opening")));
+        assert!(!rows.iter().any(|row| row.contains("Esc")));
+        assert!(rows.len() < bounds.height as usize / 2);
+    }
 
     #[test]
     fn pane_bodies_fill_available_height_without_covering_headers() {
@@ -1400,7 +1967,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let bounds = frame.area();
-                let inner = modal_area_in(frame, bounds, " confirm ", 9);
+                let inner = modal_area_in(frame, bounds, " confirm ", Size::new(76, 9));
                 draw_confirmation(frame, inner, &"Long destructive consequences ".repeat(20));
                 let buffer = frame.buffer_mut();
                 assert_eq!(buffer[(inner.x, inner.bottom() - 1)].fg, AMBER);
@@ -1476,7 +2043,7 @@ mod tests {
             terminal
                 .draw(|frame| {
                     let available = Rect::new(0, 0, size.width, size.height - height);
-                    let inner = modal_area_in(frame, available, " input ", 12);
+                    let inner = modal_area_in(frame, available, " input ", Size::new(76, 12));
                     assert!(inner.height >= 4);
                     input_line(
                         frame,

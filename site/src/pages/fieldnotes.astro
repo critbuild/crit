@@ -158,7 +158,7 @@ const requests: Request[] = [
       },
     ],
     note:
-      'A split asks for a branch name, and that branch’s worktree opens in the second pane; Ctrl+Shift+, does the same by hand. Ctrl+Shift+L cycles full, vertical and horizontal layouts, and returning to full width keeps the focused worktree.',
+      'The split picker offers New worktree for a separate checkout, Split terminal for another session in the same folder, and Existing branch/worktree for a list of checkouts and local branches. Existing checkouts are reused; a branch without one gets its own worktree at its own commit. Ctrl+Shift+, opens the picker by hand. Ctrl+Shift+L cycles full, vertical and horizontal layouts; returning to full width keeps the focused session.',
   },
   {
     id: 'logs',
@@ -276,7 +276,7 @@ const guide = [
   },
   {
     q: 'What happens when I close a tab?',
-    a: 'Ctrl+Shift+Q closes the worktree tab and keeps the checkout on disk. Removing a worktree is a separate, confirmed action, and it refuses while the worktree holds uncommitted or untracked changes.',
+    a: 'Ctrl+Shift+Q offers Yes to close the tab and keep its checkout, Yes, delete worktree to remove it too, and No to cancel. Deletion refuses dirty, locked, or main worktrees and running Docker environments; the branch is kept. Progress and any refusal stay in the popup, and the tab closes only after successful deletion.',
   },
   {
     q: 'What happens when I exit Crit?',
@@ -376,7 +376,7 @@ const prerequisites = [
           <p class="fn-lead">Most terminals treat a branch as a state you switch into: stash, check out, rebuild, remember where you were. Crit treats it as a place.</p>
           <div class="fn-prose">
             <p>Each branch gets a Git worktree of its own, a complete checkout on disk that shares one repository with the others. Each worktree gets a tab, and you can put two side by side when the work calls for it: run the fix in one while the agent keeps reading in the other.</p>
-            <p>Closing a tab never deletes its checkout. Removing a worktree is its own confirmed step, and it refuses while the worktree still holds uncommitted or untracked changes. Nothing is tidied away behind your back.</p>
+            <p>Closing a tab keeps its checkout unless you explicitly choose “Yes, delete worktree.” Deletion refuses while the worktree holds uncommitted or untracked changes, is locked or the main checkout, or has a running Docker environment. The branch stays.</p>
           </div>
           <figure class="fn-fig">
             <FieldnotesBranchFigure />
@@ -385,8 +385,8 @@ const prerequisites = [
         </div>
         <aside class="fn-margin" aria-label="Shortcuts for rooms">
           <p><kbd>Ctrl+Shift+T</kbd><br />New tab: a worktree here, another project folder, or an open project.</p>
-          <p><kbd>Ctrl+Shift+,</kbd> <kbd>Ctrl+Shift+.</kbd><br />Split side by side, or top and bottom. Name a branch; its worktree opens in the second pane.</p>
-          <p><kbd>Ctrl+Shift+Q</kbd><br />Close the worktree tab. The checkout stays.</p>
+          <p><kbd>Ctrl+Shift+,</kbd> <kbd>Ctrl+Shift+.</kbd><br />Split side by side, or top and bottom. Choose New worktree, Split terminal in the same folder, or Existing branch/worktree to pick a checkout or local branch.</p>
+          <p><kbd>Ctrl+Shift+Q</kbd><br />Close only, close and delete the worktree, or cancel. No is selected by default.</p>
           <p>Worktrees live under <code>.crit-worktrees/</code> beside the repository, one directory per branch.</p>
         </aside>
       </section>

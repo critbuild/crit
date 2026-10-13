@@ -33,6 +33,9 @@ pub struct SavedProject {
     pub workspaces: Vec<SavedWorkspace>,
     pub active: usize,
     pub secondary: Option<usize>,
+    /// Independent secondary selection, only when both panes share the active workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secondary_session: Option<usize>,
     pub focus_secondary: bool,
     pub layout: SavedLayout,
     #[serde(default = "default_split_ratio")]
@@ -87,11 +90,34 @@ impl Snapshot {
                     format!("invalid secondary workspace in project {project_index}")
                 })?;
                 if secondary == project.active {
-                    bail!("project {project_index} repeats its active workspace in the split");
+                    let workspace = &project.workspaces[secondary];
+                    let Some(session) = project.secondary_session else {
+                        bail!(
+                            "project {project_index} has no secondary session for its shared workspace"
+                        );
+                    };
+                    if session >= workspace.sessions.len() || session == workspace.selected {
+                        bail!(
+                            "project {project_index} has an invalid secondary session for its shared workspace"
+                        );
+                    }
+                } else if project.secondary_session.is_some() {
+                    bail!(
+                        "project {project_index} has a secondary session for different workspaces"
+                    );
                 }
             }
+            if project.secondary.is_none() && project.secondary_session.is_some() {
+                bail!(
+                    "project {project_index} has a secondary session without a secondary workspace"
+                );
+            }
             match project.layout {
-                SavedLayout::Full if project.secondary.is_some() || project.focus_secondary => {
+                SavedLayout::Full
+                    if project.secondary.is_some()
+                        || project.secondary_session.is_some()
+                        || project.focus_secondary =>
+                {
                     bail!("project {project_index} has split state in a full layout");
                 }
                 SavedLayout::Vertical | SavedLayout::Horizontal if project.secondary.is_none() => {
@@ -386,6 +412,7 @@ mod tests {
                     ],
                     active: 0,
                     secondary: Some(1),
+                    secondary_session: None,
                     focus_secondary: true,
                     layout: SavedLayout::Vertical,
                     split_ratio: default_split_ratio(),
@@ -399,6 +426,7 @@ mod tests {
                     }],
                     active: 0,
                     secondary: None,
+                    secondary_session: None,
                     focus_secondary: false,
                     layout: SavedLayout::Full,
                     split_ratio: default_split_ratio(),
@@ -435,8 +463,16 @@ mod tests {
         let store = Store::open_in(directory.path()).unwrap();
         let expected = snapshot();
         let mut legacy = serde_json::to_value(&expected).unwrap();
+        assert!(
+            legacy["projects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|project| project.get("secondary_session").is_none())
+        );
         for project in legacy["projects"].as_array_mut().unwrap() {
             project.as_object_mut().unwrap().remove("split_ratio");
+            project.as_object_mut().unwrap().remove("secondary_session");
         }
         fs::write(
             directory.path().join(SNAPSHOT_FILE),
@@ -451,6 +487,81 @@ mod tests {
                 .all(|project| project.split_ratio == 5_000)
         );
         assert_eq!(loaded, expected);
+    }
+
+    #[test]
+    fn shared_workspace_splits_roundtrip_independent_selections_focus_and_ratio() {
+        let directory = tempfile::tempdir().unwrap();
+        for layout in [SavedLayout::Vertical, SavedLayout::Horizontal] {
+            for focus_secondary in [false, true] {
+                for (primary, secondary) in [(1, 2), (2, 0)] {
+                    let store = Store::open_in(directory.path()).unwrap();
+                    let mut expected = snapshot();
+                    let project = &mut expected.projects[0];
+                    project.secondary = Some(project.active);
+                    project.secondary_session = Some(secondary);
+                    project.workspaces[project.active].selected = primary;
+                    project.focus_secondary = focus_secondary;
+                    project.layout = layout;
+                    project.split_ratio = 3_750;
+                    expected.active_project = 0;
+                    store.save(&expected).unwrap();
+                    let serialized: serde_json::Value = serde_json::from_slice(
+                        &fs::read(directory.path().join(SNAPSHOT_FILE)).unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        serialized["projects"][0]["secondary_session"],
+                        serde_json::json!(secondary)
+                    );
+                    drop(store);
+                    let reopened = Store::open_in(directory.path()).unwrap();
+                    assert_eq!(reopened.load().unwrap(), Some(expected));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_shared_workspace_sessions_are_rejected_without_overwriting() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_in(directory.path()).unwrap();
+        let path = directory.path().join(SNAPSHOT_FILE);
+        let mut valid = snapshot();
+        valid.projects[0].secondary = Some(0);
+        valid.projects[0].secondary_session = Some(2);
+        let mutations: &[fn(&mut SavedProject)] = &[
+            |p| p.secondary_session = None,
+            |p| p.secondary_session = Some(p.workspaces[p.active].selected),
+            |p| p.secondary_session = Some(p.workspaces[p.active].sessions.len()),
+            |p| {
+                p.workspaces[p.active].sessions.clear();
+                p.workspaces[p.active].selected = 0;
+                p.secondary_session = Some(0);
+            },
+            |p| p.secondary = Some(1),
+            |p| p.secondary = None,
+            |p| p.layout = SavedLayout::Full,
+            |p| {
+                p.secondary = None;
+                p.focus_secondary = false;
+                p.layout = SavedLayout::Full;
+            },
+        ];
+        for mutate in mutations {
+            store.save(&valid).unwrap();
+            let before = fs::read(&path).unwrap();
+            let mut invalid = valid.clone();
+            mutate(&mut invalid.projects[0]);
+            assert!(store.save(&invalid).is_err(), "accepted {invalid:?}");
+            assert_eq!(fs::read(&path).unwrap(), before);
+            assert_eq!(store.load().unwrap(), Some(valid.clone()));
+            let invalid_bytes = serde_json::to_vec(&invalid).unwrap();
+            fs::write(&path, &invalid_bytes).unwrap();
+            assert!(store.load().is_err(), "loaded {invalid:?}");
+            assert_eq!(fs::read(&path).unwrap(), invalid_bytes);
+        }
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
     }
 
     #[test]

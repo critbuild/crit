@@ -40,13 +40,32 @@ fn drive_until(
     }
 }
 
+fn git_output(cwd: &std::path::Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
 #[test]
 fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_selection() {
     let home = tempfile::tempdir().unwrap();
     let repo = home.path().join("project with spaces");
     std::fs::create_dir(&repo).unwrap();
+    std::fs::write(repo.join("tracked.txt"), "committed contents\n").unwrap();
     for args in [
         vec!["init", "--initial-branch=main"],
+        vec!["add", "tracked.txt"],
         vec![
             "-c",
             "user.name=Crit Test",
@@ -89,6 +108,29 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
     );
     let subfolder = linked.join("nested");
     std::fs::create_dir(&subfolder).unwrap();
+    std::fs::write(linked.join("tracked.txt"), "dirty linked contents\n").unwrap();
+    std::fs::write(linked.join("untracked.txt"), "untracked linked contents\n").unwrap();
+    let original_head = git_output(&repo, &["rev-parse", "HEAD"]);
+    let distinct_head = git_output(
+        &repo,
+        &[
+            "-c",
+            "user.name=Crit Test",
+            "-c",
+            "user.email=test@localhost",
+            "commit-tree",
+            "HEAD^{tree}",
+            "-p",
+            &original_head,
+            "-m",
+            "existing branch at a distinct commit",
+        ],
+    );
+    assert_ne!(distinct_head, original_head);
+    git_output(&repo, &["branch", "topic-existing", &distinct_head]);
+    for branch in ["picker-00", "picker-01"] {
+        git_output(&repo, &["branch", branch]);
+    }
 
     // Never run the user's real agent updaters from a test.
     let bin = home.path().join("bin");
@@ -222,6 +264,65 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
             had_git_metadata,
             "opening a terminal must not create Git metadata",
         );
+        let trees_before = git_output(&repo, &["worktree", "list", "--porcelain"]);
+        for (split_key, direction) in [
+            (b"\x1b[44;6u".as_slice(), "vertical"),
+            (b"\x1b[46;6u".as_slice(), "horizontal"),
+        ] {
+            let command =
+                format!("SHARED_FIRST=retained; printf 'split-%s:%s\\n' start '{direction}'\r");
+            let ready = format!("split-start:{direction}");
+            drive_until(&mut writer, &rx, &mut screen, command.as_bytes(), |s| {
+                s.contains(&ready)
+            });
+            drive_until(&mut writer, &rx, &mut screen, split_key, |s| {
+                s.contains("Split terminal")
+            });
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[B\r", |s| {
+                !s.contains("Split terminal") && s.contains("[shell 2")
+            });
+            let destination = home.path().join("shared-split-cwd");
+            let command = format!(
+                "SHARED_SECOND=independent; printf '%s' \"$PWD\" > '{}'; printf 'right-%s:%s\\n' '{direction}' \"$SHARED_SECOND\"\r",
+                destination.display()
+            );
+            let ready = format!("right-{direction}:independent");
+            drive_until(&mut writer, &rx, &mut screen, command.as_bytes(), |s| {
+                s.contains(&ready)
+            });
+            assert_eq!(
+                std::fs::read_to_string(&destination).unwrap(),
+                checkout.canonicalize().unwrap().to_str().unwrap()
+            );
+            let command = format!(
+                "\x1b[93;6uprintf 'left-%s:%s:%s\\n' '{direction}' \"$SHARED_FIRST\" \"${{SHARED_SECOND-unset}}\"\r"
+            );
+            let ready = format!("left-{direction}:retained:unset");
+            drive_until(&mut writer, &rx, &mut screen, command.as_bytes(), |s| {
+                s.contains(&ready)
+            });
+            // Close only the second session; its peer and checkout must survive.
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                b"\x1b[93;6u\x1b[119;6uy",
+                |s| {
+                    !s.contains("shell 2")
+                        && s.lines().nth(1).is_some_and(|h| h.contains("[shell 1"))
+                },
+            );
+            let command = format!("printf 'kept-%s:%s\\n' '{direction}' \"$SHARED_FIRST\"\r");
+            let ready = format!("kept-{direction}:retained");
+            drive_until(&mut writer, &rx, &mut screen, command.as_bytes(), |s| {
+                s.contains(&ready)
+            });
+            assert_eq!(
+                git_output(&repo, &["worktree", "list", "--porcelain"]),
+                trees_before
+            );
+            assert_eq!(cwd.join(".git").exists(), had_git_metadata);
+        }
         if direct_start && cwd == repo {
             // The default new-tab action opens home without a path prompt.
             let in_home = |contents: &str| {
@@ -276,7 +377,235 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
                 &mut writer,
                 &rx,
                 &mut screen,
-                b"\x1b[44;6uintegration-split\r",
+                b"FIRST_PANE_TOKEN=kept; printf 'first-%s\\n' prepared\r",
+                |contents| contents.contains("first-prepared"),
+            );
+            let original_state = home.path().join("original-pane-state");
+            let target_state = home.path().join("existing-pane-state");
+            let linked_status = git_output(&linked, &["status", "--porcelain"]);
+            let trees_before_existing = git_output(&repo, &["worktree", "list", "--porcelain"]);
+            assert!(
+                !screen
+                    .screen()
+                    .contents()
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .contains("feature/other"),
+                "linked checkout must be unopened before the picker is used",
+            );
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[44;6u", |contents| {
+                contents.contains("Existing branch/worktree")
+            });
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                b"\x1b[B\x1b[B\r",
+                |contents| {
+                    contents.contains("› feature/other")
+                        && contents.contains(linked.to_str().unwrap())
+                },
+            );
+
+            // A short viewport must scroll the nested list, not lose its controls.
+            pair.master
+                .resize(PtySize {
+                    rows: 10,
+                    cols: 30,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap();
+            screen.screen_mut().set_size(10, 30);
+            drive_until(&mut writer, &rx, &mut screen, b"", |contents| {
+                contents.contains("› feature/other")
+                    && contents.contains("Enter")
+                    && contents.contains("Esc")
+            });
+            for (key, selected) in [
+                (b"\x1b[B".as_slice(), "picker-00"),
+                (b"\x1b[B".as_slice(), "picker-01"),
+                (b"\x1b[A".as_slice(), "picker-00"),
+            ] {
+                let selected = format!("› {selected}");
+                drive_until(&mut writer, &rx, &mut screen, key, |contents| {
+                    contents.contains(&selected)
+                        && contents.contains("Enter")
+                        && contents.contains("Esc")
+                });
+            }
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b", |contents| {
+                contents.contains("› Existing branch")
+            });
+            drive_until(&mut writer, &rx, &mut screen, b"\r", |contents| {
+                contents.contains("› feature/other")
+            });
+            pair.master
+                .resize(PtySize {
+                    rows: 24,
+                    cols: 100,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .unwrap();
+            screen.screen_mut().set_size(24, 100);
+            drive_until(&mut writer, &rx, &mut screen, b"", |contents| {
+                contents.contains("› feature/other") && contents.contains(linked.to_str().unwrap())
+            });
+            drive_until(&mut writer, &rx, &mut screen, b"\r", |contents| {
+                contents.lines().nth(1).is_some_and(|header| {
+                    header.trim_start().starts_with("› main")
+                        && header.contains("│")
+                        && header.contains("feature/other")
+                }) && !contents.contains("↑↓ choose")
+            });
+            let record_original = format!(
+                "printf '%s\\n%s\\n%s\\n' \"$FIRST_PANE_TOKEN\" \"$(git branch --show-current)\" \"$(git rev-parse HEAD)\" > '{}'; printf 'reuse-%s\\n' original\r",
+                original_state.display()
+            );
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                record_original.as_bytes(),
+                |contents| contents.contains("reuse-original"),
+            );
+            assert_eq!(
+                std::fs::read_to_string(&original_state).unwrap(),
+                format!("kept\nmain\n{original_head}\n"),
+            );
+            let record_target = format!(
+                "\x1b[93;6uprintf '%s\\n%s\\n%s\\n' \"$PWD\" \"$(git branch --show-current)\" \"$(git rev-parse HEAD)\" > '{}'; printf 'reuse-%s\\n' target\r",
+                target_state.display()
+            );
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                record_target.as_bytes(),
+                |contents| contents.contains("reuse-target"),
+            );
+            assert_eq!(
+                std::fs::read_to_string(&target_state).unwrap(),
+                format!("{}\nfeature/other\n{original_head}\n", linked.display()),
+            );
+            assert_eq!(
+                git_output(&repo, &["worktree", "list", "--porcelain"]),
+                trees_before_existing,
+                "selecting a linked checkout must not create another checkout",
+            );
+            assert_eq!(
+                git_output(&linked, &["status", "--porcelain"]),
+                linked_status
+            );
+            assert_eq!(
+                std::fs::read_to_string(linked.join("tracked.txt")).unwrap(),
+                "dirty linked contents\n",
+            );
+            assert_eq!(
+                std::fs::read_to_string(linked.join("untracked.txt")).unwrap(),
+                "untracked linked contents\n",
+            );
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[113;6u", |contents| {
+                contents.contains("Yes, delete worktree")
+            });
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[H\r", |contents| {
+                in_repo(contents)
+                    && !contents
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .contains("feature/other")
+                    && !contents.contains("Yes, delete worktree")
+            });
+            assert!(
+                linked.is_dir(),
+                "closing the tab must retain the dirty checkout"
+            );
+
+            // Checkouts precede local unchecked-out branches, sorted by branch name.
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[44;6u", |contents| {
+                contents.contains("Existing branch/worktree")
+            });
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                b"\x1b[B\x1b[B\r",
+                |contents| contents.contains("› feature/other"),
+            );
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                b"\x1b[B\x1b[B\x1b[B",
+                |contents| {
+                    contents.contains("› topic-existing") && contents.contains("create worktree")
+                },
+            );
+            drive_until(&mut writer, &rx, &mut screen, b"\r", |contents| {
+                contents.lines().nth(1).is_some_and(|header| {
+                    header.trim_start().starts_with("› main")
+                        && header.contains("│")
+                        && header.contains("topic-existing")
+                }) && !contents.contains("↑↓ choose")
+            });
+            let record_original = record_original.replace("reuse-%s", "create-%s");
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                record_original.as_bytes(),
+                |contents| contents.contains("create-original"),
+            );
+            assert_eq!(
+                std::fs::read_to_string(&original_state).unwrap(),
+                format!("kept\nmain\n{original_head}\n"),
+            );
+            let record_target = record_target.replace("reuse-%s", "create-%s");
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                record_target.as_bytes(),
+                |contents| contents.contains("create-target"),
+            );
+            let state = std::fs::read_to_string(&target_state).unwrap();
+            let fields: Vec<_> = state.lines().collect();
+            assert_eq!(fields.len(), 3);
+            let created = std::path::Path::new(fields[0]);
+            assert!(created.is_dir());
+            assert_ne!(created, repo);
+            assert_ne!(created, linked);
+            assert_eq!(fields[1], "topic-existing");
+            assert_eq!(fields[2], distinct_head);
+            assert_eq!(git_output(&repo, &["rev-parse", "HEAD"]), original_head);
+            assert_eq!(git_output(&repo, &["branch", "--show-current"]), "main");
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[113;6u", |contents| {
+                contents.contains("Yes, delete worktree")
+            });
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[H\r", |contents| {
+                in_repo(contents)
+                    && !contents
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .contains("topic-existing")
+                    && !contents.contains("Yes, delete worktree")
+            });
+            assert!(
+                created.is_dir(),
+                "closing the tab must retain the branch checkout"
+            );
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[44;6u", |contents| {
+                contents.contains("Split terminal")
+            });
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                b"\rintegration-split\r",
                 |contents| {
                     contents.lines().nth(1).is_some_and(|header| {
                         header.contains("│") && header.contains("› integration-split")
@@ -338,6 +667,108 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
                     .nth(1)
                     .is_some_and(|header| header.trim_start().starts_with("› integration-split"))
             });
+            // Close-only and cancellation must never take the deletion path.
+            let path_file = home.path().join("focused-checkout");
+            let record_path = format!(
+                "printf '%s' \"$PWD\" > '{}'; printf 'close-%s\\n' ready\r",
+                path_file.display()
+            );
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                record_path.as_bytes(),
+                |contents| contents.contains("close-ready"),
+            );
+            let split = std::path::PathBuf::from(std::fs::read_to_string(path_file).unwrap());
+            let close_menu = |contents: &str| contents.contains("Yes, delete worktree");
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[113;6u", close_menu);
+            drive_until(&mut writer, &rx, &mut screen, b"\r", |contents| {
+                !close_menu(contents)
+            });
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                b"printf 'cancel-%s\\n' retained\r",
+                |contents| contents.contains("cancel-retained"),
+            );
+
+            // A refused deletion leaves both the tab and its data intact.
+            let local_file = split.join("untracked.txt");
+            std::fs::write(&local_file, "keep this work").unwrap();
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[113;6u", close_menu);
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[A\r", |contents| {
+                contents.contains("refusing to remove dirty worktree")
+            });
+            assert_eq!(
+                std::fs::read_to_string(&local_file).unwrap(),
+                "keep this work"
+            );
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b", |contents| {
+                !contents.contains("Tab and checkout kept.")
+            });
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                b"printf 'refused-%s\\n' alive\r",
+                |contents| contents.contains("refused-alive"),
+            );
+            std::fs::remove_file(local_file).unwrap();
+
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[113;6u", close_menu);
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[H\r", |contents| {
+                !close_menu(contents)
+                    && !contents
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .contains("integration-split")
+            });
+            assert!(split.is_dir(), "close-only deleted the checkout");
+
+            // Reopen the retained checkout, then explicitly delete it.
+            let reopen = format!("\x1b[116;6u\x1b[B\r{}\r", split.display());
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                reopen.as_bytes(),
+                |contents| {
+                    contents.lines().nth(1).is_some_and(|header| {
+                        header.trim_start().starts_with("› integration-split")
+                    })
+                },
+            );
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[113;6u", close_menu);
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[A\r", |contents| {
+                contents.contains("Checkout removed")
+                    && !contents
+                        .lines()
+                        .next()
+                        .unwrap_or_default()
+                        .contains("integration-split")
+            });
+            assert!(
+                !split.exists(),
+                "explicit deletion left the checkout on disk"
+            );
+            assert!(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&repo)
+                    .args([
+                        "show-ref",
+                        "--verify",
+                        "--quiet",
+                        "refs/heads/integration-split"
+                    ])
+                    .status()
+                    .unwrap()
+                    .success(),
+                "checkout removal also deleted its branch"
+            );
         }
         writer.write_all(b"\x1b[21~y").unwrap();
         writer.flush().unwrap();

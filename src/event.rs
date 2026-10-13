@@ -45,6 +45,24 @@ pub enum Event {
         project: PathBuf,
         result: Result<Vec<Worktree>, String>,
     },
+    SplitTargets {
+        request: u64,
+        project: PathBuf,
+        layout: LayoutMode,
+        result: Result<Vec<crate::worktree::SplitTarget>, String>,
+    },
+    SplitOpened {
+        request: u64,
+        project: PathBuf,
+        layout: LayoutMode,
+        choices: Vec<crate::worktree::SplitTarget>,
+        selected: usize,
+        source: PathBuf,
+        preparation_error: Option<String>,
+        result: Result<(Worktree, bool), String>,
+    },
+    /// Background Git discovery; failures leave the last known metadata intact.
+    Metadata(Vec<Worktree>),
     Removed {
         tree: String,
         result: Result<(), String>,

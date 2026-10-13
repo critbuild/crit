@@ -79,8 +79,8 @@ const envCommands = [
 
 interface LifecycleRow { event: string; keys?: string[]; command?: string; result: string }
 const lifecycle: LifecycleRow[] = [
-  { event: 'Close a tab', keys: ['Ctrl+Shift+Q'], result: 'The checkout stays on disk. The tab leaves the saved workspace; its chat history stays with the agent.' },
-  { event: 'Remove a worktree', keys: ['F1', 'F2'], result: 'A separate, confirmed step from either launcher. It refuses while the worktree has uncommitted or untracked changes, and the branch is kept.' },
+  { event: 'Close a tab', keys: ['Ctrl+Shift+Q'], result: 'Choose Yes to close only, Yes, delete worktree to remove its checkout too, or No to cancel. No is selected by default; close-only keeps the checkout and agent chat history.' },
+  { event: 'Remove a worktree', keys: ['F1', 'F2'], result: 'Also available in the close-tab popup. Deletion refuses dirty, locked, or main worktrees and running Docker environments; the branch is kept. The popup shows progress or the refusal reason, and the tab closes only on success.' },
   { event: 'Exit Crit', keys: ['F10'], result: 'After you confirm, Crit stops the agent and shell processes it started. Checkouts and Compose stacks stay exactly as they are.' },
   { event: 'Launch again', command: 'crit', result: 'Projects, worktrees, splits, focused panes and selected sessions reopen. Every saved OMP and OpenCode chat resumes exactly, background tabs included; shells start fresh in their worktrees.' },
   { event: 'Start clean', command: 'crit --fresh', result: 'Skips restoration and starts a new saved workspace.' },

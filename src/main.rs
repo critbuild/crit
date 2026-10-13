@@ -33,8 +33,10 @@ New terminal or any folder. F1 opens Ask Crit. Ctrl+D in an agent opens its
 workspace shell without stopping it;
 Ctrl+D in a shell keeps normal EOF behavior, and native mode passes it through.
 Ctrl+Shift+T then Enter opens your home folder. The menu also offers other
-folders, worktrees, and open projects. Ctrl+Shift+, or . splits: name a branch
-and its worktree opens in the second pane. Ctrl+Shift+Enter opens a session.
+folders, worktrees, and open projects. Ctrl+Shift+, or . opens a split picker:
+New worktree creates a separate checkout; Split terminal opens another session
+in the same folder. Existing branch/worktree opens a destination picker.
+Ctrl+Shift+Enter opens a session.
 F12 persistently toggles Crit/native Kitty shortcuts. Run `crit setup kitty` once
 to enable the window-scoped mappings.
 
@@ -128,6 +130,8 @@ PROJECTS
   Opening a Git folder opens only its checkout, not every branch/worktree.
   Ask to open an existing worktree or switch to a named project.
   Already open projects and shell/agent sessions stay alive when switching.
+  Branch labels refresh automatically after git switch, checkout, or branch rename,
+  including background tabs. Detached checkouts are labeled detached HEAD.
   An ordinary folder workspace can open Git projects later through F1 / F2.
   Worktree and Docker actions require opening a Git project first.
   New worktrees use the focused checkout's current HEAD, not another project.
@@ -135,7 +139,19 @@ PROJECTS
   cannot reopen canceled dialogs or replace newer ones. Failed worktree creation
   restores its input only while its original workspace is focused and no newer
   dialog is open.
-  Returning a split to full width keeps the focused worktree.
+  The split picker offers New worktree, Split terminal, and Existing branch/worktree.
+  New worktree asks for a branch name and leaves the first pane's branch alone.
+  Split terminal starts an independent session of the current agent/shell kind
+  in the same folder, without creating a branch, worktree, or Docker environment.
+  It also works in non-Git folders. Mouse clicks or Ctrl+Shift+[ / ] switch panes.
+  Ctrl+Shift+W closes the focused session; its peer stays running.
+  Existing branch/worktree lists other registered checkouts and local branches
+  without checkouts. Up/Down selects; Enter opens; Esc returns to the split menu.
+  Existing checkouts keep their files and sessions. An unchecked-out branch gets
+  its own worktree at that branch's commit. The original pane keeps its branch,
+  session, and focus. Once opening starts, wait for completion before navigating.
+  Returning a split to full width keeps the focused session. Saved terminal
+  splits reopen both sessions in the same workspace, with their focus and ratio.
   Saved projects, worktrees, splits, focused panes and selected sessions reopen.
 
 RESTORE
@@ -182,7 +198,16 @@ DOCKER
 
 LIFECYCLE
 
-Closing a tab never deletes its Git checkout. Docker down retains volumes.
+Ctrl+Shift+Q offers Yes (close only), Yes, delete worktree, and No.
+Use Up/Down and Enter; No is selected by default. Esc cancels.
+Close-only retains the checkout and Docker stack. Explicit deletion closes the
+tab only after removing a clean, unlocked, non-main worktree; its branch stays.
+Stop its Docker environment first. Ordinary folders are never deleted.
+Deletion stays in a progress popup until it finishes. A refusal stays visible
+with its reason and leaves the tab and checkout intact; Enter returns to the
+confirmation and Esc dismisses the error. Docker state is checked again at deletion,
+so stopping the stack outside Crit does not require reopening the tab.
+Docker down retains volumes.
 Crit owns its agent processes; exiting stops them, not Docker stacks. The next
 launch restores the saved workspace and supported chats, not the old processes.
 Agent hooks are launch-scoped, not global plugins. Crit is not a background daemon.

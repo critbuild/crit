@@ -23,6 +23,24 @@ pub struct Worktree {
     pub locked: bool,
 }
 
+#[derive(Clone, Debug)]
+pub enum SplitTarget {
+    Worktree(Worktree),
+    Branch(String),
+}
+
+impl Worktree {
+    pub fn label(&self) -> &str {
+        if !self.branch.is_empty() {
+            &self.branch
+        } else if !self.head.is_empty() {
+            "detached HEAD"
+        } else {
+            "terminal"
+        }
+    }
+}
+
 fn git(cwd: &Path) -> Command {
     let mut command = Command::new("git");
     command.arg("-C").arg(cwd);
@@ -194,6 +212,96 @@ pub fn list(repository: &Repository) -> Result<Vec<Worktree>> {
     parse_list(&output.stdout)
 }
 
+/// Registered checkouts first, then local branches not checked out anywhere.
+pub fn split_targets(repository: &Repository, focused: &str) -> Result<Vec<SplitTarget>> {
+    let trees = list(repository)?;
+    let branches = checked(
+        git(&repository.root).args(["for-each-ref", "--format=%(refname:strip=2)", "refs/heads/"]),
+        "list local branches",
+    )?;
+    let branches = String::from_utf8(branches.stdout).context("non-UTF-8 Git branch name")?;
+    let mut targets = Vec::with_capacity(trees.len() + branches.lines().count());
+    targets.extend(trees.into_iter().map(SplitTarget::Worktree));
+    for branch in branches.lines() {
+        if !targets
+            .iter()
+            .any(|target| matches!(target, SplitTarget::Worktree(tree) if tree.branch == branch))
+        {
+            targets.push(SplitTarget::Branch(branch.to_owned()));
+        }
+    }
+    // Keep the focused checkout in the branch exclusion set until discovery ends.
+    targets.retain(|target| !matches!(target, SplitTarget::Worktree(tree) if tree.id == focused));
+    Ok(targets)
+}
+
+fn validate_checkout(repository: &Repository, tree: Worktree) -> Result<Worktree> {
+    let actual = discover(&tree.path)?;
+    ensure!(
+        actual.root == tree.path && actual.common_dir == repository.common_dir,
+        "selected checkout no longer belongs to this repository: {}",
+        tree.path.display()
+    );
+    Ok(tree)
+}
+
+/// Reuse checkouts without touching their files, or check out an existing branch.
+pub fn open_split_target(
+    repository: &Repository,
+    target: &SplitTarget,
+) -> Result<(Worktree, bool)> {
+    let mut trees = list(repository)?;
+    match target {
+        SplitTarget::Worktree(selected) => {
+            let tree = trees
+                .into_iter()
+                .find(|tree| tree.id == selected.id && tree.path == selected.path)
+                .context("selected checkout is no longer registered")?;
+            Ok((validate_checkout(repository, tree)?, false))
+        }
+        SplitTarget::Branch(branch) => {
+            ensure!(
+                branch_exists(repository, branch)?,
+                "selected branch no longer exists: {branch}"
+            );
+            if let Some(index) = trees.iter().position(|tree| tree.branch == *branch) {
+                return Ok((validate_checkout(repository, trees.remove(index))?, false));
+            }
+            match add_checkout(repository, branch, None, &trees) {
+                Ok(tree) => Ok((tree, true)),
+                Err(error) => {
+                    // Another process may have checked it out after our fresh listing.
+                    // Git refuses duplicates; never force or recreate the branch.
+                    if let Some(tree) = list(repository)?
+                        .into_iter()
+                        .find(|tree| tree.branch == *branch)
+                    {
+                        return Ok((validate_checkout(repository, tree)?, false));
+                    }
+                    Err(error)
+                }
+            }
+        }
+    }
+}
+
+fn branch_exists(repository: &Repository, branch: &str) -> Result<bool> {
+    let exists = git(&repository.root)
+        .args([
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .status()
+        .context("check whether branch exists")?;
+    ensure!(
+        exists.success() || exists.code() == Some(1),
+        "could not inspect branch {branch:?}"
+    );
+    Ok(exists.success())
+}
+
 fn parse_list(bytes: &[u8]) -> Result<Vec<Worktree>> {
     let mut trees = Vec::new();
     let mut current: Option<Worktree> = None;
@@ -285,20 +393,8 @@ pub fn create(repository: &Repository, branch: &str, base: Option<&str>) -> Resu
             "invalid base revision: {base:?}"
         );
     }
-    let exists = git(&repository.root)
-        .args([
-            "show-ref",
-            "--verify",
-            "--quiet",
-            &format!("refs/heads/{branch}"),
-        ])
-        .status()
-        .context("check whether branch exists")?;
-    ensure!(
-        exists.success() || exists.code() == Some(1),
-        "could not inspect branch {branch:?}"
-    );
-    let base_commit = if exists.success() && base.is_none() {
+    let exists = branch_exists(repository, branch)?;
+    let base_commit = if exists && base.is_none() {
         None
     } else {
         let revision = format!("{}^{{commit}}", base.unwrap_or("HEAD"));
@@ -306,7 +402,7 @@ pub fn create(repository: &Repository, branch: &str, base: Option<&str>) -> Resu
             git(&repository.root).args(["rev-parse", "--verify", "--end-of-options", &revision]),
             "resolve worktree base commit",
         )?;
-        if exists.success() {
+        if exists {
             None
         } else {
             Some(
@@ -318,6 +414,15 @@ pub fn create(repository: &Repository, branch: &str, base: Option<&str>) -> Resu
         }
     };
     let trees = list(repository)?;
+    add_checkout(repository, branch, base_commit.as_deref(), &trees)
+}
+
+fn add_checkout(
+    repository: &Repository,
+    branch: &str,
+    base_commit: Option<&str>,
+    trees: &[Worktree],
+) -> Result<Worktree> {
     let main = trees
         .iter()
         .find(|tree| tree.is_main)
@@ -425,6 +530,195 @@ mod tests {
         .unwrap();
         let repository = discover(&root).unwrap();
         (directory, repository)
+    }
+
+    fn unopened_branch(repository: &Repository, name: &str) -> SplitTarget {
+        checked(
+            git(&repository.root).args(["branch", name]),
+            "create unopened test branch",
+        )
+        .unwrap();
+        let focused = list(repository).unwrap().remove(0).id;
+        split_targets(repository, &focused)
+            .unwrap()
+            .into_iter()
+            .find(|target| matches!(target, SplitTarget::Branch(branch) if branch == name))
+            .unwrap()
+    }
+
+    #[test]
+    fn split_discovery_omits_focused_checkout_and_all_checked_out_branches() {
+        let (_directory, repository) = repository();
+        let linked = create(&repository, "linked", None).unwrap();
+        let _ = unopened_branch(&repository, "available");
+        checked(
+            git(&repository.root).args(["update-ref", "refs/remotes/origin/remote", "HEAD"]),
+            "create remote test ref",
+        )
+        .unwrap();
+        let choices = split_targets(&repository, &linked.id).unwrap();
+        assert_eq!(choices.len(), 2);
+        assert!(matches!(&choices[0], SplitTarget::Worktree(tree) if tree.branch == "main"));
+        assert!(matches!(&choices[1], SplitTarget::Branch(branch) if branch == "available"));
+    }
+
+    #[test]
+    fn split_reuses_unopened_dirty_checkout_without_changing_files_or_head() {
+        let (_directory, repository) = repository();
+        let linked = create(&repository, "linked", None).unwrap();
+        fs::write(linked.path.join("untracked"), "keep untracked").unwrap();
+        fs::write(linked.path.join("staged"), "keep staged").unwrap();
+        checked(
+            git(&linked.path).args(["add", "staged"]),
+            "stage local test change",
+        )
+        .unwrap();
+        fs::write(linked.path.join("staged"), "keep unstaged").unwrap();
+        let before = checked(
+            git(&linked.path).args(["status", "--porcelain=v1", "-z"]),
+            "record local changes",
+        )
+        .unwrap()
+        .stdout;
+        let focused = list(&repository).unwrap().remove(0).id;
+        let target = split_targets(&repository, &focused).unwrap().remove(0);
+        let (opened, created) = open_split_target(&repository, &target).unwrap();
+        assert!(!created);
+        assert_eq!(opened.id, linked.id);
+        assert_eq!(opened.head, linked.head);
+        assert_eq!(
+            fs::read(linked.path.join("untracked")).unwrap(),
+            b"keep untracked"
+        );
+        assert_eq!(
+            fs::read(linked.path.join("staged")).unwrap(),
+            b"keep unstaged"
+        );
+        assert_eq!(
+            checked(
+                git(&linked.path).args(["status", "--porcelain=v1", "-z"]),
+                "inspect preserved local changes",
+            )
+            .unwrap()
+            .stdout,
+            before
+        );
+    }
+
+    #[test]
+    fn split_stale_branch_selection_reuses_new_checkout() {
+        let (_directory, repository) = repository();
+        let target = unopened_branch(&repository, "available");
+        let linked = create(&repository, "available", None).unwrap();
+        fs::write(linked.path.join("dirty"), "keep me").unwrap();
+        let (opened, created) = open_split_target(&repository, &target).unwrap();
+        assert!(!created);
+        assert_eq!(opened.id, linked.id);
+        assert_eq!(fs::read(linked.path.join("dirty")).unwrap(), b"keep me");
+        assert_eq!(list(&repository).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn split_existing_branch_uses_its_own_commit_not_focused_head() {
+        let (_directory, repository) = repository();
+        let target = unopened_branch(&repository, "older");
+        let original = list(&repository).unwrap().remove(0).head;
+        checked(
+            git(&repository.root).args([
+                "-c",
+                "user.name=Crit Test",
+                "-c",
+                "user.email=crit@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "new focused commit",
+            ]),
+            "advance focused checkout",
+        )
+        .unwrap();
+        let focused_head = list(&repository).unwrap().remove(0).head;
+        let (opened, created) = open_split_target(&repository, &target).unwrap();
+        assert!(created);
+        assert_eq!(opened.branch, "older");
+        assert_eq!(opened.head, original);
+        assert_ne!(opened.head, focused_head);
+        assert_eq!(list(&repository).unwrap().remove(0).head, focused_head);
+    }
+
+    #[test]
+    fn split_refuses_disappeared_branch_without_recreating_it() {
+        let (_directory, repository) = repository();
+        let target = unopened_branch(&repository, "gone");
+        checked(
+            git(&repository.root).args(["branch", "-D", "gone"]),
+            "delete selected branch",
+        )
+        .unwrap();
+        assert!(open_split_target(&repository, &target).is_err());
+        assert!(!branch_exists(&repository, "gone").unwrap());
+        assert_eq!(list(&repository).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn split_refuses_removed_or_replaced_checkout() {
+        let (_directory, repository) = repository();
+        let linked = create(&repository, "linked", None).unwrap();
+        let target = SplitTarget::Worktree(linked.clone());
+        remove(&repository, &linked).unwrap();
+        assert!(open_split_target(&repository, &target).is_err());
+
+        let linked = create(&repository, "linked", None).unwrap();
+        fs::remove_file(linked.path.join(".git")).unwrap();
+        assert!(open_split_target(&repository, &target).is_err());
+    }
+
+    #[test]
+    fn rediscovery_tracks_external_head_changes_per_worktree() {
+        let (_directory, repository) = repository();
+        let linked = create(&repository, "linked", None).unwrap();
+        let main = list(&repository).unwrap().remove(0);
+        checked(
+            git(&repository.root).args(["switch", "-c", "switched"]),
+            "switch external branch",
+        )
+        .unwrap();
+        let trees = list(&repository).unwrap();
+        let refreshed = trees.iter().find(|tree| tree.id == main.id).unwrap();
+        assert_eq!(refreshed.label(), "switched");
+        assert_eq!(
+            trees
+                .iter()
+                .find(|tree| tree.id == linked.id)
+                .unwrap()
+                .label(),
+            "linked"
+        );
+
+        checked(
+            git(&repository.root).args(["branch", "-m", "renamed"]),
+            "rename external branch",
+        )
+        .unwrap();
+        assert_eq!(list(&repository).unwrap()[0].label(), "renamed");
+        checked(
+            git(&linked.path).args(["checkout", "--detach", "HEAD"]),
+            "detach linked checkout",
+        )
+        .unwrap();
+        let trees = list(&repository).unwrap();
+        let detached = trees.iter().find(|tree| tree.id == linked.id).unwrap();
+        assert!(detached.branch.is_empty());
+        assert_eq!(detached.head, linked.head);
+        assert_eq!(detached.label(), "detached HEAD");
+        assert_eq!(
+            trees
+                .iter()
+                .find(|tree| tree.id == main.id)
+                .unwrap()
+                .label(),
+            "renamed"
+        );
     }
 
     #[test]
