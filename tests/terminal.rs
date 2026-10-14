@@ -948,7 +948,12 @@ fn startup_keeps_update_and_restore_notices() {
     let home_path = home.path().canonicalize().unwrap();
     seed_snapshot(&home_path, b"{broken");
     let mut crit = Crit::start(&home_path, &home_path, &[], &[]);
+    // Updates run in the background: the picker has the restore warning, and the failed
+    // update joins it once a workspace is open.
     crit.drive(b"", |screen| {
+        screen.contains("Saved workspace could not be loaded")
+    });
+    crit.drive(b"\r", |screen| {
         screen.contains("OMP update failed")
             && screen.contains("Saved workspace could not be loaded")
     });

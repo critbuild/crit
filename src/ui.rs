@@ -4,7 +4,6 @@ use crate::{
         Scrollbar, SplitDivider, TabHit, Workspace, WorktreeHit, WorktreeHitAction, project_slots,
     },
     integration::AgentState,
-    updates::{State as UpdateState, TOOLS as UPDATE_TOOLS},
     worktree::SplitTarget,
 };
 use anyhow::Result;
@@ -835,113 +834,6 @@ fn draw_key_mode(frame: &mut Frame, native_keys: bool, has_project: bool) -> u16
         Rect::new(frame.area().width.saturating_sub(width), 0, width, 1),
     );
     width
-}
-
-pub fn draw_updates(frame: &mut Frame, states: &[UpdateState; 2], tick: usize) {
-    let bounds = frame.area();
-    if bounds.is_empty() {
-        return;
-    }
-    let buffer = frame.buffer_mut();
-    buffer.set_style(bounds, Style::default().fg(FG).bg(BG));
-    let width = bounds.width.min(48);
-    let x = bounds.x + (bounds.width - width) / 2;
-    let y = bounds.y + bounds.height.saturating_sub(7) / 2;
-    buffer.set_stringn(
-        x,
-        y,
-        "crit",
-        width as usize,
-        Style::default().fg(ACCENT).bold(),
-    );
-    if width > 4 {
-        let checking = states
-            .iter()
-            .any(|state| matches!(state, UpdateState::Checking));
-        let label = if !checking {
-            " is ready"
-        } else if width >= 43 {
-            " is checking for updates"
-        } else {
-            " is checking"
-        };
-        buffer.set_stringn(
-            x + 4,
-            y,
-            label,
-            (width - 4) as usize,
-            Style::default().fg(FG),
-        );
-    }
-    if width >= 30 {
-        let start = x + width - 13;
-        let head = if tick < 12 { tick } else { 23 - tick };
-        // A compact travelling wave, not a percentage or simulated download bar.
-        for column in 0_usize..12 {
-            let (glyph, color) = match column.abs_diff(head) {
-                0 => ("⣿", ACCENT),
-                1 => ("⣶", Color::Rgb(120, 162, 220)),
-                2 => ("⣤", Color::Rgb(85, 118, 164)),
-                3 => ("⣀", Color::Rgb(60, 80, 110)),
-                _ => ("·", BORDER),
-            };
-            buffer[(start + column as u16, y)]
-                .set_symbol(glyph)
-                .set_fg(color);
-        }
-    } else if width > 17 {
-        const FRAMES: [&str; 4] = ["⣀", "⣤", "⣶", "⣿"];
-        buffer[(x + width - 1, y)]
-            .set_symbol(FRAMES[tick % FRAMES.len()])
-            .set_fg(ACCENT);
-    }
-    for (index, state) in states.iter().enumerate() {
-        let row = y + 2 + index as u16;
-        if row >= bounds.bottom() || width < 3 {
-            break;
-        }
-        let (mark, text, color) = match state {
-            UpdateState::Checking => ("›", "checking", ACCENT),
-            UpdateState::Ready => ("✓", "ready", GREEN),
-            UpdateState::Failed => ("!", "using installed version", AMBER),
-            UpdateState::Skipped => ("–", "skipped", MUTED),
-            UpdateState::Missing => ("·", "not installed", MUTED),
-        };
-        buffer.set_stringn(
-            x + 2,
-            row,
-            mark,
-            (width - 2) as usize,
-            Style::default().fg(color),
-        );
-        if width > 5 {
-            buffer.set_stringn(
-                x + 5,
-                row,
-                UPDATE_TOOLS[index].0,
-                (width - 5) as usize,
-                Style::default().fg(FG),
-            );
-        }
-        if width > 15 {
-            buffer.set_stringn(
-                x + 15,
-                row,
-                text,
-                (width - 15) as usize,
-                Style::default().fg(color),
-            );
-        }
-    }
-    if y + 5 < bounds.bottom() {
-        buffer.set_stringn(
-            x,
-            y + 5,
-            "esc skip · ctrl+c quit",
-            width as usize,
-            Style::default().fg(MUTED),
-        );
-    }
 }
 
 pub fn draw_project_chooser(

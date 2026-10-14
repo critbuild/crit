@@ -105,14 +105,13 @@ COPY, PASTE, AND LINKS
   reload Kitty configuration with Ctrl+Shift+F5. Other Kitty windows are unaffected.
 
 UPDATES
-  Each interactive startup runs omp update and opencode upgrade together,
-  before launching agents. A blue scan animation shows each tool checking,
-  ready, skipped, or not installed; updater banners stay out of the UI.
-  Checks finish without an artificial delay. Esc skips updates still running;
-  Ctrl+C cancels startup. Either stops the updater process groups.
-  Input typed while checking is kept for the picker or terminal.
-  If an update fails, Crit shows its diagnostic and continues with the
-  installed version. A tool that is not installed is not a failure.
+  Each interactive startup runs omp update and opencode upgrade together, in
+  the background while the workspace opens. Nothing waits for them: agents
+  start at once with the installed version, and updater banners stay out of
+  the UI. If an update fails, Crit shows a notice with its diagnostic and keeps
+  using the installed version. A tool that is not installed is not a failure.
+  An update that finishes during a session applies to panes started afterwards
+  and to the next launch. Quitting Crit leaves an update still running to finish.
 
 PROJECTS
   Run crit from any folder, including a Git checkout, to choose New terminal

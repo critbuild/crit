@@ -17,8 +17,10 @@ use crossterm::{
         KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
         MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
     },
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen},
+    execute, queue,
+    terminal::{
+        BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
+    },
 };
 use ratatui::{Terminal, backend::CrosstermBackend, layout::Rect};
 use std::{
@@ -1152,6 +1154,20 @@ impl App {
         false
     }
 
+    /// Whether a pane the next frame draws has an app partway through a synchronized update
+    /// (DEC mode 2026): drawing now would show half a repaint, so the frame waits for the
+    /// end of the update, or for the hold `Session::synchronized` allows to run out. `panes`
+    /// is what the last frame drew, and empty once the layout changed, which holds nothing.
+    fn frame_held(&self) -> bool {
+        self.panes.iter().any(|pane| {
+            self.project
+                .workspaces
+                .get(pane.workspace)
+                .and_then(|workspace| workspace.sessions.get(pane.session))
+                .is_some_and(Session::synchronized)
+        })
+    }
+
     pub fn focused_index(&self) -> usize {
         if self.project.layout != LayoutMode::Full && self.project.focus_secondary {
             self.project.secondary.unwrap_or(self.project.active)
@@ -1206,6 +1222,19 @@ impl App {
     fn set_warning(&mut self, message: impl Into<String>) {
         self.set_notice(message);
         self.notice_sticky = true;
+    }
+
+    /// Adds `message` below what the notice row already says, keeping a warning a warning. For
+    /// news that can arrive at any time, such as a failed update: it must not hide a startup
+    /// warning, or an earlier failure, that the user has yet to read.
+    fn append_notice(&mut self, message: &str) {
+        let Some(shown) = self.notice.take() else {
+            self.set_notice(message);
+            return;
+        };
+        let sticky = self.notice_sticky;
+        self.set_notice(format!("{shown}\n{message}"));
+        self.notice_sticky = sticky;
     }
 
     /// Typing, pasting or clicking acknowledges an ordinary notice; a warning needs Esc.
@@ -3577,10 +3606,23 @@ fn install_panic_hook(use_kitty: bool) {
     }));
 }
 
+/// Draws one frame on the real terminal as a single synchronized update (DEC mode 2026), so
+/// that Kitty never paints it half written. Terminals without the mode ignore it.
+fn draw_frame(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    render: impl FnOnce(&mut ratatui::Frame),
+) -> Result<()> {
+    queue!(io::stdout(), BeginSynchronizedUpdate)?;
+    let drawn = terminal.draw(render);
+    // Ended even when drawing failed, so the terminal is not left waiting out its timeout.
+    execute!(io::stdout(), EndSynchronizedUpdate)?;
+    drawn?;
+    Ok(())
+}
+
 fn choose_project(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     rx: &mpsc::Receiver<Event>,
-    pending: &mut VecDeque<Event>,
     jobs: &SyncSender<Job>,
     path: &Path,
     notice: Option<&str>,
@@ -3600,12 +3642,12 @@ fn choose_project(
     let mut native_keys = false;
     let mut interaction_visible = true;
     loop {
-        terminal.draw(|frame| {
+        draw_frame(terminal, |frame| {
             let bounds = frame.area();
             interaction_visible = bounds.width >= 30 && bounds.height >= 10;
             ui::draw_project_chooser(frame, &picker, &notice, native_keys);
         })?;
-        match pending.pop_front().map_or_else(|| rx.recv(), Ok)? {
+        match rx.recv()? {
             Event::Input(crossterm::event::Event::Key(key))
                 if key.kind != KeyEventKind::Release =>
             {
@@ -3906,20 +3948,10 @@ pub fn run(
             }
         })?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let startup = updates::run(&mut terminal, &rx);
-    let updates::Startup {
-        notice: update_notice,
-        mut pending,
-    } = match startup {
-        Ok(Some(startup)) => startup,
-        result => {
-            signal_handle.close();
-            return result.map(|_| ());
-        }
-    };
+    let mut checks = updates::start();
     // Everything startup has to say, shown together. `sticky` keeps it past terminal input:
     // it reports that saving is off or that saved items were left out.
-    let mut notices: Vec<String> = update_notice.into_iter().collect();
+    let mut notices: Vec<String> = Vec::new();
     let mut sticky = false;
     let mut store = match restore::Store::open() {
         Ok(store) => Some(store),
@@ -4013,7 +4045,6 @@ pub fn run(
                     choose_project(
                         &mut terminal,
                         &rx,
-                        &mut pending,
                         &jobs,
                         path,
                         (!shown.is_empty()).then_some(shown.as_str()),
@@ -4104,17 +4135,27 @@ pub fn run(
     let mut redraw = true;
     while !app.should_quit {
         app.refresh_metadata();
-        if redraw && last_draw.elapsed() >= frame_interval {
+        let failures = checks.poll();
+        if !failures.is_empty() {
+            app.append_notice(&failures.join("\n"));
+            redraw = true;
+        }
+        if redraw && last_draw.elapsed() >= frame_interval && !app.frame_held() {
             ui::resize_sessions(&mut app, terminal.size()?)?;
-            terminal.draw(|frame| ui::draw(frame, &mut app))?;
+            draw_frame(&mut terminal, |frame| ui::draw(frame, &mut app))?;
             redraw = false;
             last_draw = Instant::now();
         }
         redraw |= app.checkpoint(&mut store);
-        let event = if let Some(event) = pending.pop_front() {
-            Some(event)
-        } else if redraw {
-            match rx.recv_timeout(frame_interval.saturating_sub(last_draw.elapsed())) {
+        let event = if redraw {
+            // A frame held for an app's update is retried every few ms, so that it goes out
+            // right after the app ends the update, or once the hold runs out.
+            let wait = if app.frame_held() {
+                Duration::from_millis(4)
+            } else {
+                frame_interval.saturating_sub(last_draw.elapsed())
+            };
+            match rx.recv_timeout(wait) {
                 Ok(event) => Some(event),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(_) => break,
@@ -4135,7 +4176,7 @@ pub fn run(
                 }
             }
             for _ in 0..127 {
-                let Some(event) = pending.pop_front().or_else(|| rx.try_recv().ok()) else {
+                let Ok(event) = rx.try_recv() else {
                     break;
                 };
                 match app.handle(event) {
@@ -4235,6 +4276,63 @@ mod tests {
             assert!(app.project.secondary.is_none());
             assert!(app.project.secondary_session.is_none());
         }
+    }
+
+    #[test]
+    fn held_frames_wait_for_the_app_to_finish_painting() {
+        let (mut app, _queued, _events) = interaction_app();
+        let directory = tempfile::tempdir().unwrap();
+        app.project.workspaces[0].sessions.push(
+            Session::spawn(
+                1,
+                "shell",
+                None,
+                directory.path(),
+                &app.socket,
+                app.tx.clone(),
+                10,
+                40,
+                Some(("/bin/sleep".into(), vec!["30".into()])),
+            )
+            .unwrap(),
+        );
+        // Before a frame has said what it draws, nothing is held.
+        assert!(!app.frame_held());
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        ui::resize_sessions(&mut app, ratatui::layout::Size::new(120, 24)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        assert!(!app.panes.is_empty());
+        assert!(!app.frame_held());
+        let parser = app.project.workspaces[0].sessions[0].parser.clone();
+        parser.lock().process(b"\x1b[?2026h");
+        assert!(app.frame_held());
+        parser.lock().process(b"\x1b[?2026l");
+        assert!(!app.frame_held());
+        // A layout change empties `panes`, and the next frame is not held for the old list.
+        parser.lock().process(b"\x1b[?2026h");
+        assert!(app.frame_held());
+        app.panes.clear();
+        assert!(!app.frame_held());
+    }
+
+    #[test]
+    fn late_update_failures_join_the_notice_row_instead_of_replacing_it() {
+        let (mut app, _queued, _events) = interaction_app();
+        let omp = "OMP update failed: boom. Continuing with the installed version.";
+        app.append_notice(omp);
+        assert_eq!(app.notice.as_deref(), Some(omp));
+        assert!(!app.notice_sticky);
+        // A startup warning stays on screen, and stays a warning, with the failure beneath it.
+        app.set_warning("Saved workspace could not be loaded.");
+        let opencode = "OpenCode update failed: refused. Continuing with the installed version.";
+        app.append_notice(opencode);
+        assert_eq!(
+            app.notice,
+            Some(format!("Saved workspace could not be loaded.\n{opencode}"))
+        );
+        assert!(app.notice_sticky);
+        app.clear_notice_on_input(false);
+        assert!(app.notice.is_some());
     }
 
     #[test]

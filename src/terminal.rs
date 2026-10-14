@@ -11,8 +11,8 @@ use std::{
     io::{Read, Write},
     path::Path,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock,
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{Receiver, SyncSender, TrySendError},
     },
     time::{Duration, Instant},
@@ -22,6 +22,10 @@ use std::{
 /// is one chunk and a scripted burst can outrun the writer thread, so this
 /// matches the 4 KiB of typed-ahead input a PTY itself buffers.
 const INPUT_QUEUE: usize = 4096;
+
+/// How long an app's synchronized update (DEC mode 2026) holds its pane's frame. An app that
+/// never ends its update must not freeze the pane; terminals bound the mode the same way.
+const SYNC_HOLD: Duration = Duration::from_millis(100);
 
 /// Everything bound for a pane's PTY. One queue keeps typed input and terminal
 /// replies in order, and only the writer thread ever blocks on the PTY.
@@ -47,6 +51,8 @@ pub struct Session {
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     pid: Option<u32>,
     size: (u16, u16),
+    /// The app's open synchronized update, shared with the parser's callbacks.
+    sync: Arc<AtomicU64>,
 }
 
 impl Session {
@@ -124,11 +130,10 @@ impl Session {
         let pid = child.process_id();
         let killer = child.clone_killer();
         let (input, queue) = std::sync::mpsc::sync_channel(INPUT_QUEUE);
+        let responses = Responses::new(input.clone());
+        let sync = responses.sync.clone();
         let parser = Arc::new(Mutex::new(Parser::new_with_callbacks(
-            rows,
-            cols,
-            512,
-            Responses::new(input.clone()),
+            rows, cols, 512, responses,
         )));
         let dirty = Arc::new(AtomicBool::new(true));
         let alive = Arc::new(AtomicBool::new(true));
@@ -214,6 +219,7 @@ impl Session {
             killer,
             pid,
             size: (rows, cols),
+            sync,
         })
     }
 
@@ -302,6 +308,13 @@ impl Session {
         let mut bytes = Vec::new();
         write_mouse(&mut bytes, event, column, row, mode, encoding)?;
         self.send(bytes)
+    }
+
+    /// Whether the app in this pane is partway through a synchronized update (DEC mode 2026),
+    /// so that drawing now would show half a repaint. Stops being true `SYNC_HOLD` after the
+    /// update began: an app that never ends it must not freeze the pane.
+    pub fn synchronized(&self) -> bool {
+        held(self.sync.load(Ordering::Acquire), clock())
     }
 
     /// The agent whose TUI this pane's shell runs in the foreground, if any.
@@ -524,11 +537,27 @@ fn write_pty(mut writer: Box<dyn Write + Send>, queue: Receiver<Input>) {
     }
 }
 
+/// The origin of the millisecond stamps in `Responses::sync`.
+static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// Milliseconds since `START`, plus one so that no stamp is the 0 that means "no update open".
+fn clock() -> u64 {
+    START.elapsed().as_millis() as u64 + 1
+}
+
+/// Whether an update begun at `stamp` (0: none open) still holds the frame at `now`.
+fn held(stamp: u64, now: u64) -> bool {
+    stamp != 0 && Duration::from_millis(now.saturating_sub(stamp)) < SYNC_HOLD
+}
+
 pub struct Responses {
     input: SyncSender<Input>,
     keyboard: [KeyboardModes; 2],
     /// The latest OSC 52 copy since the reader last looked.
     clipboard: Option<(Vec<u8>, Vec<u8>)>,
+    /// When the app began the synchronized update it has not ended yet, as `clock` stamps it;
+    /// 0 while none is open. The UI thread reads it to hold the pane's frame.
+    sync: Arc<AtomicU64>,
 }
 
 impl Responses {
@@ -537,6 +566,7 @@ impl Responses {
             input,
             keyboard: [KeyboardModes::default(); 2],
             clipboard: None,
+            sync: Arc::new(AtomicU64::new(0)),
         }
     }
     fn keyboard_flags(&self, alternate_screen: bool) -> u16 {
@@ -622,6 +652,23 @@ impl vt100::Callbacks for Responses {
                 };
                 return;
             }
+            // The app brackets a repaint of its screen; the UI holds its frame in between.
+            // vt100 hands the mode over as unhandled, and no reply is due. Any parameter of
+            // the list can be the mode, since the callback sees the whole list.
+            (Some(b'?'), None, 'h' | 'l')
+                if params.iter().any(|param| param.first() == Some(&2026)) =>
+            {
+                if c == 'h' {
+                    // Only a begin that finds no update open counts, so an app that never ends
+                    // its update cannot keep renewing the hold.
+                    if self.sync.load(Ordering::Acquire) == 0 {
+                        self.sync.store(clock(), Ordering::Release);
+                    }
+                } else {
+                    self.sync.store(0, Ordering::Release);
+                }
+                return;
+            }
             (Some(b'?'), Some(b'$'), 'p') => {
                 let state = match p {
                     25 => {
@@ -633,6 +680,13 @@ impl vt100::Callbacks for Responses {
                     }
                     2004 => {
                         if screen.bracketed_paste() {
+                            1
+                        } else {
+                            2
+                        }
+                    }
+                    2026 => {
+                        if self.sync.load(Ordering::Acquire) != 0 {
                             1
                         } else {
                             2
@@ -739,6 +793,41 @@ mod tests {
         assert_eq!(parser.screen().cursor_position(), (0, 80));
         parser.process(b"\x1b[6n");
         assert_eq!(queued(&queue), b"\x1b[1;80R");
+    }
+
+    #[test]
+    fn synchronized_output_is_advertised_and_tracked() {
+        let (mut parser, queue) = response_parser();
+        let stamp = |parser: &Parser| parser.callbacks().sync.load(Ordering::Acquire);
+        // Supported from the start, with no update open.
+        parser.process(b"\x1b[?2026$p");
+        assert_eq!(queued(&queue), b"\x1b[?2026;2$y");
+        assert!(!held(stamp(&parser), clock()));
+
+        parser.process(b"\x1b[?2026h\x1b[?2026$p");
+        assert_eq!(queued(&queue), b"\x1b[?2026;1$y");
+        let begun = stamp(&parser);
+        assert!(held(begun, begun));
+        // A begin while an update is open keeps its stamp, so an app that never ends its
+        // update cannot keep renewing the hold.
+        parser.callbacks().sync.store(5, Ordering::Release);
+        parser.process(b"\x1b[?2026h");
+        assert_eq!(stamp(&parser), 5);
+        // The hold runs out once the update is `SYNC_HOLD` old.
+        assert!(held(5, 5 + 99));
+        assert!(!held(5, 5 + 100));
+
+        parser.process(b"\x1b[?2026l\x1b[?2026$p");
+        assert_eq!(queued(&queue), b"\x1b[?2026;2$y");
+        assert!(!held(stamp(&parser), clock()));
+
+        // The mode may sit anywhere in a list of private modes.
+        parser.process(b"\x1b[?25;2026h");
+        assert_ne!(stamp(&parser), 0);
+        parser.process(b"\x1b[?25;2026l");
+        assert_eq!(stamp(&parser), 0);
+        // Setting and resetting the mode send no reply of their own.
+        assert!(queue.try_recv().is_err());
     }
 
     #[test]
