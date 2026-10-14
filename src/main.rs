@@ -165,9 +165,9 @@ SCRATCH SPACE
   crit worktree remove, takes its scratch with it at once. A pass at startup
   and then daily, in the background at idle CPU and I/O priority, removes the
   scratch of folders that no longer exist, anything inside a workspace's
-  scratch untouched for 30 days, and the empty folders of workspaces unused
-  for 30 days; a notice says what it freed. A sandbox under /var/tmp is also
-  aged by the system (systemd-tmpfiles).
+  scratch or left by Crit's own helpers untouched for 30 days, and the empty
+  folders of workspaces unused for 30 days; a notice says what it freed. A
+  sandbox under /var/tmp is also aged by the system (systemd-tmpfiles).
   crit sandbox status (or just crit sandbox) shows the sandbox, the space each
   workspace's scratch takes, and your largest entries in a RAM-backed /tmp.
   crit sandbox clean runs a pass now; with --all it deletes all scratch, but

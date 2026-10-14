@@ -265,12 +265,17 @@ impl Sandbox {
             .map(|(dir, _)| dir)
             .collect();
         let mut report = CleanReport::default();
-        let (device, directories) = self.workspaces(&mut report.errors)?;
+        let (device, directories, helpers) = self.entries(&mut report.errors)?;
         for dir in directories {
             let open = open.contains(&dir);
             if let Err(error) = clean_workspace(&dir, device, cutoff, open, &mut report) {
                 report.errors.push(format!("{}: {error}", dir.display()));
             }
+        }
+        // (d) What Crit's own helpers left at the root (the updaters, Ask Crit, Git, Docker)
+        // is judged like a workspace's entries: by the newest stamp in its tree.
+        for path in helpers {
+            clean_entry(&path, device, cutoff, &mut report);
         }
         Ok(report)
     }
@@ -290,23 +295,31 @@ impl Sandbox {
         Ok(report)
     }
 
-    /// The root's device and its workspace directories, known by their names: nothing else in
-    /// it, such as Crit's own temp files, is a workspace's. Entries that cannot be listed go to
-    /// `errors`. The error is the root's: it cannot be read.
+    /// The root's device and its workspace directories, known by their names. The error is the
+    /// root's: it cannot be read.
     fn workspaces(&self, errors: &mut Vec<String>) -> io::Result<(u64, Vec<PathBuf>)> {
+        let (device, directories, _) = self.entries(errors)?;
+        Ok((device, directories))
+    }
+
+    /// The root's device, its workspace directories, and everything else in it: the scratch
+    /// of Crit's own helpers, which run with the root as their temp folder. Entries that
+    /// cannot be listed go to `errors`. The error is the root's: it cannot be read.
+    fn entries(&self, errors: &mut Vec<String>) -> io::Result<(u64, Vec<PathBuf>, Vec<PathBuf>)> {
         let root = self.root();
         let device = fs::symlink_metadata(root)?.dev();
         let mut directories = Vec::new();
+        let mut helpers = Vec::new();
         for entry in fs::read_dir(root)? {
             match entry {
                 Ok(entry) if is_workspace_name(&entry.file_name()) => {
                     directories.push(entry.path());
                 }
-                Ok(_) => {}
+                Ok(entry) => helpers.push(entry.path()),
                 Err(error) => errors.push(format!("{}: {error}", root.display())),
             }
         }
-        Ok((device, directories))
+        Ok((device, directories, helpers))
     }
 
     /// The directory of the workspace in `folder`, and the canonical folder it is named after.
@@ -699,25 +712,7 @@ fn clean_workspace(
                 continue;
             }
         };
-        let tree = survey(&path, device);
-        if let Some(error) = &tree.error {
-            kept = true;
-            report.errors.push(format!("{}: {error}", path.display()));
-            continue;
-        }
-        if tree.foreign || tree.newest >= cutoff {
-            kept = true;
-            continue;
-        }
-        let (bytes, result) = delete_surveyed(&path, &tree, device);
-        report.removed_bytes += bytes;
-        match result {
-            Ok(()) => report.removed_entries += 1,
-            Err(error) => {
-                kept = true;
-                report.errors.push(format!("{}: {error}", path.display()));
-            }
-        }
+        kept |= !clean_entry(&path, device, cutoff, report);
     }
     // (c) An empty directory of a workspace that nothing has used for `AGE`.
     if kept || open {
@@ -738,6 +733,33 @@ fn clean_workspace(
     report.removed_bytes += (stamped.blocks() + metadata.blocks()) * 512;
     report.removed_workspaces += 1;
     Ok(())
+}
+
+/// Removes `path`, a scratch entry, when nothing in its tree has a stamp from after
+/// `cutoff`, adding what it removed to `report`; returns whether it was removed. An entry that
+/// could not be surveyed, reaches another filesystem, or could not be deleted is kept and the
+/// error noted.
+fn clean_entry(path: &Path, device: u64, cutoff: i64, report: &mut CleanReport) -> bool {
+    let tree = survey(path, device);
+    if let Some(error) = &tree.error {
+        report.errors.push(format!("{}: {error}", path.display()));
+        return false;
+    }
+    if tree.foreign || tree.newest >= cutoff {
+        return false;
+    }
+    let (bytes, result) = delete_surveyed(path, &tree, device);
+    report.removed_bytes += bytes;
+    match result {
+        Ok(()) => {
+            report.removed_entries += 1;
+            true
+        }
+        Err(error) => {
+            report.errors.push(format!("{}: {error}", path.display()));
+            false
+        }
+    }
 }
 
 /// What a walk over a tree found. It follows no symlink and enters no other filesystem.
@@ -1426,13 +1448,19 @@ mod tests {
         let unmarked = root.path().join("unmarked-0123456789abcdef01234567");
         fs::create_dir(&unmarked).unwrap();
         fs::write(unmarked.join("data"), "data").unwrap();
+        // (d) Crit's own helpers' scratch at the root: an old one goes, a fresh one stays.
         let own = root.path().join("omp-shell-snapshots-1000");
         fs::create_dir(&own).unwrap();
+        fs::write(own.join("snapshot"), "old").unwrap();
+        let own_fresh = root.path().join("node-compile-cache");
+        fs::create_dir(&own_fresh).unwrap();
+        fs::write(own_fresh.join("entry"), "fresh").unwrap();
+        touch(&own_fresh.join("entry"), fresh);
 
         let report = sandbox.clean_at(&[open_folder], now).unwrap();
         assert_eq!(
             (report.removed_workspaces, report.removed_entries),
-            (2, 3),
+            (2, 4),
             "{report:?}"
         );
         assert!(report.removed_bytes >= 65536 + 8192, "{report:?}");
@@ -1451,7 +1479,10 @@ mod tests {
         // (c): only the empty directory of a workspace neither open nor used lately goes.
         assert!(!idle.exists());
         assert!(open_idle.join(MARKER).exists() && fresh_idle.join(MARKER).exists());
-        assert!(unmarked.join("data").exists() && own.exists());
+        // An unmarked directory with a workspace's name is nobody's to clean; helper scratch
+        // is judged by age.
+        assert!(unmarked.join("data").exists());
+        assert!(!own.exists() && own_fresh.join("entry").exists());
 
         // Again, nothing is left to remove.
         let report = sandbox
