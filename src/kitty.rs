@@ -197,12 +197,11 @@ fn has_include(config: &[u8]) -> bool {
             continue;
         }
         let line = line.trim_ascii();
-        if let Some(value) = line.strip_prefix(b"include") {
-            if value.first().is_some_and(u8::is_ascii_whitespace)
-                && matches!(value.trim_ascii(), b"crit.conf" | b"./crit.conf")
-            {
-                return true;
-            }
+        if let Some(value) = line.strip_prefix(b"include")
+            && value.first().is_some_and(u8::is_ascii_whitespace)
+            && matches!(value.trim_ascii(), b"crit.conf" | b"./crit.conf")
+        {
+            return true;
         }
     }
     false

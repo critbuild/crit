@@ -15,6 +15,15 @@ pub fn default_split_ratio() -> u16 {
     5_000
 }
 
+/// Snapshots from before the agent CPU limit existed turn it on.
+fn default_agent_cpu_limited() -> bool {
+    true
+}
+
+fn default_agent_cpu_percent() -> u8 {
+    crate::limits::DEFAULT_PERCENT
+}
+
 const MAX_SNAPSHOT_BYTES: u64 = 8 * 1024 * 1024;
 const SNAPSHOT_FILE: &str = "workspace.json";
 const BACKUP_FILE: &str = "workspace.json.bak";
@@ -26,6 +35,12 @@ pub struct Snapshot {
     pub projects: Vec<SavedProject>,
     pub active_project: usize,
     pub native_keys: bool,
+    /// Whether agent panes run under the CPU limit (F3).
+    #[serde(default = "default_agent_cpu_limited")]
+    pub agent_cpu_limited: bool,
+    /// Agents' share of the machine's CPU while limited, in percent (`--agent-cpu`).
+    #[serde(default = "default_agent_cpu_percent")]
+    pub agent_cpu_percent: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +92,12 @@ impl Snapshot {
         }
         valid_selection(self.active_project, self.projects.len())
             .context("invalid active project index")?;
+        if !(1..=100).contains(&self.agent_cpu_percent) {
+            bail!(
+                "agent CPU share {}% is outside 1-100%",
+                self.agent_cpu_percent
+            );
+        }
         for (project_index, project) in self.projects.iter().enumerate() {
             if project.split_ratio > SPLIT_RATIO_SCALE {
                 bail!("project {project_index} has an out-of-range split ratio");
@@ -144,10 +165,10 @@ impl Snapshot {
                                 session.kind
                             ),
                         }
-                        if let Some(resume) = &session.resume {
-                            if resume.trim().is_empty() || resume.contains('\0') {
-                                bail!("session {session_index} has an invalid resume identity");
-                            }
+                        if let Some(resume) = &session.resume
+                            && (resume.trim().is_empty() || resume.contains('\0'))
+                        {
+                            bail!("session {session_index} has an invalid resume identity");
                         }
                     }
                     Ok(())
@@ -458,6 +479,8 @@ mod tests {
             ],
             active_project: 1,
             native_keys: true,
+            agent_cpu_limited: false,
+            agent_cpu_percent: 30,
         }
     }
 
@@ -476,9 +499,30 @@ mod tests {
             projects: vec![],
             active_project: 0,
             native_keys: false,
+            agent_cpu_limited: true,
+            agent_cpu_percent: 100,
         };
         reopened.save(&empty).unwrap();
         assert_eq!(reopened.load().unwrap(), Some(empty));
+    }
+
+    #[test]
+    fn legacy_snapshots_load_with_the_agent_cpu_limit_on_at_half() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_in(directory.path()).unwrap();
+        let mut expected = snapshot();
+        let mut legacy = serde_json::to_value(&expected).unwrap();
+        let fields = legacy.as_object_mut().unwrap();
+        assert_eq!(fields.remove("agent_cpu_limited"), Some(false.into()));
+        assert_eq!(fields.remove("agent_cpu_percent"), Some(30.into()));
+        fs::write(
+            directory.path().join(SNAPSHOT_FILE),
+            serde_json::to_vec(&legacy).unwrap(),
+        )
+        .unwrap();
+        expected.agent_cpu_limited = true;
+        expected.agent_cpu_percent = 50;
+        assert_eq!(store.load().unwrap(), Some(expected));
     }
 
     #[test]
@@ -732,6 +776,8 @@ mod tests {
             |s| s.projects[0].workspaces[0].sessions[2].resume = Some("not-a-shell-chat".into()),
             |s| s.projects[0].workspaces[0].sessions[0].resume = Some(" ".into()),
             |s| s.projects[0].workspaces[0].sessions[0].resume = Some("nul\0identity".into()),
+            |s| s.agent_cpu_percent = 0,
+            |s| s.agent_cpu_percent = 101,
         ];
         for mutate in mutations {
             store.save(&snapshot()).unwrap();

@@ -6,6 +6,7 @@ mod integration;
 mod intent;
 mod keys;
 mod kitty;
+mod limits;
 mod restore;
 mod selection;
 mod terminal;
@@ -21,6 +22,7 @@ const HELP: &str = "crit — worktree-first terminals for OMP and OpenCode
 
 USAGE
   crit [--fresh] [--repo PATH] [--agent omp|opencode|shell] [--no-kitty]
+       [--agent-cpu PERCENT]
   crit worktree list [--repo PATH]
   crit worktree create BRANCH [--base REF] [--repo PATH]
   crit worktree remove PATH [--repo PATH]
@@ -30,9 +32,12 @@ USAGE
   crit keys
 
 Crit restores your saved workspace on startup. With no saved workspace, choose
-New terminal or any folder. F1 opens Ask Crit. Ctrl+D in an agent opens its
-workspace shell without stopping it;
-Ctrl+D in a shell keeps normal EOF behavior, and native mode passes it through.
+New terminal or any folder. F1 opens Ask Crit. Ctrl+D goes to the focused pane:
+OMP and OpenCode quit on it, a shell reads end of input. When a shell or agent
+ends, or Ctrl+Shift+W closes a pane, the pane closes like a Kitty window: a
+split's other pane goes full width, an emptied tab closes, and the last tab
+closes Crit. An agent that fails, or quits within a second of starting, stays
+open with its exit status (F1 to restart).
 Ctrl+Shift+T then Enter opens a new home tab. The menu also offers other
 folders and worktrees; switch projects from the tab bar, F1, or F1 then F2.
 F2 opens a worktree pane on the right: click a branch to open or focus its tab,
@@ -106,6 +111,28 @@ COPY, PASTE, AND LINKS
   Agent OSC 52 clipboard writes are forwarded; unsolicited clipboard reads are not.
   Run crit setup kitty after upgrading to install the updated clipboard mappings;
   reload Kitty configuration with Ctrl+Shift+F5. Other Kitty windows are unaffected.
+
+AGENT CPU
+  Crit limits how much CPU OMP and OpenCode panes use, together with
+  everything they run (builds, tests, tools), so that a game or other apps
+  stay responsive while agents work. Shell panes are never limited. By default
+  the agent panes of a window share 50% of the machine's CPU (half of its
+  cores); --agent-cpu PERCENT (1-100) chooses another share and turns the
+  limit on. F3 turns the limit off and on again, for running agents too; the
+  key hint shows the share, or OFF. The share and F3's choice are saved with
+  the workspace, like F12; --fresh starts over with the default. In native
+  Kitty mode F3 goes to the terminal like every key except F12.
+  The agents run in a transient systemd user scope named after the window
+  (crit-<pid>-<random>.scope) that holds the CPU quota. While limited they
+  also get a low CPU weight, so a game and other apps take precedence whenever
+  the CPUs are contended, even while the agents use less than their share.
+  An agent that cannot join the scope still starts, unlimited, and a notice
+  says so. Docker containers run under the Docker daemon, outside the limit.
+  Without cgroup v2, a systemd user session, busctl and systemctl, or a user
+  manager that can limit CPU, agents run at a lower priority (nice 10) while
+  the limit is on instead, the key hint shows LOW, and a notice says why. No
+  process can raise that priority again, so turning the limit off then
+  applies only to agents started afterwards.
 
 UPDATES
   At most once a day, Crit runs omp update and opencode upgrade together, in
@@ -293,6 +320,16 @@ fn utf8(option: &str, value: OsString) -> Result<String> {
         .map_err(|value| anyhow!("{option} must be UTF-8: {}", value.to_string_lossy()))
 }
 
+/// The agents' share of the CPU that `--agent-cpu` takes: a whole percentage from 1 to 100,
+/// with or without its percent sign.
+fn agent_cpu_percent(value: OsString) -> Result<u8> {
+    let value = utf8("--agent-cpu", value)?;
+    match value.strip_suffix('%').unwrap_or(&value).parse::<u8>() {
+        Ok(percent @ 1..=100) => Ok(percent),
+        _ => bail!("--agent-cpu takes a whole percentage from 1 to 100, not {value:?}"),
+    }
+}
+
 fn run() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let mut positionals: Vec<OsString> = Vec::new();
@@ -302,6 +339,7 @@ fn run() -> Result<()> {
     let mut use_kitty = true;
     let mut direct_start = false;
     let mut fresh = false;
+    let mut agent_cpu = None;
     let mut source = None;
     while let Some(arg) = args.next() {
         // A non-UTF-8 argument cannot be an option, so it is a positional (a path).
@@ -334,6 +372,12 @@ fn run() -> Result<()> {
                     args.next().context("--base requires a Git reference")?,
                 )?)
             }
+            Some("--agent-cpu") => {
+                agent_cpu = Some(agent_cpu_percent(
+                    args.next()
+                        .context("--agent-cpu requires a percentage from 1 to 100")?,
+                )?)
+            }
             Some("--fresh") => fresh = true,
             Some("--source") => {
                 source = Some(PathBuf::from(
@@ -361,6 +405,9 @@ fn run() -> Result<()> {
     if fresh && !positionals.is_empty() {
         bail!("--fresh is only available when opening Crit");
     }
+    if agent_cpu.is_some() && !positionals.is_empty() {
+        bail!("--agent-cpu is only available when opening Crit");
+    }
     if source.is_some()
         && !(positionals
             .first()
@@ -375,7 +422,7 @@ fn run() -> Result<()> {
         .first()
         .map(|command| command.to_str().unwrap_or_default())
     {
-        None => app::run(&repo()?, &agent, use_kitty, direct_start, fresh),
+        None => app::run(&repo()?, &agent, use_kitty, direct_start, fresh, agent_cpu),
         Some("keys") if positionals.len() == 1 => {
             print!("{}", keys::HELP);
             Ok(())
@@ -491,4 +538,23 @@ fn selected_tree(repository: &worktree::Repository, path: &Path) -> Result<workt
         .filter(|tree| path.starts_with(&tree.path))
         .max_by_key(|tree| tree.path.components().count())
         .context("directory is not inside a checked-out worktree")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_cpu_takes_a_whole_percentage_from_1_to_100() {
+        for (value, percent) in [("50", 50), ("1", 1), ("100", 100), ("25%", 25)] {
+            assert_eq!(agent_cpu_percent(value.into()).unwrap(), percent);
+        }
+        for value in ["0", "101", "256", "-5", "50.5", "half", "", "%", "50%%"] {
+            let error = agent_cpu_percent(value.into()).unwrap_err().to_string();
+            assert!(error.contains("1 to 100"), "{value:?}: {error}");
+        }
+        use std::os::unix::ffi::OsStringExt;
+        let error = agent_cpu_percent(OsString::from_vec(b"5\xff".to_vec())).unwrap_err();
+        assert!(error.to_string().contains("must be UTF-8"), "{error}");
+    }
 }

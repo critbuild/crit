@@ -67,6 +67,14 @@ const ASSETS: &[(&str, &str)] = &[
     ("reporter.js", include_str!("../integrations/reporter.js")),
 ];
 
+impl IntegrationServer {
+    /// The window's private runtime folder (`crit-<pid>-<16 hex>`), which holds the socket and
+    /// the agent CPU limit's start-up FIFOs, and whose name is unique to this run.
+    pub fn directory(&self) -> &Path {
+        &self.directory
+    }
+}
+
 pub fn start(tx: SyncSender<crate::event::Event>) -> Result<IntegrationServer> {
     // An unusable XDG_RUNTIME_DIR (`su` without `-`, /run/user removed after logout) falls back
     // to the temp dir instead of ending Crit.
@@ -367,13 +375,12 @@ fn relocate_tui_config(config: &mut Value, original: &Path) -> Result<()> {
     for pointer in ["/attention/sounds", "/tui/attention/sounds"] {
         if let Some(sounds) = config.pointer_mut(pointer).and_then(Value::as_object_mut) {
             for value in sounds.values_mut() {
-                if let Some(sound) = value.as_str() {
-                    if !sound.is_empty()
-                        && !Path::new(sound).is_absolute()
-                        && !sound.starts_with("~/")
-                    {
-                        *value = Value::String(base.join(sound).to_string_lossy().into_owned());
-                    }
+                if let Some(sound) = value.as_str()
+                    && !sound.is_empty()
+                    && !Path::new(sound).is_absolute()
+                    && !sound.starts_with("~/")
+                {
+                    *value = Value::String(base.join(sound).to_string_lossy().into_owned());
                 }
             }
         }
@@ -388,12 +395,11 @@ fn relocate_plugins(plugins: &mut [Value], base: &Path) -> Result<()> {
         } else {
             Some(plugin)
         };
-        if let Some(spec) = spec {
-            if let Some(text) = spec.as_str() {
-                if text.starts_with('.') {
-                    *spec = Value::String(file_url(&base.join(text))?);
-                }
-            }
+        if let Some(spec) = spec
+            && let Some(text) = spec.as_str()
+            && text.starts_with('.')
+        {
+            *spec = Value::String(file_url(&base.join(text))?);
         }
     }
     Ok(())
@@ -409,6 +415,9 @@ pub enum Resume<'a> {
     Continue,
 }
 
+/// What `command` launches: the program, its arguments, and the environment it adds.
+pub type Launch = (String, Vec<String>, Vec<(String, String)>);
+
 /// Return launch-scoped injection; inherited auth, profiles and plugin discovery stay intact.
 /// `resume` is passed through unchecked: callers validate it first (`validate_resume`, plus
 /// `opencode_chats` for OpenCode), because restore checks every chat up front.
@@ -417,7 +426,7 @@ pub fn command(
     session: u64,
     socket: &Path,
     resume: Option<Resume<'_>>,
-) -> Result<(String, Vec<String>, Vec<(String, String)>)> {
+) -> Result<Launch> {
     if !matches!(kind, "omp" | "opencode") {
         bail!("unsupported agent {kind:?}; expected omp or opencode");
     }
@@ -832,7 +841,7 @@ mod tests {
             .unwrap();
         client.write_all(frame).unwrap();
         let mut ack = [0];
-        client.read_exact(&mut ack).is_ok() && ack == [b'\n']
+        client.read_exact(&mut ack).is_ok() && ack == *b"\n"
     }
 
     #[test]

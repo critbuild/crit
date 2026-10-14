@@ -2,6 +2,7 @@ use crate::{
     event::Event,
     integration::{self, AgentState, Resume},
     keys, kitty,
+    limits::Limiter,
 };
 use anyhow::{Context, Result, bail};
 use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -76,6 +77,8 @@ pub struct Session {
 }
 
 impl Session {
+    // Everything a launch needs, each used once; a parameter struct would only move the list.
+    #[expect(clippy::too_many_arguments)]
     pub fn spawn(
         id: u64,
         kind: &str,
@@ -86,6 +89,7 @@ impl Session {
         rows: u16,
         cols: u16,
         command: Option<(String, Vec<String>)>,
+        limiter: Option<&Limiter>,
     ) -> Result<Self> {
         let (program, args, extra_env) = if let Some((program, args)) = command {
             (program, args, Vec::new())
@@ -97,6 +101,14 @@ impl Session {
             )
         } else {
             integration::command(kind, id, socket, resume)?
+        };
+        // Agent panes, with everything they start, run under the agent CPU limit; shells and
+        // log followers never do.
+        let (program, args, gate) = match limiter {
+            Some(limiter) if matches!(kind, "omp" | "opencode") => {
+                limiter.prepare(id, program, args, cwd)
+            }
+            _ => (program, args, None),
         };
         let rows = rows.max(2);
         let cols = cols.max(2);
@@ -165,6 +177,7 @@ impl Session {
         let reader_quiet = quiet_since.clone();
         let wait_alive = alive.clone();
         let wait_tx = tx.clone();
+        let limit_tx = tx.clone();
         // The child is running; a thread that cannot start must not leave it unreaped.
         let abandon = |error: std::io::Error| {
             kill_and_reap(pid);
@@ -228,14 +241,25 @@ impl Session {
         std::thread::Builder::new()
             .name(format!("pty-wait-{id}"))
             .spawn(move || {
-                let code = match child.wait() {
-                    Ok(status) => status.to_string(),
-                    Err(error) => error.to_string(),
+                // This thread starts right after the child, so this is when the child started.
+                let started = Instant::now();
+                let (code, success) = match child.wait() {
+                    Ok(status) => (status.to_string(), status.success()),
+                    Err(error) => (error.to_string(), false),
                 };
                 wait_alive.store(false, Ordering::Release);
-                let _ = wait_tx.send(Event::Exited { session: id, code });
+                let _ = wait_tx.send(Event::Exited {
+                    session: id,
+                    code,
+                    success,
+                    ran: started.elapsed(),
+                });
             })
             .map_err(abandon)?;
+        // Only now that nothing can fail: an abandoned pane drops its gate, which removes it.
+        if let (Some(limiter), Some(gate)) = (limiter, gate) {
+            limiter.start(gate, id, pid, alive.clone(), limit_tx);
+        }
         Ok(Self {
             id,
             kind: kind.into(),
@@ -427,6 +451,11 @@ impl Session {
     #[cfg(test)]
     pub fn note_output(&self) {
         self.quiet_since.store(clock(), Ordering::Release);
+    }
+
+    /// The pane's own process, which leads its process group.
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
     }
 
     /// The agent whose TUI this pane's shell runs in the foreground, if any.
@@ -866,6 +895,7 @@ mod tests {
             24,
             80,
             Some((program.into(), args.iter().map(|&arg| arg.into()).collect())),
+            None,
         )
         .unwrap()
     }
@@ -1158,6 +1188,7 @@ mod tests {
                 "/bin/sh".into(),
                 vec!["-c".into(), "IFS= read -r line".into()],
             )),
+            None,
         )
         .unwrap();
         {
@@ -1355,6 +1386,7 @@ mod tests {
             1,
             1,
             Some(("/bin/sleep".into(), vec!["5".into()])),
+            None,
         )
         .unwrap();
         // vt100 panics on 1-row and 1-column grids, which would kill the reader thread.
@@ -1363,5 +1395,156 @@ mod tests {
         assert_eq!(session.parser.lock().screen().size(), (10, 20));
         session.resize(0, 1).unwrap();
         assert_eq!(session.parser.lock().screen().size(), (2, 2));
+    }
+
+    /// An OMP pane that runs `script` under a limit of `percent` of one CPU, with the cgroup of
+    /// the scope it runs in; `None` where no systemd user scope can hold agents.
+    fn limited_pane(
+        directory: &Path,
+        percent: u8,
+        script: &str,
+    ) -> Option<(Limiter, Session, std::path::PathBuf)> {
+        let limiter = Limiter::with_cores(directory, percent, 1, true);
+        let unit = match limiter.unit() {
+            Ok(unit) => unit.to_owned(),
+            Err(reason) => {
+                eprintln!("skipped: no systemd user scope can hold agents here: {reason}");
+                return None;
+            }
+        };
+        let (tx, events) = std::sync::mpsc::sync_channel(32);
+        let session = Session::spawn(
+            1,
+            "omp",
+            None,
+            directory,
+            &directory.join("unused.sock"),
+            tx,
+            24,
+            80,
+            Some(("/bin/sh".into(), vec!["-c".into(), script.into()])),
+            Some(&limiter),
+        )
+        .unwrap();
+        // The pane is released only once it is in the scope, but its trampoline may not have
+        // been moved yet when this first looks.
+        let pid = session.pid.unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let cgroup = loop {
+            let groups = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+            if let Some(path) = groups.lines().find_map(|line| line.strip_prefix("0::"))
+                && path.ends_with(&format!("/{unit}"))
+            {
+                break Path::new("/sys/fs/cgroup").join(path.trim_start_matches('/'));
+            }
+            if Instant::now() >= deadline {
+                let reports: Vec<String> = events
+                    .try_iter()
+                    .filter_map(|event| match event {
+                        Event::CpuLimit(report) => Some(report),
+                        _ => None,
+                    })
+                    .collect();
+                panic!("the pane never joined {unit}: {reports:?}");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        Some((limiter, session, cgroup))
+    }
+
+    /// How many CPUs the processes in `cgroup` kept busy over `window`.
+    fn cpu_rate(cgroup: &Path, window: Duration) -> f64 {
+        let usage = || {
+            let stat = std::fs::read_to_string(cgroup.join("cpu.stat")).unwrap();
+            let micros: u64 = stat
+                .lines()
+                .find_map(|line| line.strip_prefix("usage_usec "))
+                .unwrap()
+                .parse()
+                .unwrap();
+            Duration::from_micros(micros)
+        };
+        let (before, started) = (usage(), Instant::now());
+        std::thread::sleep(window);
+        (usage() - before).as_secs_f64() / started.elapsed().as_secs_f64()
+    }
+
+    /// Waits until the pane's shell has started its busy loops, which share its cgroup.
+    fn wait_for_processes(cgroup: &Path, count: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let procs = std::fs::read_to_string(cgroup.join("cgroup.procs")).unwrap();
+            if procs.lines().count() >= count {
+                return;
+            }
+            assert!(Instant::now() < deadline, "only {procs:?} run in the scope");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn agent_panes_run_in_their_scope_at_its_quota() {
+        let directory = tempfile::Builder::new()
+            .prefix("crit-test-")
+            .tempdir()
+            .unwrap();
+        let Some((_limiter, _session, cgroup)) = limited_pane(
+            directory.path(),
+            100,
+            "yes >/dev/null & yes >/dev/null & sleep 3; kill $!",
+        ) else {
+            return;
+        };
+        let read = |name| std::fs::read_to_string(cgroup.join(name)).unwrap();
+        // All of one CPU, and other apps go first while the CPUs are contended.
+        assert_eq!(read("cpu.max"), "100000 100000\n");
+        assert_eq!(read("cpu.weight"), "20\n");
+        // What the agent starts runs in its scope too: the shell, both loops and `sleep`.
+        wait_for_processes(&cgroup, 4);
+        // Two busy processes would keep two CPUs busy; the quota holds them to one. Other
+        // apps that contend for the CPUs can leave them less.
+        let rate = cpu_rate(&cgroup, Duration::from_secs(2));
+        assert!(rate <= 1.3, "{rate:.2} CPUs");
+    }
+
+    #[test]
+    fn retuning_lifts_and_restores_the_quota_of_running_agents() {
+        let directory = tempfile::Builder::new()
+            .prefix("crit-test-")
+            .tempdir()
+            .unwrap();
+        // All of one CPU, for three busy loops.
+        let Some((limiter, _session, cgroup)) = limited_pane(
+            directory.path(),
+            100,
+            "yes >/dev/null & yes >/dev/null & yes >/dev/null & wait",
+        ) else {
+            return;
+        };
+        let read = |name| std::fs::read_to_string(cgroup.join(name)).unwrap();
+        wait_for_processes(&cgroup, 4);
+        // Over a window the rate strays a little from the quota, either way.
+        let window = Duration::from_secs(2);
+        assert_eq!(read("cpu.max"), "100000 100000\n");
+        let limited = cpu_rate(&cgroup, window);
+        assert!(limited <= 1.3, "limited: {limited:.2} CPUs");
+        // As the worker does after F3: the scope has changed by the time `retune` returns.
+        limiter.set_limited(false);
+        limiter.retune().unwrap();
+        assert_eq!(
+            (read("cpu.max"), read("cpu.weight")),
+            ("max 100000\n".into(), "100\n".into())
+        );
+        limiter.set_limited(true);
+        limiter.retune().unwrap();
+        assert_eq!(
+            (read("cpu.max"), read("cpu.weight")),
+            ("100000 100000\n".into(), "20\n".into())
+        );
+        // The scheduler lets the agents overrun the quota for a moment as it returns, and
+        // takes that time back right after.
+        std::thread::sleep(Duration::from_secs(1));
+        let restored = cpu_rate(&cgroup, window);
+        assert!(restored <= 1.3, "restored: {restored:.2} CPUs");
     }
 }

@@ -13,7 +13,7 @@ const sections = [
 
 const heroFacts = [
   { href: '#lanes', number: '01', title: 'A worktree per branch', body: 'Its own checkout, tab and sessions.' },
-  { href: '#shell', number: '02', title: 'Ctrl+D to the shell', body: 'From OMP or OpenCode. The agent keeps going.' },
+  { href: '#shell', number: '02', title: 'Ctrl+D closes one tier', body: 'The agent, then the split, then the tab, like Kitty.' },
   { href: '#stacks', number: '03', title: 'Stacks, if you want them', body: 'Docker Compose per worktree, on its own loopback ports.' },
 ];
 
@@ -26,9 +26,10 @@ const laneKeys = [
 ];
 
 const ctrlD = [
-  ['In OMP or OpenCode', 'Selects this worktree’s shell, or opens one. The agent keeps running.'],
-  ['In a shell', 'End of input, exactly as before. It never toggles back to the agent.'],
-  ['In native mode (F12)', 'Passed straight through to the focused terminal.'],
+  ['In OMP or OpenCode', 'Reaches the agent, which quits on it. Its pane closes; a split’s other half goes full width.'],
+  ['In a shell', 'End of input, exactly as before. The shell ends and its pane closes the same way.'],
+  ['In the last session of a tab', 'The tab closes; the checkout and its Docker stack stay. The last tab closes Crit.'],
+  ['In native mode (F12)', 'Passed straight through to the focused terminal, as every key is.'],
 ];
 
 const planExample = JSON.stringify({ action: 'create_worktree', branch: 'feat/csv-export', base: null, agent: null }, null, 2);
@@ -209,25 +210,25 @@ const needs = [
           <header class="pl-head">
             <p class="pl-num" aria-hidden="true">02</p>
             <p class="pl-kicker">The shell</p>
-            <h2 id="shell-title" class="pl-h2">One key to the shell. The agent keeps going.</h2>
-            <p class="pl-lead">Inside OMP or OpenCode, Ctrl+D selects that worktree’s shell, or opens one if there isn’t one yet. The agent isn’t stopped; it carries on in its own session while you run the command yourself.</p>
+            <h2 id="shell-title" class="pl-h2">One key closes one tier. The rest keeps going.</h2>
+            <p class="pl-lead">Ctrl+D goes to whatever has focus, as in Kitty. OMP and OpenCode quit on it and their pane closes; a split’s survivor takes the full width; an empty tab closes. A shell beside the agent is Ctrl+Shift+Enter away, and the agent keeps running while you use it. An agent that fails stays on screen with its exit status, so a crash is never silently closed.</p>
           </header>
           <div class="pl-shell-grid">
             <div class="pl-caps-art">
               <div class="pl-caps" aria-hidden="true"><span class="pl-cap pl-cap-ctrl">Ctrl</span><span class="pl-cap-plus">+</span><span class="pl-cap pl-cap-d">D</span></div>
               <div class="pl-route" aria-hidden="true">
-                <span class="pl-route-chip"><i class="pl-pulse"></i>omp 1 · working</span>
+                <span class="pl-route-chip">[shell 2 · idle]</span>
                 <span class="pl-route-arrow"></span>
-                <span class="pl-route-chip pl-route-on">[shell 2 · idle]</span>
+                <span class="pl-route-chip pl-route-on"><i class="pl-pulse"></i>omp 1 · working</span>
               </div>
-              <p class="pl-route-caption">After Ctrl+D the shell is selected, and omp 1 is still working beside it.</p>
+              <p class="pl-route-caption">Ctrl+D in shell 2 ends it; omp 1 takes the full width and is still working.</p>
             </div>
             <div>
               <h3 class="pl-mini">What Ctrl+D does</h3>
               <dl class="pl-ledger">
                 {ctrlD.map(([where, what]) => <div><dt>{where}</dt><dd>{what}</dd></div>)}
               </dl>
-              <p class="pl-shell-back">Going back is its own move: <kbd>Ctrl+Shift+[</kbd> and <kbd>Ctrl+Shift+]</kbd> step through sessions, and <kbd>Ctrl+Shift+1</kbd> to <kbd>9</kbd> jump straight to one.</p>
+              <p class="pl-shell-back">Moving around is its own move: <kbd>Ctrl+Shift+Enter</kbd> opens a session, <kbd>Ctrl+Shift+[</kbd> and <kbd>Ctrl+Shift+]</kbd> step through sessions, and <kbd>Ctrl+Shift+1</kbd> to <kbd>9</kbd> jump straight to one.</p>
             </div>
           </div>
         </div>
@@ -389,7 +390,7 @@ const needs = [
                   </ul>
                   <h3 class="pl-mini">Good to know</h3>
                   <ul>
-                    <li>Each interactive start runs <code>omp update</code> and <code>opencode upgrade</code> before launching agents. If an update fails, Crit shows why and carries on with the installed version.</li>
+                    <li>At most once a day, Crit runs <code>omp update</code> and <code>opencode upgrade</code> in the background while the workspace opens; agents start at once with the installed version. If an update fails, Crit shows why and carries on.</li>
                     <li><code>crit --help</code> carries the full notes on projects, restore, Ask Crit and Docker.</li>
                   </ul>
                 </div>

@@ -217,7 +217,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         );
         return;
     }
-    let width = draw_key_mode(frame, app.native_keys, true);
+    let width = draw_key_mode(frame, app.native_keys, Some(app.limiter.hint()));
     draw_tabs(frame, app, bounds.width.saturating_sub(width));
     let (regions, count) = areas(app, Size::new(bounds.width, bounds.height));
     let pane_width = worktree_pane_width(app, bounds.width);
@@ -592,6 +592,8 @@ fn draw_worktree_pane(frame: &mut Frame, app: &mut App, width: u16, bottom: u16)
     }
 }
 
+// One pane's frame, header and body: each parameter is one thing the frame decided about it.
+#[expect(clippy::too_many_arguments)]
 fn draw_workspace(
     frame: &mut Frame,
     workspace: &Workspace,
@@ -870,28 +872,44 @@ fn line_horizontal(buffer: &mut Buffer, x: u16, y: u16, width: u16, color: Color
     }
 }
 
-fn draw_key_mode(frame: &mut Frame, native_keys: bool, has_project: bool) -> u16 {
-    let mode = if native_keys {
-        " F12  KITTY KEYS "
-    } else if has_project && frame.area().width >= 64 {
-        " F1 ASK · F2 WORKTREES · F12 CRIT KEYS "
-    } else if has_project {
-        // Keeps at least 15 columns for the tabs, even at the 30-column minimum.
-        " F1 · F2 · F12 "
-    } else {
-        " F12  CRIT KEYS "
+/// Draws the key hint at the right end of the top row and returns its width. `cpu` is the agent
+/// CPU limit's state for F3 once a project is open, and `None` on the start screen, which only
+/// takes F12. The full labels take at most half the row, so the tabs keep the rest; narrower
+/// windows get shorter forms that leave the tabs at least 15 columns, so a focused tab fits
+/// even at the 30-column minimum.
+fn draw_key_mode(frame: &mut Frame, native_keys: bool, cpu: Option<&str>) -> u16 {
+    let width = usize::from(frame.area().width);
+    let hint_width =
+        |(start, end): (&str, &str), cpu: &str| start.width() + cpu.width() + end.width();
+    let (start, state, end) = match cpu {
+        _ if native_keys => (" F12  KITTY KEYS ", "", ""),
+        None => (" F12  CRIT KEYS ", "", ""),
+        Some(cpu) if 2 * hint_width(FULL_KEYS, cpu) <= width => (FULL_KEYS.0, cpu, FULL_KEYS.1),
+        Some(cpu) if hint_width(SHORT_KEYS, cpu) + 15 <= width => (SHORT_KEYS.0, cpu, SHORT_KEYS.1),
+        Some(_) => (" F1·F2·F3·F12 ", "", ""),
     };
-    let width = mode.width() as u16;
+    let used = (start.width() + state.width() + end.width()) as u16;
     frame.render_widget(
-        Paragraph::new(mode).style(
+        Paragraph::new(Line::from(vec![
+            Span::raw(start),
+            Span::raw(state),
+            Span::raw(end),
+        ]))
+        .style(
             Style::default()
                 .fg(if native_keys { AMBER } else { ACCENT })
                 .bg(BG),
         ),
-        Rect::new(frame.area().width.saturating_sub(width), 0, width, 1),
+        Rect::new(frame.area().width.saturating_sub(used), 0, used, 1),
     );
-    width
+    used
 }
+
+/// The key hint around the agent CPU limit's state, with every key named.
+const FULL_KEYS: (&str, &str) = (" F1 ASK · F2 WORKTREES · F3 CPU ", " · F12 CRIT KEYS ");
+
+/// The key hint around the agent CPU limit's state, for windows too narrow for `FULL_KEYS`.
+const SHORT_KEYS: (&str, &str) = (" F1 · F2 · F3 CPU ", " · F12 ");
 
 pub fn draw_project_chooser(
     frame: &mut Frame,
@@ -911,7 +929,7 @@ pub fn draw_project_chooser(
         );
         return;
     }
-    let mode_width = draw_key_mode(frame, native_keys, false);
+    let mode_width = draw_key_mode(frame, native_keys, None);
     frame.render_widget(
         Paragraph::new(" crit · start").style(Style::default().fg(FG).bold()),
         Rect::new(0, 0, bounds.width.saturating_sub(mode_width), 1),
@@ -1317,7 +1335,7 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
                 inner.width,
                 inner.bottom().saturating_sub(top + 1),
             ),
-            choices.into_iter(),
+            choices,
             *selected,
         );
         frame.render_widget(
@@ -1498,7 +1516,7 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
                 }
                 Confirm::CloseWorktree { .. } => unreachable!("close tab is rendered above"),
                 Confirm::CloseSession => {
-                    "End the focused session?\nOther sessions and Docker remain."
+                    "End the focused session?\nA tab left empty closes, like a Kitty window.\nOther sessions, checkouts and Docker remain."
                 }
                 Confirm::StopEnvironment => {
                     "Stop this worktree's Docker?\nOther worktrees unaffected.\nVolumes remain."
@@ -1756,6 +1774,7 @@ mod tests {
                     bodies[0].height,
                     bodies[0].width,
                     Some(("/bin/cat".into(), Vec::new())),
+                    None,
                 )
                 .unwrap(),
             );
@@ -1794,8 +1813,8 @@ mod tests {
                 })
                 .unwrap();
             let buffer = terminal.backend().buffer();
-            for selected in 0..2 {
-                let header = row_text(buffer, panes[selected], panes[selected].y);
+            for (selected, pane) in panes.iter().enumerate() {
+                let header = row_text(buffer, *pane, pane.y);
                 assert!(header.contains(&format!("[shell {} ", selected + 1)));
                 assert_eq!(header.contains('›'), selected == focused);
                 assert!(!workspace.sessions[selected].dirty.load(Ordering::Acquire));
@@ -1901,6 +1920,7 @@ mod tests {
                 body.height,
                 body.width,
                 Some(("/bin/cat".into(), Vec::new())),
+                None,
             )
             .unwrap(),
         );
@@ -1979,6 +1999,7 @@ mod tests {
                     content.height,
                     content.width,
                     Some((program.into(), args.iter().map(|&arg| arg.into()).collect())),
+                    None,
                 )
                 .unwrap(),
             );
@@ -2528,14 +2549,14 @@ mod tests {
     }
 
     #[test]
-    fn key_mode_hint_lists_f2_and_compacts_on_narrow_frames() {
+    fn key_mode_hint_lists_f2_and_f3_and_compacts_on_narrow_frames() {
         // The pane's trash cell relies on this glyph taking one column, not two.
         assert_eq!("🗑".width(), 1);
-        let hint = |width: u16, native_keys: bool, has_project: bool| {
+        let hint = |width: u16, native_keys: bool, cpu: Option<&str>| {
             let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
             let mut used = 0;
             terminal
-                .draw(|frame| used = draw_key_mode(frame, native_keys, has_project))
+                .draw(|frame| used = draw_key_mode(frame, native_keys, cpu))
                 .unwrap();
             let buffer = terminal.backend().buffer();
             let row: String = (0..width)
@@ -2543,24 +2564,39 @@ mod tests {
                 .collect();
             (used, row)
         };
-        for width in [64, 80, 200] {
-            let (used, row) = hint(width, false, true);
-            assert_eq!(used, 39);
+        // Every key is named where that takes at most half the row.
+        for (width, cpu) in [(104, "50%"), (104, "OFF"), (106, "100%"), (200, "LOW")] {
+            let (used, row) = hint(width, false, Some(cpu));
+            let expected = format!(" F1 ASK · F2 WORKTREES · F3 CPU {cpu} · F12 CRIT KEYS ");
+            assert!(row.ends_with(&expected), "{row:?}");
+            assert_eq!(usize::from(used), expected.width());
+            assert!(width - used >= used);
+        }
+        // Narrower, the keys and the limit's state still show while the tab bar keeps 15.
+        for (width, cpu) in [
+            (103, "50%"),
+            (105, "100%"),
+            (64, "50%"),
+            (43, "50%"),
+            (43, "OFF"),
+        ] {
+            let (used, row) = hint(width, false, Some(cpu));
             assert!(
-                row.ends_with(" F1 ASK · F2 WORKTREES · F12 CRIT KEYS "),
+                row.ends_with(&format!(" F1 · F2 · F3 CPU {cpu} · F12 ")),
                 "{row:?}"
             );
-        }
-        // Below 64 columns the tab bar keeps at least 15, so a focused tab fits at 30.
-        for width in [30, 50, 63] {
-            let (used, row) = hint(width, false, true);
-            assert_eq!(used, 15);
-            assert!(row.ends_with(" F1 · F2 · F12 "), "{row:?}");
             assert!(width - used >= 15);
         }
-        // Native mode and the project chooser keep their labels.
-        assert_eq!(hint(100, true, true).0, 17);
-        assert_eq!(hint(100, false, false).0, 16);
+        // Down to the 30-column minimum, the keys alone; a focused tab still fits.
+        for width in [30, 42] {
+            let (used, row) = hint(width, false, Some("100%"));
+            assert_eq!(used, 14);
+            assert!(row.ends_with(" F1·F2·F3·F12 "), "{row:?}");
+            assert!(width - used >= 15);
+        }
+        // Native mode, where F3 belongs to the terminal, and the project chooser keep their labels.
+        assert_eq!(hint(100, true, Some("50%")).0, 17);
+        assert_eq!(hint(100, false, None).0, 16);
     }
 
     #[test]

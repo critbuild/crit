@@ -148,8 +148,8 @@ const clientLanes = lanes.map(({ id, branch, sessions }) => ({
         <p class="sb-legend" id="sb-keys-title">Session keys</p>
         <div class="sb-keys">
           <button type="button" class="sb-key" data-key="shell" aria-disabled="false">
-            <span class="sb-caps"><kbd>Ctrl</kbd><span aria-hidden="true">+</span><kbd>D</kbd></span>
-            <span>Shell; the agent keeps running</span>
+            <span class="sb-caps"><kbd>Ctrl</kbd><span aria-hidden="true">+</span><kbd>Shift</kbd><span aria-hidden="true">+</span><kbd>Enter</kbd></span>
+            <span>Shell beside the agent; the agent keeps running</span>
           </button>
           <button type="button" class="sb-key" data-key="first" aria-disabled="true">
             <span class="sb-caps"><kbd>Ctrl</kbd><span aria-hidden="true">+</span><kbd>Shift</kbd><span aria-hidden="true">+</span><kbd>1</kbd></span>
@@ -538,8 +538,8 @@ const clientLanes = lanes.map(({ id, branch, sessions }) => ({
         const agent = entry.sessions.findIndex((candidate) => candidate.kind !== 'shell');
         announce(
           agent === -1
-            ? `${entry.branch} only has a shell. In a shell, Ctrl+D is end-of-input for the shell itself; Crit doesn’t intercept it.`
-            : `${label(entry, from)} is already selected. In a shell, Ctrl+D is end-of-input for the shell, not a switch back. Ctrl+Shift+1 returns to ${label(entry, agent)}.`,
+            ? `${entry.branch} only has a shell. Ctrl+Shift+Enter would open another session here; Ctrl+D in the shell is end of input and closes it.`
+            : `${label(entry, from)} is already selected. Ctrl+Shift+1 returns to ${label(entry, agent)}; Ctrl+D in the shell is end of input and closes it.`,
         );
         return;
       }
@@ -548,7 +548,7 @@ const clientLanes = lanes.map(({ id, branch, sessions }) => ({
       if (!wasOpen) opened.add(`${entry.id}:${shell}`);
       active.set(entry.id, shell);
       render();
-      announce(`Ctrl+D ${wasOpen ? 'selected' : 'opened'} ${label(entry, shell)} in ${entry.branch}, and ${label(entry, from)} ${STILL_TEXT[session.state]}.`);
+      announce(`Ctrl+Shift+Enter ${wasOpen ? 'selected' : 'opened'} ${label(entry, shell)} in ${entry.branch}, and ${label(entry, from)} ${STILL_TEXT[session.state]}.`);
     });
 
     firstKey?.addEventListener('click', () => {

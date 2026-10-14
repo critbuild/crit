@@ -8,7 +8,7 @@ pub const HELP: &str = "Crit shortcuts (same as Kitty's terminal/window actions)
   Ctrl+Tab / Ctrl+Shift+Right  Next tab (wraps into the next open project)
   Ctrl+Shift+Tab / Left   Previous tab
   Ctrl+Shift+Enter        New OMP / OpenCode / shell session
-  Ctrl+D                 From OMP / OpenCode, select or open a shell here
+  Ctrl+D                 Sent to the pane: quits OMP / OpenCode, EOF in a shell
   Ctrl+Shift+W            Close focused session
   Ctrl+Shift+[ / ]        Previous / next session or split pane
   Ctrl+Shift+1..9 / 0     Focus session 1..10
@@ -18,10 +18,13 @@ pub const HELP: &str = "Crit shortcuts (same as Kitty's terminal/window actions)
   F1                     Ask Crit in natural language (Haiku 5.5)
   F1 then F2             Manual controls: Up/Down and Enter, no AI needed
   F2                     Toggle the worktree pane (click a row to open, 🗑 to delete)
+  F3                     Toggle the OMP/OpenCode CPU limit (default 50%, persistent)
   F10                    Exit Crit (confirmation required)
 
-The agent keeps running when Ctrl+D selects a shell. In a shell, Ctrl+D remains
-normal EOF; native shortcut mode always forwards Ctrl+D to the focused terminal.
+When a shell or agent ends, or Ctrl+Shift+W closes a pane, the pane closes like a
+Kitty window: a split's other pane goes full width, an emptied tab closes, and the
+last tab closes Crit. An agent that fails, or quits within a second of starting,
+stays open with its exit status (F1 to restart).
 Close-tab choices use Up/Down and Enter; No is selected by default. Esc cancels.
 Yes keeps the checkout; deletion requires a clean, unlocked, non-main worktree
 with its Docker environment stopped, and keeps the branch. Ordinary folders stay.
@@ -60,6 +63,7 @@ pub enum Action {
     ToggleNative,
     Launcher,
     Worktrees,
+    ToggleAgentCpu,
     Quit,
     NewTab,
     CloseWorktree,
@@ -89,6 +93,7 @@ pub fn action(key: KeyEvent) -> Option<Action> {
         F(12) if key.modifiers.is_empty() => Some(ToggleNative),
         F(1) if key.modifiers.is_empty() => Some(Action::Launcher),
         F(2) if key.modifiers.is_empty() => Some(Worktrees),
+        F(3) if key.modifiers.is_empty() => Some(ToggleAgentCpu),
         F(10) if key.modifiers.is_empty() => Some(Quit),
         Tab if ctrl && !shift => Some(NextWorktree),
         Tab | BackTab if ctrl && shift => Some(PreviousWorktree),
@@ -271,7 +276,21 @@ mod tests {
         }
     }
     #[test]
-    fn ctrl_d_remains_terminal_input_when_not_switching_from_an_agent() {
+    fn f3_toggles_the_agent_cpu_limit_only_without_modifiers() {
+        assert_eq!(
+            action(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)),
+            Some(Action::ToggleAgentCpu)
+        );
+        for modifiers in [
+            KeyModifiers::SHIFT,
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+        ] {
+            assert_eq!(action(KeyEvent::new(KeyCode::F(3), modifiers)), None);
+        }
+    }
+    #[test]
+    fn ctrl_d_is_terminal_input() {
         let key = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
         assert_eq!(action(key), None);
         let mut bytes = Vec::new();

@@ -4,7 +4,7 @@ use crate::{
     integration::{self, AgentState},
     intent::{self, Agent as AgentKind, Command as IntentCommand, Plan},
     keys::{self, Action},
-    kitty, restore,
+    kitty, limits, restore,
     selection::Selection,
     terminal::Session,
     ui, updates,
@@ -615,12 +615,55 @@ impl Project {
             self.focus_secondary = false;
         }
     }
+
+    /// Removes session `session` of workspace `workspace`, as Kitty closes a window. A split
+    /// that showed it beside another session of the same workspace leaves that session the full
+    /// width, and the focus. A workspace that had it selected selects the nearest remaining
+    /// session in its place, so a split of two workspaces stays split. The workspace can be
+    /// left without sessions: closing its tab is up to the caller.
+    fn remove_session(&mut self, workspace: usize, session: usize) {
+        // The other pane, when both show sessions of this workspace and one of them is this one.
+        let peer = self
+            .secondary_session
+            .filter(|_| self.layout != LayoutMode::Full && workspace == self.active)
+            .and_then(|shared| {
+                let primary = self.workspaces[workspace].selected;
+                if session == primary {
+                    Some(shared)
+                } else if session == shared {
+                    Some(primary)
+                } else {
+                    None
+                }
+            });
+        let shift = |index: usize| index - usize::from(index > session);
+        let open = &mut self.workspaces[workspace];
+        open.sessions.remove(session);
+        if let Some(peer) = peer {
+            open.selected = shift(peer);
+            self.layout = LayoutMode::Full;
+            self.secondary = None;
+            self.secondary_session = None;
+            self.focus_secondary = false;
+            return;
+        }
+        open.selected = if open.selected == session {
+            session.min(open.sessions.len().saturating_sub(1))
+        } else {
+            shift(open.selected)
+        };
+        if workspace == self.active {
+            self.secondary_session = self.secondary_session.map(shift);
+        }
+    }
 }
 
 pub struct App {
     pub project: Project,
     pub saved_projects: Vec<Project>,
     pub native_keys: bool,
+    /// The agent CPU limit (F3), saved with the workspace like `native_keys`.
+    pub limiter: limits::Limiter,
     pub modal: Option<Modal>,
     pub notice: Option<String>,
     /// The notice is a warning that terminal input must not dismiss.
@@ -710,6 +753,8 @@ enum Job {
         repository: worktree::Repository,
         tree: Worktree,
     },
+    /// Apply the agent CPU limit's setting, as it is when this runs, to the running agents.
+    RetuneAgentCpu(limits::Limiter),
 }
 #[derive(Clone, Copy)]
 pub enum EnvironmentOp {
@@ -765,8 +810,15 @@ fn environment_summary(label: &str, environment: &compose::Environment) -> Strin
 /// Shown when a new worktree's tab exists but the full job queue refused its Docker start.
 const ENVIRONMENT_NOT_STARTED: &str = "Worktree created; its Docker environment was not started (command queue busy). Start it from F1 → F2.";
 
+/// Shown when a tab closes. Closing one never touches its checkout or Docker environment.
+const TAB_CLOSED: &str = "Tab closed; any checkout and Docker environment retained.";
+
 impl App {
     const METADATA_INTERVAL: Duration = Duration::from_secs(1);
+    /// An agent that ends successfully within this long of starting stays open, as a failed one
+    /// does, rather than closing like a Kitty window: it most likely never got going (a tool that
+    /// refuses to run can still exit 0), and closing it could end Crit before anyone saw why.
+    const AGENT_STARTUP: Duration = Duration::from_secs(1);
 
     fn refresh_metadata(&mut self) {
         if self.metadata_pending || self.metadata_checked.elapsed() < Self::METADATA_INTERVAL {
@@ -1132,6 +1184,8 @@ impl App {
             projects,
             active_project,
             native_keys: self.native_keys,
+            agent_cpu_limited: self.limiter.limited(),
+            agent_cpu_percent: self.limiter.percent(),
         }
     }
 
@@ -1285,6 +1339,29 @@ impl App {
             .flat_map(|project| project.workspaces.iter_mut())
     }
 
+    /// The project in `slot`: `None` is the current project, `Some(i)` is `saved_projects[i]`.
+    fn project_mut(&mut self, slot: Option<usize>) -> &mut Project {
+        match slot {
+            None => &mut self.project,
+            Some(index) => &mut self.saved_projects[index],
+        }
+    }
+
+    /// Where session `id` is, in any open project: the project's slot (as `project_mut` takes
+    /// it), and the indices of its workspace and of the session in it.
+    fn find_session(&self, id: u64) -> Option<(Option<usize>, usize, usize)> {
+        project_slots(&self.project, &self.saved_projects).find_map(|(slot, project)| {
+            project
+                .workspaces
+                .iter()
+                .enumerate()
+                .find_map(|(workspace, open)| {
+                    let session = open.sessions.iter().position(|s| s.id == id)?;
+                    Some((slot, workspace, session))
+                })
+        })
+    }
+
     /// Worktree tabs across all open projects, in tab-bar order.
     fn tabs(&self) -> impl Iterator<Item = (Option<usize>, usize)> + '_ {
         project_slots(&self.project, &self.saved_projects)
@@ -1386,6 +1463,7 @@ impl App {
             rows.saturating_sub(8),
             cols.saturating_sub(2),
             command,
+            Some(&self.limiter),
         )?;
         self.next_session += 1;
         let workspace = &mut self.project.workspaces[index];
@@ -1398,20 +1476,6 @@ impl App {
             self.state_dirty = true;
         }
         Ok(())
-    }
-    fn select_shell(&mut self) -> Result<()> {
-        let index = self.focused_index();
-        let workspace = &mut self.project.workspaces[index];
-        if let Some(selected) = workspace
-            .sessions
-            .iter()
-            .position(|session| session.kind == "shell" && session.alive.load(Ordering::Acquire))
-        {
-            self.select_session(selected);
-            Ok(())
-        } else {
-            self.spawn(index, "shell", None)
-        }
     }
     fn ensure_session(&mut self, index: usize) -> Result<()> {
         if self.project.workspaces[index].sessions.is_empty() {
@@ -1565,21 +1629,112 @@ impl App {
         }
         choices
     }
+    /// Closes the focused tab, keeping its checkout and Docker environment.
     fn close_workspace(&mut self) {
-        self.workspace_changed();
-        let index = self.focused_index();
-        if self.project.workspaces.len() == 1 {
-            if let Some(project) = self.saved_projects.pop() {
-                self.project = project;
-            } else {
-                self.project.workspaces.clear();
-                self.should_quit = true;
-                return;
-            }
-        } else {
-            self.project.close_workspace(index);
+        self.close_tab(None, self.focused_index());
+        if !self.should_quit {
+            self.set_notice(TAB_CLOSED);
         }
-        self.set_notice("Tab closed; any checkout and Docker environment retained.");
+    }
+
+    /// Closes tab `index` of the project in `slot` (as `project_mut` takes it), keeping its
+    /// checkout and Docker environment. A project closes with its last tab: the current one
+    /// gives way to the most recently opened other project, and without one Crit ends, as Kitty
+    /// does when its last window closes. Crit's final save then holds no project, so the next
+    /// launch starts at the chooser.
+    fn close_tab(&mut self, slot: Option<usize>, index: usize) {
+        self.workspace_changed();
+        let project = self.project_mut(slot);
+        if project.workspaces.len() > 1 {
+            project.close_workspace(index);
+            return;
+        }
+        match slot {
+            Some(saved) => {
+                self.saved_projects.remove(saved);
+            }
+            None => match self.saved_projects.pop() {
+                Some(project) => self.project = project,
+                None => {
+                    self.project.workspaces.clear();
+                    self.should_quit = true;
+                }
+            },
+        }
+    }
+
+    /// Closes session `session` of workspace `workspace` in the project in `slot` (as
+    /// `project_mut` takes it), as Kitty closes a window: its pane gives way as
+    /// `Project::remove_session` describes, and a tab left without sessions closes as
+    /// `close_tab` describes, which can end Crit.
+    fn close_session(
+        &mut self,
+        slot: Option<usize>,
+        workspace: usize,
+        session: usize,
+    ) -> Result<()> {
+        let focused = slot.is_none()
+            && workspace == self.focused_index()
+            && session == self.focused_session_index();
+        let project = self.project_mut(slot);
+        project.remove_session(workspace, session);
+        let emptied = project.workspaces[workspace].sessions.is_empty();
+        self.workspace_changed();
+        if emptied {
+            self.close_tab(slot, workspace);
+            if self.should_quit {
+                return Ok(());
+            }
+            // Below what the notice row says: a program can end while it shows a warning.
+            self.append_notice(TAB_CLOSED);
+        }
+        // A confirmation for what had the focus must not go on to act on what has it now.
+        let stale = match &self.modal {
+            Some(Modal::Confirm(Confirm::CloseSession)) => focused,
+            Some(Modal::Confirm(
+                Confirm::CloseWorktree { .. }
+                | Confirm::StopEnvironment
+                | Confirm::RemoveWorktree { tree: None },
+            )) => focused && emptied,
+            _ => false,
+        };
+        if stale {
+            self.modal = None;
+        }
+        if focused && emptied {
+            // As after Close tab, the tab that takes over the window gets a session.
+            self.ensure_session(self.focused_index())?;
+        }
+        Ok(())
+    }
+
+    /// Session `id`'s program ended. A shell's pane closes like a Kitty window however it
+    /// ended, and an agent's does when it quit (Ctrl+D or its own quit command) after
+    /// `AGENT_STARTUP`. A failed agent stays open with its exit status in its header, and so
+    /// does a Docker log follower, which ends along with the stack it follows.
+    fn session_exited(
+        &mut self,
+        id: u64,
+        code: String,
+        success: bool,
+        ran: Duration,
+    ) -> Result<()> {
+        // A session closed in Crit is gone before its program's exit is reported.
+        let Some((slot, workspace, index)) = self.find_session(id) else {
+            return Ok(());
+        };
+        let session = &mut self.project_mut(slot).workspaces[workspace].sessions[index];
+        let closes = match session.kind.as_str() {
+            "shell" => true,
+            "omp" | "opencode" => success && ran >= Self::AGENT_STARTUP,
+            _ => false,
+        };
+        if closes {
+            return self.close_session(slot, workspace, index);
+        }
+        session.state = AgentState::Exited;
+        session.message = Some(code);
+        Ok(())
     }
     fn new_request(&mut self) -> u64 {
         let request = self.next_request;
@@ -1872,6 +2027,42 @@ impl App {
         Ok(())
     }
 
+    /// F3: turns the agent CPU limit off or on, for running agents as far as it can, and says
+    /// what it does now.
+    fn toggle_agent_cpu(&mut self) -> Result<()> {
+        let limited = !self.limiter.limited();
+        self.limiter.set_limited(limited);
+        if self.limiter.uses_scope() {
+            // systemd can take a while to answer, so the worker retunes the running agents, to
+            // the setting as it is by then.
+            if self
+                .jobs
+                .try_send(Job::RetuneAgentCpu(self.limiter.clone()))
+                .is_err()
+            {
+                self.limiter.set_limited(!limited);
+                anyhow::bail!("command queue is busy; press F3 again");
+            }
+        } else if limited {
+            // Without a scope, running agents can only be given a lower priority.
+            let sessions = std::iter::once(&self.project)
+                .chain(&self.saved_projects)
+                .flat_map(|project| &project.workspaces)
+                .flat_map(|workspace| &workspace.sessions);
+            for session in sessions {
+                if matches!(session.kind.as_str(), "omp" | "opencode")
+                    && session.alive.load(Ordering::Acquire)
+                    && let Some(pid) = session.pid()
+                {
+                    limits::lower_priority(pid);
+                }
+            }
+        }
+        self.state_dirty = true;
+        self.set_notice(self.limiter.describe());
+        Ok(())
+    }
+
     fn action(&mut self, action: Action) -> Result<()> {
         match action {
             Action::ToggleNative => {
@@ -1889,6 +2080,7 @@ impl App {
             }
             Action::Launcher => self.open_intent()?,
             Action::Worktrees => self.set_worktree_pane(self.worktree_pane.is_none()),
+            Action::ToggleAgentCpu => self.toggle_agent_cpu()?,
             Action::Quit => self.modal = Some(Modal::Confirm(Confirm::Quit)),
             Action::NewTab => {
                 self.modal = Some(Modal::NewTab {
@@ -2090,7 +2282,17 @@ impl App {
                 Modal::OpenWorktree { trees, selected } => {
                     navigate(key, selected, trees.len());
                     if key.code == KeyCode::Enter {
-                        if let Some(tree) = trees.get(*selected) {
+                        if let Some(picked) = trees.get(*selected) {
+                            // The picker listed when it opened; the Git poll has kept
+                            // `Project::trees` current since, and only sends another listing
+                            // when something changes again. A branch switched meanwhile would
+                            // otherwise label the new tab until then.
+                            let tree = self
+                                .project
+                                .trees
+                                .iter()
+                                .find(|tree| tree.id == picked.id && tree.path == picked.path)
+                                .unwrap_or(picked);
                             let index = if let Some(index) = self
                                 .project
                                 .workspaces
@@ -2208,25 +2410,9 @@ impl App {
                                 }
                             }
                             Confirm::CloseSession => {
-                                let selected = self.focused_session_index();
-                                let other = self.project.secondary_session.map(|_| {
-                                    self.project.pane_session(!self.project.focus_secondary)
-                                });
-                                let workspace = &mut self.project.workspaces[index];
-                                if !workspace.sessions.is_empty() {
-                                    workspace.sessions.remove(selected);
-                                    workspace.selected = other.map_or_else(
-                                        || selected.min(workspace.sessions.len().saturating_sub(1)),
-                                        |other| other - usize::from(other > selected),
-                                    );
+                                if self.focused_session().is_some() {
+                                    self.close_session(None, index, self.focused_session_index())?;
                                 }
-                                if other.is_some() {
-                                    self.project.layout = LayoutMode::Full;
-                                    self.project.secondary = None;
-                                    self.project.secondary_session = None;
-                                    self.project.focus_secondary = false;
-                                }
-                                self.workspace_changed();
                             }
                             Confirm::StopEnvironment => self.env(index, EnvironmentOp::Down)?,
                             Confirm::CloseWorktree { .. } | Confirm::RemoveWorktree { .. } => {
@@ -2380,15 +2566,11 @@ impl App {
                 } else if let Some(action) = action {
                     self.notice = None;
                     self.action(action)?;
-                } else if matches!(key.code, KeyCode::Char('d' | 'D'))
-                    && key.modifiers == KeyModifiers::CONTROL
-                    && self
-                        .focused_session()
-                        .is_some_and(|session| matches!(session.kind.as_str(), "omp" | "opencode"))
-                {
-                    self.notice = None;
-                    self.select_shell()?;
                 } else {
+                    // Every other key is the pane's, Ctrl+D too: an agent quits on it and a shell
+                    // reads end of input, and the pane then closes as a Kitty window would (see
+                    // `session_exited`).
+                    //
                     // The program draws its answer, if any, through its own output; drawing now
                     // as well would put out a frame before the echo, and the echo would then wait
                     // out the frame interval.
@@ -2502,24 +2684,24 @@ impl App {
                 ) {
                     self.selection = None;
                 }
-                if let Some((id, grab)) = self.scroll_drag {
-                    if matches!(
+                if let Some((id, grab)) = self.scroll_drag
+                    && matches!(
                         mouse.kind,
                         MouseEventKind::Drag(MouseButton::Left)
                             | MouseEventKind::Up(MouseButton::Left)
-                    ) {
-                        if let Some((session, bar)) = self.panes.iter().find_map(|pane| {
-                            let workspace = self.project.workspaces.get(pane.workspace)?;
-                            let session = workspace.sessions.get(pane.session)?;
-                            (session.id == id).then_some((session, pane.scrollbar?))
-                        }) {
-                            session.scroll_to(bar.offset_at(mouse.row, grab));
-                        }
-                        if matches!(mouse.kind, MouseEventKind::Up(_)) {
-                            self.scroll_drag = None;
-                        }
-                        return Ok(true);
+                    )
+                {
+                    if let Some((session, bar)) = self.panes.iter().find_map(|pane| {
+                        let workspace = self.project.workspaces.get(pane.workspace)?;
+                        let session = workspace.sessions.get(pane.session)?;
+                        (session.id == id).then_some((session, pane.scrollbar?))
+                    }) {
+                        session.scroll_to(bar.offset_at(mouse.row, grab));
                     }
+                    if matches!(mouse.kind, MouseEventKind::Up(_)) {
+                        self.scroll_drag = None;
+                    }
+                    return Ok(true);
                 }
                 if matches!(mouse.kind, MouseEventKind::Down(_)) {
                     self.clear_notice_on_input(false);
@@ -2663,15 +2845,12 @@ impl App {
                         .is_some_and(|s| s.id == id)
                 }));
             }
-            Event::Exited { session, code } => {
-                for workspace in self.all_workspaces_mut() {
-                    if let Some(found) = workspace.sessions.iter_mut().find(|s| s.id == session) {
-                        found.state = AgentState::Exited;
-                        found.message = Some(code);
-                        break;
-                    }
-                }
-            }
+            Event::Exited {
+                session,
+                code,
+                success,
+                ran,
+            } => self.session_exited(session, code, success, ran)?,
             Event::Clipboard { ty, data } => {
                 clipboard::copy_encoded(&ty, &data).context("forwarding a pane's OSC 52 copy")?;
                 return Ok(false);
@@ -3142,11 +3321,7 @@ impl App {
                         if removed_focus {
                             self.modal = None;
                         }
-                        if self.project.workspaces.len() == 1 {
-                            self.close_workspace();
-                        } else {
-                            self.project.close_workspace(index);
-                        }
+                        self.close_tab(None, index);
                         if removed_focus && !self.should_quit {
                             self.ensure_session(self.focused_index())?;
                         }
@@ -3162,11 +3337,7 @@ impl App {
                                 .map(|index| (project, index))
                         })
                     {
-                        if self.saved_projects[project].workspaces.len() == 1 {
-                            self.saved_projects.remove(project);
-                        } else {
-                            self.saved_projects[project].close_workspace(index);
-                        }
+                        self.close_tab(Some(project), index);
                     }
                     self.set_notice(match warning {
                         Some(warning) => format!(
@@ -3194,6 +3365,7 @@ impl App {
                     }
                 }
             },
+            Event::CpuLimit(message) => self.append_notice(&message),
             Event::Error(error) => self.set_notice(error),
             Event::Shutdown => self.should_quit = true,
         }
@@ -3567,6 +3739,11 @@ fn start_worker(tx: SyncSender<Event>) -> Result<SyncSender<Job>> {
                             },
                         }
                     }
+                    // A retune that worked has nothing to say: F3's notice already did.
+                    Job::RetuneAgentCpu(limiter) => match limiter.retune() {
+                        Ok(()) => continue,
+                        Err(error) => Event::CpuLimit(error),
+                    },
                 };
                 if tx.send(event).is_err() {
                     break;
@@ -3810,6 +3987,7 @@ fn choose_project(
 fn restore_projects(
     snapshot: &restore::Snapshot,
     socket: &Path,
+    limiter: &limits::Limiter,
     tx: &SyncSender<Event>,
     size: ratatui::layout::Size,
     next_session: &mut u64,
@@ -3833,19 +4011,29 @@ fn restore_projects(
     }
     let opencode_chats = integration::opencode_chats(&opencode_ids, &opencode_folders)
         .map_err(|error| format!("{error:#}"));
+    // Every pane reopens as the next session, sized for the window, under the agent CPU limit.
+    let mut spawn = |kind: &str, resume: Option<integration::Resume<'_>>, cwd: &Path| {
+        let id = *next_session;
+        *next_session += 1;
+        Session::spawn(
+            id,
+            kind,
+            resume,
+            cwd,
+            socket,
+            tx.clone(),
+            size.height.saturating_sub(4),
+            size.width.saturating_sub(2),
+            None,
+            Some(limiter),
+        )
+    };
     let mut skipped = Vec::new();
     let mut projects = Vec::with_capacity(snapshot.projects.len());
     let mut current = None;
     for (index, saved) in snapshot.projects.iter().enumerate() {
-        let Some(mut project) = restore_project(
-            saved,
-            &opencode_chats,
-            socket,
-            tx,
-            size,
-            next_session,
-            &mut skipped,
-        ) else {
+        let Some(mut project) = restore_project(saved, &opencode_chats, &mut spawn, &mut skipped)
+        else {
             continue;
         };
         project.order = projects.len() as u64;
@@ -3862,15 +4050,12 @@ fn restore_projects(
     (Some((current, projects)), skipped)
 }
 
-/// One saved project, or `None` when none of its folders reopened. Every item that cannot be
-/// reopened adds a line to `skipped`.
+/// One saved project, or `None` when none of its folders reopened. Its panes are started with
+/// `spawn`. Every item that cannot be reopened adds a line to `skipped`.
 fn restore_project(
     saved: &restore::SavedProject,
     opencode_chats: &Result<integration::OpencodeChats, String>,
-    socket: &Path,
-    tx: &SyncSender<Event>,
-    size: ratatui::layout::Size,
-    next_session: &mut u64,
+    spawn: &mut impl FnMut(&str, Option<integration::Resume<'_>>, &Path) -> Result<Session>,
     skipped: &mut Vec<String>,
 ) -> Option<Project> {
     let mut project: Option<Project> = None;
@@ -3915,21 +4100,8 @@ fn restore_project(
                     .map(|chat| integration::Resume::Chat(chat.as_str())),
                 _ => None,
             };
-            let spawned = check_resume(saved_session, opencode_chats).and_then(|()| {
-                let id = *next_session;
-                *next_session += 1;
-                Session::spawn(
-                    id,
-                    &saved_session.kind,
-                    resume,
-                    &workspace.tree.path,
-                    socket,
-                    tx.clone(),
-                    size.height.saturating_sub(4),
-                    size.width.saturating_sub(2),
-                    None,
-                )
-            });
+            let spawned = check_resume(saved_session, opencode_chats)
+                .and_then(|()| spawn(&saved_session.kind, resume, &workspace.tree.path));
             match spawned {
                 Ok(session) => {
                     sessions.push(Some(workspace.sessions.len()));
@@ -4016,6 +4188,7 @@ pub fn run(
     use_kitty: bool,
     direct_start: bool,
     fresh: bool,
+    agent_cpu: Option<u8>,
 ) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         anyhow::bail!("Crit needs an interactive terminal; use --help for noninteractive commands");
@@ -4082,9 +4255,7 @@ pub fn run(
         None
     } else {
         match store.as_ref().map(restore::Store::load).transpose() {
-            Ok(snapshot) => snapshot
-                .flatten()
-                .filter(|snapshot| !snapshot.projects.is_empty()),
+            Ok(snapshot) => snapshot.flatten(),
             Err(error) => {
                 notices.push(format!(
                     "Saved workspace could not be loaded: {error:#}. Original state retained; saving disabled. Use --fresh to replace it."
@@ -4095,12 +4266,23 @@ pub fn run(
             }
         }
     };
+    // `--agent-cpu` turns the limit on at its share; otherwise the saved choice stands, even
+    // once every tab was closed.
+    let (cpu_limited, cpu_percent) = match (agent_cpu, &snapshot) {
+        (Some(percent), _) => (true, percent),
+        (None, Some(saved)) => (saved.agent_cpu_limited, saved.agent_cpu_percent),
+        (None, None) => (true, limits::DEFAULT_PERCENT),
+    };
+    let snapshot = snapshot.filter(|snapshot| !snapshot.projects.is_empty());
     let server = integration::start(tx.clone())?;
+    let limiter = limits::Limiter::new(server.directory(), cpu_percent, cpu_limited);
+    notices.extend(limiter.startup_notice());
     let mut next_session = 1;
     let (restored, skipped) = match &snapshot {
         Some(snapshot) => restore_projects(
             snapshot,
             &server.socket_path,
+            &limiter,
             &tx,
             terminal.size()?,
             &mut next_session,
@@ -4188,6 +4370,7 @@ pub fn run(
         project,
         saved_projects,
         native_keys,
+        limiter: limiter.clone(),
         modal: None,
         notice: None,
         notice_sticky: false,
@@ -4352,6 +4535,8 @@ pub fn run(
     app.checkpoint(&mut store);
     signal_handle.close();
     drop(app);
+    // Panes still starting leave FIFOs that would keep the server's folder from going.
+    limiter.remove_gates();
     drop(server);
     Ok(())
 }
@@ -4377,6 +4562,7 @@ mod tests {
                         10,
                         40,
                         Some(("/bin/sleep".into(), vec!["30".into()])),
+                        None,
                     )
                     .unwrap(),
                 );
@@ -4451,6 +4637,7 @@ mod tests {
                 10,
                 40,
                 Some(("/bin/sleep".into(), vec!["30".into()])),
+                None,
             )
             .unwrap(),
         );
@@ -4554,6 +4741,7 @@ mod tests {
                     10,
                     40,
                     Some(("/bin/sleep".into(), vec!["30".into()])),
+                    None,
                 )
                 .unwrap(),
             );
@@ -4808,6 +4996,7 @@ mod tests {
                 "/bin/sh".into(),
                 vec!["-c".into(), "IFS= read -r line".into()],
             )),
+            None,
         )
         .unwrap();
         let parser = session.parser.clone();
@@ -5065,6 +5254,7 @@ mod tests {
                 "/bin/sh".into(),
                 vec!["-c".into(), "IFS= read -r line".into()],
             )),
+            None,
         )
         .unwrap();
         {
@@ -5177,6 +5367,296 @@ mod tests {
         app.close_workspace();
         assert!(app.should_quit);
         assert!(app.snapshot().projects.is_empty());
+    }
+
+    /// The exit of session `session` as its wait thread reports it, long after its start.
+    fn exited(session: u64, success: bool) -> Event {
+        let code = if success {
+            "Success"
+        } else {
+            "Exited with code 1"
+        };
+        Event::Exited {
+            session,
+            code: code.into(),
+            success,
+            ran: Duration::from_secs(5),
+        }
+    }
+
+    #[test]
+    fn ctrl_d_goes_to_the_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let output = directory.path().join("received");
+        let mut session = recording_session(1, directory.path(), app.tx.clone(), &output);
+        session.kind = "omp".into();
+        app.project.workspaces[0].sessions.push(session);
+        app.handle(Event::Input(crossterm::event::Event::Key(KeyEvent::new(
+            KeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+        ))))
+        .unwrap();
+        wait_for_file(&output, b"\x04");
+        assert!(app.modal.is_none());
+        assert_eq!(app.focused().sessions.len(), 1);
+        assert_eq!(app.focused_session().unwrap().id, 1);
+    }
+
+    #[test]
+    fn exited_split_pane_leaves_the_other_full_width_and_focused() {
+        let directory = tempfile::tempdir().unwrap();
+        // Two sessions of one workspace side by side, the second one focused; either can end.
+        for (ended, survivor) in [(2, 1), (1, 2)] {
+            let (mut app, _queued, _events) = interaction_app();
+            for id in 1..=2 {
+                let session = sleeping_session(&app, directory.path(), id);
+                app.project.workspaces[0].sessions.push(session);
+            }
+            app.project.layout = LayoutMode::Vertical;
+            app.project.secondary = Some(0);
+            app.project.secondary_session = Some(1);
+            app.project.focus_secondary = true;
+            app.handle(exited(ended, true)).unwrap();
+            assert!(app.project.layout == LayoutMode::Full);
+            assert_eq!(app.project.secondary, None);
+            assert_eq!(app.project.secondary_session, None);
+            assert_eq!(app.focused().sessions.len(), 1);
+            assert_eq!(app.focused_session().unwrap().id, survivor);
+            // A session closing inside a tab has nothing to say.
+            assert!(app.notice.is_none());
+        }
+
+        // Two workspaces side by side: the focused one's only session ends, and its tab closes.
+        let (mut app, _queued, _events) = interaction_app();
+        for (workspace, id) in [(0, 1), (1, 2)] {
+            let session = sleeping_session(&app, directory.path(), id);
+            app.project.workspaces[workspace].sessions.push(session);
+        }
+        app.project.layout = LayoutMode::Horizontal;
+        app.project.secondary = Some(1);
+        app.project.focus_secondary = true;
+        app.handle(exited(2, true)).unwrap();
+        assert!(app.project.layout == LayoutMode::Full);
+        assert_eq!(app.project.secondary, None);
+        assert_eq!(app.project.workspaces.len(), 1);
+        assert_eq!(app.focused().tree.id, "main");
+        assert_eq!(app.focused_session().unwrap().id, 1);
+        assert_eq!(app.notice.as_deref(), Some(TAB_CLOSED));
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn exited_session_gives_way_to_its_neighbour() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        for id in 1..=4 {
+            let session = sleeping_session(&app, directory.path(), id);
+            app.project.workspaces[0].sessions.push(session);
+        }
+        let ids = |app: &App| -> Vec<u64> { app.focused().sessions.iter().map(|s| s.id).collect() };
+        // The selected session gives way to the next one.
+        app.project.workspaces[0].selected = 1;
+        app.handle(exited(2, true)).unwrap();
+        assert_eq!(ids(&app), [1, 3, 4]);
+        assert_eq!(app.focused_session().unwrap().id, 3);
+        // One that is not shown leaves the selection on its session.
+        app.handle(exited(1, false)).unwrap();
+        assert_eq!(ids(&app), [3, 4]);
+        assert_eq!(app.focused_session().unwrap().id, 3);
+        // The last one gives way to the one before it.
+        app.project.workspaces[0].selected = 1;
+        app.handle(exited(4, true)).unwrap();
+        assert_eq!(ids(&app), [3]);
+        assert_eq!(app.focused_session().unwrap().id, 3);
+        assert!(app.notice.is_none());
+        assert!(app.state_dirty);
+    }
+
+    #[test]
+    fn exited_last_session_closes_its_tab_and_the_last_tab_ends_crit() {
+        let directory = tempfile::tempdir().unwrap();
+        let start = || {
+            let (mut app, queued, events) = interaction_app();
+            for (workspace, id) in [(0, 1), (1, 2)] {
+                let session = sleeping_session(&app, directory.path(), id);
+                app.project.workspaces[workspace].sessions.push(session);
+            }
+            (app, queued, events)
+        };
+        // A tab in the background closes without moving the focus.
+        let (mut app, _queued, _events) = start();
+        app.handle(exited(2, true)).unwrap();
+        assert_eq!(app.project.workspaces.len(), 1);
+        assert_eq!(app.focused_session().unwrap().id, 1);
+        assert_eq!(app.notice.as_deref(), Some(TAB_CLOSED));
+
+        let (mut app, _queued, _events) = start();
+        // An agent that quits closes like a shell that ends.
+        app.project.workspaces[1].sessions[0].kind = "omp".into();
+        app.handle(exited(1, true)).unwrap();
+        assert_eq!(app.project.workspaces.len(), 1);
+        assert_eq!(app.focused().tree.id, "other");
+        assert_eq!(app.focused_session().unwrap().id, 2);
+        assert_eq!(app.notice.as_deref(), Some(TAB_CLOSED));
+        assert!(!app.should_quit);
+        app.handle(exited(2, true)).unwrap();
+        assert!(app.should_quit);
+        // As Kitty after its last window: the next launch starts at the chooser.
+        assert!(app.snapshot().projects.is_empty());
+    }
+
+    #[test]
+    fn failed_agent_stays_with_its_exit_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let mut session = sleeping_session(&app, directory.path(), 1);
+        session.kind = "opencode".into();
+        app.project.workspaces[0].sessions.push(session);
+        app.handle(exited(1, false)).unwrap();
+        let session = app.focused_session().unwrap();
+        assert_eq!(session.id, 1);
+        assert_eq!(session.state, AgentState::Exited);
+        assert_eq!(session.message.as_deref(), Some("Exited with code 1"));
+        assert_eq!(app.project.workspaces.len(), 2);
+        assert!(app.notice.is_none());
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn agent_that_quits_as_it_starts_stays_but_a_shell_closes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        app.project.workspaces.truncate(1);
+        for id in 1..=2 {
+            let session = sleeping_session(&app, directory.path(), id);
+            app.project.workspaces[0].sessions.push(session);
+        }
+        app.project.workspaces[0].sessions[0].kind = "omp".into();
+        let at_once = |session| Event::Exited {
+            session,
+            code: "Success".into(),
+            success: true,
+            ran: App::AGENT_STARTUP - Duration::from_millis(1),
+        };
+        app.handle(at_once(2)).unwrap();
+        assert_eq!(app.focused().sessions.len(), 1);
+        // The last pane, which would take Crit with it.
+        app.handle(at_once(1)).unwrap();
+        assert!(!app.should_quit);
+        let session = app.focused_session().unwrap();
+        assert_eq!(session.state, AgentState::Exited);
+        assert_eq!(session.message.as_deref(), Some("Success"));
+    }
+
+    #[test]
+    fn exits_in_background_projects_close_there() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let session = sleeping_session(&app, directory.path(), 1);
+        app.project.workspaces[0].sessions.push(session);
+        let (mut background, _, _) = interaction_app();
+        background.project.name = "background".into();
+        background.project.order = 1;
+        // Its first tab has sessions 2 and 3, with 3 selected; its second tab has 4 alone.
+        for (workspace, id) in [(0, 2), (0, 3), (1, 4)] {
+            let session = sleeping_session(&app, directory.path(), id);
+            background.project.workspaces[workspace]
+                .sessions
+                .push(session);
+        }
+        background.project.workspaces[0].selected = 1;
+        app.saved_projects.push(background.project);
+        // A hidden session goes, and its tab keeps its selected session.
+        app.handle(exited(2, true)).unwrap();
+        let saved = &app.saved_projects[0].workspaces[0];
+        assert_eq!(saved.sessions.len(), 1);
+        assert_eq!(saved.sessions[0].id, 3);
+        assert_eq!(saved.selected, 0);
+        assert!(app.notice.is_none());
+        // A background tab left without sessions closes, and the current project stays put.
+        app.handle(exited(4, true)).unwrap();
+        assert_eq!(app.saved_projects[0].workspaces.len(), 1);
+        assert_eq!(app.notice.as_deref(), Some(TAB_CLOSED));
+        assert_eq!(app.project.workspaces.len(), 2);
+        assert_eq!(app.focused_session().unwrap().id, 1);
+        // So does a background project left without tabs.
+        app.notice = None;
+        app.handle(exited(3, true)).unwrap();
+        assert!(app.saved_projects.is_empty());
+        assert_eq!(app.notice.as_deref(), Some(TAB_CLOSED));
+        assert_eq!(app.focused_session().unwrap().id, 1);
+
+        // The current project, left without tabs, gives way to the other one.
+        let (mut app, _queued, _events) = interaction_app();
+        app.project.workspaces.truncate(1);
+        let session = sleeping_session(&app, directory.path(), 1);
+        app.project.workspaces[0].sessions.push(session);
+        let (mut background, _, _) = interaction_app();
+        background.project.name = "background".into();
+        background.project.order = 1;
+        let session = sleeping_session(&app, directory.path(), 2);
+        background.project.workspaces[0].sessions.push(session);
+        app.saved_projects.push(background.project);
+        app.handle(exited(1, true)).unwrap();
+        assert!(!app.should_quit);
+        assert_eq!(app.project.name, "background");
+        assert!(app.saved_projects.is_empty());
+        assert_eq!(app.focused_session().unwrap().id, 2);
+        assert_eq!(app.notice.as_deref(), Some(TAB_CLOSED));
+    }
+
+    #[test]
+    fn a_confirmation_about_the_focus_goes_when_its_subject_closes() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        for (workspace, id) in [(0, 1), (0, 2), (0, 3), (1, 4), (1, 5)] {
+            let session = sleeping_session(&app, directory.path(), id);
+            app.project.workspaces[workspace].sessions.push(session);
+        }
+        let asks = |app: &App, close_tab: bool| match &app.modal {
+            Some(Modal::Confirm(Confirm::CloseWorktree { .. })) => close_tab,
+            Some(Modal::Confirm(Confirm::CloseSession)) => !close_tab,
+            _ => false,
+        };
+        // The focused session goes: Close session would end the next one.
+        app.modal = Some(Modal::Confirm(Confirm::CloseSession));
+        app.handle(exited(1, true)).unwrap();
+        assert!(app.modal.is_none());
+        // The next focused session goes too, but its tab stays: Close tab still means that tab.
+        app.modal = Some(Modal::Confirm(Confirm::CloseWorktree { selected: 2 }));
+        app.handle(exited(2, true)).unwrap();
+        assert!(asks(&app, true));
+        // A session of another tab goes: the focused session is still the one to close.
+        app.modal = Some(Modal::Confirm(Confirm::CloseSession));
+        app.handle(exited(4, true)).unwrap();
+        assert!(asks(&app, false));
+        // The focused session goes with its tab: Close tab would close the next one.
+        app.modal = Some(Modal::Confirm(Confirm::CloseWorktree { selected: 2 }));
+        app.handle(exited(3, true)).unwrap();
+        assert!(app.modal.is_none());
+        assert_eq!(app.focused_session().unwrap().id, 5);
+    }
+
+    #[test]
+    fn ctrl_shift_w_on_the_last_session_closes_its_tab() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        for (workspace, id) in [(0, 1), (1, 2)] {
+            let session = sleeping_session(&app, directory.path(), id);
+            app.project.workspaces[workspace].sessions.push(session);
+        }
+        app.action(Action::CloseSession).unwrap();
+        app.modal_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.modal.is_none());
+        assert_eq!(app.project.workspaces.len(), 1);
+        assert_eq!(app.focused_session().unwrap().id, 2);
+        assert_eq!(app.notice.as_deref(), Some(TAB_CLOSED));
+        app.action(Action::CloseSession).unwrap();
+        app.modal_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .unwrap();
+        assert!(app.should_quit);
     }
 
     #[test]
@@ -5394,6 +5874,8 @@ mod tests {
             projects,
             active_project,
             native_keys: false,
+            agent_cpu_limited: true,
+            agent_cpu_percent: limits::DEFAULT_PERCENT,
         };
         // The shared split's second chat cannot start, and the current project is deleted.
         let both = snapshot(
@@ -5407,8 +5889,10 @@ mod tests {
         let (tx, _events) = mpsc::sync_channel(64);
         let socket = directory.path().join("unused.sock");
         let size = ratatui::layout::Size::new(80, 24);
+        let limiter = limits::Limiter::off();
         let mut next_session = 1;
-        let (restored, skipped) = restore_projects(&both, &socket, &tx, size, &mut next_session);
+        let (restored, skipped) =
+            restore_projects(&both, &socket, &limiter, &tx, size, &mut next_session);
         let (current, others) = restored.expect("the surviving project reopens");
         assert_eq!(current.name, "kept");
         assert!(others.is_empty());
@@ -5443,7 +5927,7 @@ mod tests {
         let before = next_session;
         let only_gone = snapshot(vec![saved(&gone, &["shell"], false)], 0);
         let (restored, skipped) =
-            restore_projects(&only_gone, &socket, &tx, size, &mut next_session);
+            restore_projects(&only_gone, &socket, &limiter, &tx, size, &mut next_session);
         assert!(restored.is_none());
         assert_eq!(skipped.len(), 1);
         assert_eq!(next_session, before);
@@ -5486,6 +5970,7 @@ mod tests {
                     "--test-threads=1".into(),
                 ],
             )),
+            None,
         )
         .unwrap();
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -5803,6 +6288,8 @@ mod tests {
             projects: Vec::new(),
             active_project: 0,
             native_keys: false,
+            agent_cpu_limited: true,
+            agent_cpu_percent: limits::DEFAULT_PERCENT,
         };
         store.as_ref().unwrap().save(&other).unwrap();
         app.state_dirty = true;
@@ -6693,6 +7180,7 @@ mod tests {
             10,
             40,
             Some(("/bin/sleep".into(), vec!["30".into()])),
+            None,
         )
         .unwrap()
     }
@@ -6722,6 +7210,7 @@ mod tests {
                     output.to_string_lossy().into_owned(),
                 ],
             )),
+            None,
         )
         .unwrap();
         // Enabled here rather than by the program, whose own output would race the test.
@@ -6799,6 +7288,7 @@ mod tests {
             },
             saved_projects: Vec::new(),
             native_keys: false,
+            limiter: limits::Limiter::off(),
             modal: None,
             notice: None,
             notice_sticky: false,
@@ -6956,6 +7446,7 @@ mod tests {
                     10,
                     40,
                     Some(("/bin/sleep".into(), vec!["30".into()])),
+                    None,
                 )
                 .unwrap(),
             );
@@ -7554,6 +8045,7 @@ mod tests {
             project: Project::terminal(parent.path()).unwrap(),
             saved_projects: Vec::new(),
             native_keys: false,
+            limiter: limits::Limiter::off(),
             modal: None,
             notice: None,
             notice_sticky: false,
@@ -7602,6 +8094,7 @@ mod tests {
             project: Project::terminal(directory.path()).unwrap(),
             saved_projects: Vec::new(),
             native_keys: false,
+            limiter: limits::Limiter::off(),
             modal: None,
             notice: None,
             notice_sticky: false,
@@ -7719,6 +8212,7 @@ mod tests {
             project: project("alpha", 0, &["main", "dev"]),
             saved_projects: vec![project("beta", 1, &["main"])],
             native_keys: false,
+            limiter: limits::Limiter::off(),
             modal: None,
             notice: None,
             notice_sticky: false,
@@ -7866,6 +8360,7 @@ mod tests {
             },
             saved_projects: Vec::new(),
             native_keys: false,
+            limiter: limits::Limiter::off(),
             modal: None,
             notice: None,
             notice_sticky: false,
@@ -8118,9 +8613,9 @@ mod tests {
             .tab_hits
             .iter()
             .find(|hit| hit.project.is_none() && hit.workspace == Some(app.focused_index()))
-            .expect("the focused workspace has no click target in the 15-column tab bar");
-        // The compact key-mode label takes the last 15 of 30 columns.
-        assert!(hit.area.width > 0 && hit.area.right() <= 15);
+            .expect("the focused workspace has no click target in the 16-column tab bar");
+        // The compact key-mode label takes the last 14 of 30 columns.
+        assert!(hit.area.width > 0 && hit.area.right() <= 16);
     }
 
     /// `interaction_app()` listing four checkouts: its two tabs, an unopened `feature/login`
@@ -8213,7 +8708,7 @@ mod tests {
         draw_frame(&mut app, &mut terminal);
         assert!(app.worktree_area.is_none() && app.worktree_hits.is_empty());
         assert_eq!(parser.lock().screen().size(), (27, 98));
-        assert!(screen_row(&terminal, 0).ends_with(" F1 ASK · F2 WORKTREES · F12 CRIT KEYS "));
+        assert!(screen_row(&terminal, 0).ends_with(" F1 · F2 · F3 CPU OFF · F12 "));
 
         app.state_dirty = false;
         assert!(app.handle(key_event(KeyCode::F(2))).unwrap());
@@ -8306,7 +8801,7 @@ mod tests {
             assert!(app.worktree_hits.is_empty());
             assert_eq!(parser.lock().screen().size(), (17, columns));
             let hint = screen_row(&terminal, 0);
-            assert!(hint.ends_with(" F1 · F2 · F12 "), "{hint:?}");
+            assert!(hint.ends_with(" F1 · F2 · F3 CPU OFF · F12 "), "{hint:?}");
         }
         // 60 columns is the first width that shows it, leaving 34 for the terminal.
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
@@ -8733,5 +9228,103 @@ mod tests {
             .unwrap();
             assert!(app.worktree_pane.is_none());
         }
+    }
+
+    #[test]
+    fn f3_retunes_the_agent_scope_through_the_worker_and_is_saved() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, queued, _events) = interaction_app();
+        app.limiter = limits::Limiter::scope(directory.path(), "crit-test.scope", 50, 8, true);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        draw_frame(&mut app, &mut terminal);
+        assert!(screen_row(&terminal, 0).ends_with(" F3 CPU 50% · F12 CRIT KEYS "));
+
+        app.handle(key_event(KeyCode::F(3))).unwrap();
+        assert!(!app.limiter.limited());
+        assert_eq!(app.notice.as_deref(), Some("Agent CPU limit off."));
+        // systemd is never waited for here: the worker retunes the running agents.
+        assert!(matches!(queued.try_recv(), Ok(Job::RetuneAgentCpu(_))));
+        let snapshot = app.snapshot();
+        assert_eq!(
+            (snapshot.agent_cpu_limited, snapshot.agent_cpu_percent),
+            (false, 50)
+        );
+        assert!(app.state_dirty);
+        draw_frame(&mut app, &mut terminal);
+        assert!(screen_row(&terminal, 0).ends_with(" F3 CPU OFF · F12 CRIT KEYS "));
+
+        app.handle(key_event(KeyCode::F(3))).unwrap();
+        assert!(app.limiter.limited());
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Agents limited to 50% of the CPU (4 of 8 cores).")
+        );
+        assert!(matches!(queued.try_recv(), Ok(Job::RetuneAgentCpu(_))));
+
+        // A retune that failed joins the notice row.
+        let report = Event::CpuLimit("could not retune".into());
+        app.handle(report).unwrap();
+        let notice = app.notice.as_deref().unwrap_or_default();
+        assert!(notice.ends_with("\ncould not retune"), "{notice:?}");
+
+        // With no room for the retune, nothing changes and F3 can be pressed again.
+        app.jobs.try_send(Job::RefreshMetadata(Vec::new())).unwrap();
+        let error = format!("{:#}", app.handle(key_event(KeyCode::F(3))).unwrap_err());
+        assert!(error.contains("command queue is busy"), "{error}");
+        assert!(app.limiter.limited());
+        assert!(matches!(queued.try_recv(), Ok(Job::RefreshMetadata(_))));
+
+        // Native mode forwards F3 to the terminal, like every key but F12.
+        let output = directory.path().join("received");
+        let session = recording_session(1, directory.path(), app.tx.clone(), &output);
+        app.project.workspaces[0].sessions.push(session);
+        app.native_keys = true;
+        app.handle(key_event(KeyCode::F(3))).unwrap();
+        wait_for_file(&output, b"\x1bOR");
+        assert!(app.limiter.limited());
+        assert!(queued.try_recv().is_err());
+    }
+
+    #[test]
+    fn f3_without_a_scope_lowers_running_agents_priority_and_says_what_stays() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, queued, _events) = interaction_app();
+        assert!(!app.limiter.limited() && !app.limiter.uses_scope());
+        let nice = |pid: u32| -> i64 {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            let fields = stat.rsplit_once(") ").unwrap().1;
+            fields.split_whitespace().nth(16).unwrap().parse().unwrap()
+        };
+        let own = nice(std::process::id());
+        let agent = Session::spawn(
+            1,
+            "omp",
+            None,
+            directory.path(),
+            &app.socket,
+            app.tx.clone(),
+            10,
+            40,
+            Some(("/bin/sleep".into(), vec!["30".into()])),
+            None,
+        )
+        .unwrap();
+        let shell = sleeping_session(&app, directory.path(), 2);
+        let (agent_pid, shell_pid) = (agent.pid().unwrap(), shell.pid().unwrap());
+        app.project.workspaces[0].sessions.extend([agent, shell]);
+
+        app.handle(key_event(KeyCode::F(3))).unwrap();
+        assert!(app.limiter.limited());
+        assert!(queued.try_recv().is_err());
+        let notice = |app: &App| app.notice.clone().unwrap_or_default();
+        assert!(notice(&app).contains("lower CPU priority"));
+        // Only the agent yields; no process can lower its niceness below its parent's.
+        assert_eq!(nice(agent_pid), own.max(10));
+        assert_eq!(nice(shell_pid), own);
+
+        app.handle(key_event(KeyCode::F(3))).unwrap();
+        assert!(!app.limiter.limited());
+        assert!(notice(&app).contains("started from now on"));
+        assert_eq!(nice(agent_pid), own.max(10));
     }
 }

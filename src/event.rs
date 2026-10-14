@@ -10,9 +10,14 @@ use std::path::PathBuf;
 pub enum Event {
     Input(crossterm::event::Event),
     Dirty(u64),
+    /// A pane's program ended; `code` says how, for the pane's header.
     Exited {
         session: u64,
         code: String,
+        /// Exit code 0, not a signal. False as well when the status could not be read.
+        success: bool,
+        /// How long the program ran: an agent that ends at once most likely did not start.
+        ran: std::time::Duration,
     },
     /// A pane's OSC 52 copy. Only the UI thread may write to the outer terminal.
     Clipboard {
@@ -89,6 +94,9 @@ pub enum Event {
         prepared: bool,
         result: Result<Environment, String>,
     },
+    /// The agent CPU limit could not be applied: what happened. It joins the notice row rather
+    /// than replacing it, as it can arrive at any time.
+    CpuLimit(String),
     Error(String),
     Shutdown,
 }

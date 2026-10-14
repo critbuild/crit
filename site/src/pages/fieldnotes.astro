@@ -242,9 +242,10 @@ const shellPanes: Pane[] = [
 ];
 
 const ledger = [
-  ['Inside OMP or OpenCode', 'Selects this worktree’s shell, or opens one. The agent keeps running.'],
-  ['Inside a shell', 'End of input, exactly as it has always been.'],
-  ['Native Kitty mode (F12)', 'Forwarded to the focused terminal, untouched.'],
+  ['Inside OMP or OpenCode', 'Reaches the agent, which quits on it. Its pane closes; a split’s other half goes full width.'],
+  ['Inside a shell', 'End of input, exactly as it has always been. The shell ends and its pane closes the same way.'],
+  ['In the last session of a tab', 'The tab closes; the checkout and its Docker stack stay. The last tab closes Crit.'],
+  ['Native Kitty mode (F12)', 'Forwarded to the focused terminal, untouched, as every key is.'],
 ];
 
 const envCommands = [
@@ -264,7 +265,7 @@ const boundaries = [
 const guide = [
   {
     q: 'Which tools does Crit launch?',
-    a: 'OMP, OpenCode and plain shells. Each interactive startup runs omp update and opencode upgrade before launching agents; if an update fails, Crit shows the diagnostic and continues with the installed version.',
+    a: 'OMP, OpenCode and plain shells. At most once a day, Crit runs omp update and opencode upgrade in the background while the workspace opens; agents start at once with the installed version. If an update fails, Crit shows the diagnostic and continues with the installed version.',
   },
   {
     q: 'What does Ask Crit send, and where?',
@@ -348,7 +349,7 @@ const prerequisites = [
         <aside class="fn-hero-margin" aria-label="In brief">
           <ol class="fn-notes">
             <li><b>a.</b><span>Every branch gets a Git worktree of its own, and every worktree a tab.</span></li>
-            <li><b>b.</b><span>Ctrl+D in an agent drops into that worktree’s shell. The agent keeps running.</span></li>
+            <li><b>b.</b><span>Ctrl+Shift+Enter opens a shell beside the agent, which keeps running. Ctrl+D closes one tier at a time, like Kitty.</span></li>
             <li><b>c.</b><span>F1 asks in plain words through your authenticated OMP. F2 lists the same controls.</span></li>
             <li><b>d.</b><span>Optional Docker Compose per worktree, with loopback ports allocated on the fly.</span></li>
           </ol>
@@ -364,7 +365,7 @@ const prerequisites = [
         />
         <ol class="fn-legend">
           <li><span class="fn-legend-num">1</span><span>One tab per worktree, each a real checkout on disk. The mark is the session state: <code>*</code> working, <code>·</code> idle, <code>!</code> needs input.</span></li>
-          <li><span class="fn-legend-num">2</span><span>An agent and a shell share the worktree. <kbd>Ctrl+D</kbd> hops from the agent to the shell; the agent keeps working.</span></li>
+          <li><span class="fn-legend-num">2</span><span>An agent and a shell share the worktree. <kbd>Ctrl+Shift+Enter</kbd> opens the shell beside the agent; the agent keeps working.</span></li>
           <li><span class="fn-legend-num">3</span><span>Two worktrees side by side. With Compose configured, each stack has its own project and loopback ports.</span></li>
         </ol>
       </figure>
@@ -452,7 +453,7 @@ const prerequisites = [
           <h2 id="shell-title" class="fn-h2">The shell is never far.</h2>
           <p class="fn-lead">Agents are good company until you need to run one command yourself. Crit keeps a shell in every worktree, one keystroke from the agent working there.</p>
           <div class="fn-prose">
-            <p>Inside an OMP or OpenCode session, <kbd>Ctrl+D</kbd> selects that worktree’s shell, or opens one, and the agent keeps running exactly where you left it. Inside a shell, <kbd>Ctrl+D</kbd> stays what it has always been: end of input. Nothing is remapped out from under you.</p>
+            <p>Inside an OMP or OpenCode session, <kbd>Ctrl+Shift+Enter</kbd> opens that worktree’s shell beside the agent, which keeps running exactly where you left it. <kbd>Ctrl+D</kbd> is not remapped: it goes to whatever has focus, as in Kitty. OMP and OpenCode quit on it and their pane closes; in a shell it stays end of input. A pane whose program ends closes like a Kitty window: a split’s survivor takes the full width, an empty tab closes, the last tab closes Crit. An agent that fails stays on screen with its exit status.</p>
           </div>
           <dl class="fn-ledger" aria-label="What Ctrl+D does">
             {ledger.map(([where, what]) => (
@@ -463,9 +464,9 @@ const prerequisites = [
             <FieldnotesWorkspace
               projects={[critProject('feat/login-fixes')]}
               panes={shellPanes}
-              description="Illustrative workspace after Ctrl+D: the shell session is selected while omp 1 is still working"
+              description="Illustrative workspace after Ctrl+Shift+Enter: the shell session is selected while omp 1 is still working"
             />
-            <figcaption><b>Fig. 2</b> · After <kbd>Ctrl+D</kbd>. The shell is selected; <code>omp 1 · working</code> carries on in the same worktree. Illustrative workspace.</figcaption>
+            <figcaption><b>Fig. 2</b> · After <kbd>Ctrl+Shift+Enter</kbd>. The shell is selected; <code>omp 1 · working</code> carries on in the same worktree. Illustrative workspace.</figcaption>
           </figure>
         </div>
         <aside class="fn-margin" aria-label="Session shortcuts">
