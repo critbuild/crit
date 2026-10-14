@@ -92,6 +92,9 @@ APPEARANCE
   the right, and no blank column between them. Drag either grip without changing focus.
   Each pane keeps a usable minimum width; the proportion follows window resizing
   and is saved per project. Narrow windows show one pane until both fit again.
+  After a pane changes size, Crit waits for the app's repaint before drawing
+  it, so a resize never shows cut-off lines; apps that do not repaint are
+  drawn after a short pause.
 
 COPY, PASTE, AND LINKS
   Drag terminal text to select it and copy to the clipboard and primary selection.

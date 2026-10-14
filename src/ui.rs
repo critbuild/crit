@@ -160,7 +160,10 @@ fn pane_target(project: &Project, pane: usize, count: usize) -> (usize, usize, b
     (workspace, project.pane_session(secondary), secondary)
 }
 
+/// Sizes the sessions the next frame draws and lists them in `app.next_panes`, so that the frame
+/// can be held for them before it has drawn and filled `app.panes`.
 pub fn resize_sessions(app: &mut App, size: Size) -> Result<()> {
+    app.next_panes.clear();
     // Nothing is drawn below the minimum; keep the last usable PTY size.
     if size.width < 30 || size.height < 10 {
         return Ok(());
@@ -187,6 +190,7 @@ pub fn resize_sessions(app: &mut App, size: Size) -> Result<()> {
                 app.selection = None;
             }
             session.resize(rect.height, rect.width)?;
+            app.next_panes.push((index, selected));
         }
     }
     Ok(())

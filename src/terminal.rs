@@ -27,6 +27,19 @@ const INPUT_QUEUE: usize = 4096;
 /// never ends its update must not freeze the pane; terminals bound the mode the same way.
 const SYNC_HOLD: Duration = Duration::from_millis(100);
 
+/// How long after a resize a pane's frame keeps waiting out its app's output bursts, each until
+/// the app has been quiet for `RESIZE_QUIET`: an app settles in passes, and OMP re-renders
+/// everything about 140 ms after the resize. An app that keeps writing must not freeze the pane.
+const RESIZE_SETTLE_MAX: Duration = Duration::from_millis(400);
+
+/// How long it waits for an app that has painted nothing since the resize. One that does not
+/// repaint on a resize, like `sleep` or `cat`, is drawn with its grid cut, as Kitty shows it.
+const RESIZE_SILENT_MAX: Duration = Duration::from_millis(80);
+
+/// How long an app's output must have been quiet before its resized pane is drawn. An app
+/// repaints in a burst: OMP follows a full re-render with a correction 17 ms later.
+const RESIZE_QUIET: Duration = Duration::from_millis(30);
+
 /// Everything bound for a pane's PTY. One queue keeps typed input and terminal
 /// replies in order, and only the writer thread ever blocks on the PTY.
 enum Input {
@@ -55,6 +68,11 @@ pub struct Session {
     size: (u16, u16),
     /// The app's open synchronized update, shared with the parser's callbacks.
     sync: Arc<AtomicU64>,
+    /// When the pane last changed size while it showed something, as `clock` stamps it; 0 while
+    /// no resize waits for its app to repaint. Only the UI thread writes it, see `settling`.
+    resized: AtomicU64,
+    /// When the reader last processed output since that resize, as `clock` stamps it; 0: none.
+    quiet_since: Arc<AtomicU64>,
 }
 
 impl Session {
@@ -140,9 +158,11 @@ impl Session {
         let dirty = Arc::new(AtomicBool::new(true));
         let alive = Arc::new(AtomicBool::new(true));
         let output = Arc::new(AtomicBool::new(false));
+        let quiet_since = Arc::new(AtomicU64::new(0));
         let reader_parser = parser.clone();
         let reader_dirty = dirty.clone();
         let reader_output = output.clone();
+        let reader_quiet = quiet_since.clone();
         let wait_alive = alive.clone();
         let wait_tx = tx.clone();
         // The child is running; a thread that cannot start must not leave it unreaped.
@@ -168,6 +188,8 @@ impl Session {
                             let copy = {
                                 let mut parser = reader_parser.lock();
                                 parser.process(&buffer[..count]);
+                                // A resized pane is drawn once its app's output has gone quiet.
+                                reader_quiet.store(clock(), Ordering::Release);
                                 // Terminal setup (alternate screen, mouse modes, queries) and
                                 // a screen of blanks show nothing, and an app can send both
                                 // seconds before its first frame: the pane has output once a
@@ -235,6 +257,8 @@ impl Session {
             pid,
             size: (rows, cols),
             sync,
+            resized: AtomicU64::new(0),
+            quiet_since,
         })
     }
 
@@ -253,6 +277,14 @@ impl Session {
             parser.screen_mut().set_size(size.0, size.1);
             self.size = size;
             self.dirty.store(true, Ordering::Release);
+            // A pane with something on it is drawn again once its app has repainted at the new
+            // size. One that has painted nothing shows a placeholder, and its first frame must
+            // not wait.
+            if self.has_output() {
+                // Output from before the resize is not the app's answer to it.
+                self.quiet_since.store(0, Ordering::Release);
+                self.resized.store(clock(), Ordering::Release);
+            }
         }
         Ok(())
     }
@@ -332,6 +364,39 @@ impl Session {
         held(self.sync.load(Ordering::Acquire), clock())
     }
 
+    /// Whether the app in this pane has yet to repaint after the pane changed size, so that
+    /// drawing now would show its old content cut to the new grid. The app is waited for until
+    /// its output has been quiet for `RESIZE_QUIET`, or for `RESIZE_SILENT_MAX` if it paints
+    /// nothing, as `sleep` and `cat` do not. Output that follows within `RESIZE_SETTLE_MAX`, such
+    /// as a settle pass, is waited out the same way. The resize is then forgotten, so that
+    /// later output never holds a frame.
+    pub fn settling(&self) -> bool {
+        self.settling_at(clock())
+    }
+
+    /// `settling` as of `now`.
+    fn settling_at(&self, now: u64) -> bool {
+        let resized = self.resized.load(Ordering::Acquire);
+        if resized == 0 {
+            return false;
+        }
+        let quiet_since = self.quiet_since.load(Ordering::Acquire);
+        let since = |stamp: u64| Duration::from_millis(now.saturating_sub(stamp));
+        if since(resized) >= RESIZE_SETTLE_MAX
+            || (quiet_since == 0 && since(resized) >= RESIZE_SILENT_MAX)
+        {
+            self.resized.store(0, Ordering::Release);
+            return false;
+        }
+        quiet_since == 0 || since(quiet_since) < RESIZE_QUIET
+    }
+
+    /// Whether drawing this pane now would show it half done: its app is partway through a
+    /// synchronized update, or has yet to repaint after a resize.
+    pub fn holds_frame(&self) -> bool {
+        self.synchronized() || self.settling()
+    }
+
     /// Whether the program in this pane has painted anything yet: a visible character on its
     /// screen. Until it has, the pane is blank. Terminal setup (alternate screen, mouse modes,
     /// queries) and blanks paint nothing, and an agent can send them seconds before its first
@@ -344,6 +409,13 @@ impl Session {
     #[cfg(test)]
     pub fn mark_output(&self) {
         self.output.store(true, Ordering::Release);
+    }
+
+    /// Stamps output as the reader does, for tests that put the program's output in `parser`
+    /// directly.
+    #[cfg(test)]
+    pub fn note_output(&self) {
+        self.quiet_since.store(clock(), Ordering::Release);
     }
 
     /// The agent whose TUI this pane's shell runs in the foreground, if any.
@@ -862,6 +934,80 @@ mod tests {
         assert_eq!(stamp(&parser), 0);
         // Setting and resetting the mode send no reply of their own.
         assert!(queue.try_recv().is_err());
+    }
+
+    #[test]
+    fn resize_settles_until_the_app_repaints_or_goes_quiet() {
+        let (tx, _events) = std::sync::mpsc::sync_channel(32);
+        let mut session = spawn_program("/bin/sh", &["-c", "printf ready; exec sleep 30"], tx);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session.has_output() {
+            assert!(Instant::now() < deadline, "the program never painted");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The reader stamps the output it processes, before the pane counts as painted.
+        assert_ne!(session.quiet_since.load(Ordering::Acquire), 0);
+        // Nothing waits until the pane changes size, and its own size is no change.
+        assert!(!session.settling());
+        session.resize(24, 80).unwrap();
+        assert!(!session.settling());
+        // A resize waits for the app's answer: what it wrote before is not one.
+        session.resize(10, 40).unwrap();
+        assert_eq!(session.quiet_since.load(Ordering::Acquire), 0);
+        assert!(session.settling());
+        // Once its output has been quiet the pane is drawn.
+        session.note_output();
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(!session.settling());
+        // Each resize starts a new wait.
+        session.resize(12, 50).unwrap();
+        assert_eq!(session.quiet_since.load(Ordering::Acquire), 0);
+        assert!(session.settling());
+
+        // The wait at `now`, for a resize stamped 1000 and the app's last output since (0: none).
+        let waits = |session: &Session, quiet_since: u64, now: u64| {
+            session.resized.store(1_000, Ordering::Release);
+            session.quiet_since.store(quiet_since, Ordering::Release);
+            session.settling_at(now)
+        };
+        // An app that has not answered is waited for, but `sleep` and `cat` never will.
+        assert!(waits(&session, 0, 1_000));
+        assert!(waits(&session, 0, 1_000 + 79));
+        assert!(!waits(&session, 0, 1_000 + 80));
+        // Such an app is forgotten, and its later output holds nothing.
+        assert_eq!(session.resized.load(Ordering::Acquire), 0);
+        session.quiet_since.store(1_200, Ordering::Release);
+        assert!(!session.settling_at(1_200));
+        // Output is waited out until it has been quiet for 30 ms.
+        assert!(waits(&session, 1_010, 1_010));
+        assert!(waits(&session, 1_010, 1_010 + 29));
+        assert!(!waits(&session, 1_010, 1_010 + 30));
+        // The app's next pass, as OMP's settle pass 140 ms on, is waited out the same way.
+        session.quiet_since.store(1_150, Ordering::Release);
+        assert!(session.settling_at(1_150));
+        assert!(session.settling_at(1_150 + 29));
+        assert!(!session.settling_at(1_150 + 30));
+        // An app that never stops writing is let through 400 ms after the resize.
+        assert!(waits(&session, 1_399, 1_399));
+        assert!(!waits(&session, 1_399, 1_400));
+        assert_eq!(session.resized.load(Ordering::Acquire), 0);
+        // Without a resize there is nothing to wait for.
+        session.quiet_since.store(1_400, Ordering::Release);
+        assert!(!session.settling_at(1_400));
+    }
+
+    #[test]
+    fn resize_before_first_paint_does_not_settle() {
+        let (tx, _events) = std::sync::mpsc::sync_channel(32);
+        let mut session = spawn_program("/bin/sleep", &["30"], tx);
+        // A pane that has painted nothing shows a placeholder; its first frame must not wait.
+        session.resize(10, 40).unwrap();
+        assert!(!session.settling());
+        assert!(!session.holds_frame());
+        session.mark_output();
+        session.resize(12, 50).unwrap();
+        assert!(session.settling());
+        assert!(session.holds_frame());
     }
 
     #[test]

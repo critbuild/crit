@@ -626,6 +626,9 @@ pub struct App {
     /// The notice is a warning that terminal input must not dismiss.
     notice_sticky: bool,
     pub panes: Vec<Pane>,
+    /// The `(workspace, session)` of each pane the next frame draws, as `ui::resize_sessions`
+    /// last sized them. `panes` is only what the last frame drew, and empty after a layout change.
+    pub next_panes: Vec<(usize, usize)>,
     scroll_drag: Option<(u64, u16)>,
     /// The session and pane body that received a forwarded press, until its release.
     mouse_capture: Option<(u64, Rect)>,
@@ -1154,18 +1157,37 @@ impl App {
         false
     }
 
-    /// Whether a pane the next frame draws has an app partway through a synchronized update
-    /// (DEC mode 2026): drawing now would show half a repaint, so the frame waits for the
-    /// end of the update, or for the hold `Session::synchronized` allows to run out. `panes`
-    /// is what the last frame drew, and empty once the layout changed, which holds nothing.
+    /// Whether a pane the next frame draws should wait: its app is partway through a
+    /// synchronized update (DEC mode 2026), or has not repainted since the pane changed size.
+    /// Drawing now would show half a repaint, so the frame waits for the app, or for the holds
+    /// `Session::holds_frame` allows to run out. `next_panes` says what the frame draws, even
+    /// right after a layout change; `panes` is what the last frame drew, and the fallback.
+    /// A divider being dragged resizes its panes with every pointer move: they are drawn as they
+    /// are, and waited for once it is let go.
     fn frame_held(&self) -> bool {
-        self.panes.iter().any(|pane| {
+        let dragging = self.split_drag.is_some();
+        let held = |workspace: usize, session: usize| {
             self.project
                 .workspaces
-                .get(pane.workspace)
-                .and_then(|workspace| workspace.sessions.get(pane.session))
-                .is_some_and(Session::synchronized)
-        })
+                .get(workspace)
+                .and_then(|workspace| workspace.sessions.get(session))
+                .is_some_and(|session| {
+                    if dragging {
+                        session.synchronized()
+                    } else {
+                        session.holds_frame()
+                    }
+                })
+        };
+        if self.next_panes.is_empty() {
+            self.panes
+                .iter()
+                .any(|pane| held(pane.workspace, pane.session))
+        } else {
+            self.next_panes
+                .iter()
+                .any(|&(workspace, session)| held(workspace, session))
+        }
     }
 
     pub fn focused_index(&self) -> usize {
@@ -4076,6 +4098,7 @@ pub fn run(
         notice: None,
         notice_sticky: false,
         panes: Vec::with_capacity(2),
+        next_panes: Vec::with_capacity(2),
         scroll_drag: None,
         mouse_capture: None,
         selection: None,
@@ -4131,7 +4154,12 @@ pub fn run(
         }
     }
     let frame_interval = Duration::from_millis(16);
+    // The longest a frame stays held while panes keep repainting: a window drag resizes
+    // them with every pointer move, and an app can stream output after a resize. Either
+    // would otherwise freeze the screen until the resize is forgotten.
+    let max_hold = Duration::from_millis(120);
     let mut last_draw = Instant::now() - frame_interval;
+    let mut held_since: Option<Instant> = None;
     let mut redraw = true;
     while !app.should_quit {
         app.refresh_metadata();
@@ -4140,16 +4168,24 @@ pub fn run(
             app.append_notice(&failures.join("\n"));
             redraw = true;
         }
-        if redraw && last_draw.elapsed() >= frame_interval && !app.frame_held() {
+        if redraw && last_draw.elapsed() >= frame_interval {
+            // Sized before the hold is checked: the resize is what makes an app repaint, and
+            // a frame drawn before that would show the pane's old content cut to its new size.
             ui::resize_sessions(&mut app, terminal.size()?)?;
-            draw_frame(&mut terminal, |frame| ui::draw(frame, &mut app))?;
-            redraw = false;
-            last_draw = Instant::now();
+            let overdue = held_since.is_some_and(|since| since.elapsed() >= max_hold);
+            if overdue || !app.frame_held() {
+                draw_frame(&mut terminal, |frame| ui::draw(frame, &mut app))?;
+                redraw = false;
+                last_draw = Instant::now();
+                held_since = None;
+            } else if held_since.is_none() {
+                held_since = Some(Instant::now());
+            }
         }
         redraw |= app.checkpoint(&mut store);
         let event = if redraw {
-            // A frame held for an app's update is retried every few ms, so that it goes out
-            // right after the app ends the update, or once the hold runs out.
+            // A frame held for an app's update or repaint is retried every few ms, so that it
+            // goes out right after the app is done, or once the hold runs out.
             let wait = if app.frame_held() {
                 Duration::from_millis(4)
             } else {
@@ -4308,10 +4344,54 @@ mod tests {
         assert!(app.frame_held());
         parser.lock().process(b"\x1b[?2026l");
         assert!(!app.frame_held());
-        // A layout change empties `panes`, and the next frame is not held for the old list.
+        // A layout change empties `panes`; the frame still waits for the sessions it will draw.
         parser.lock().process(b"\x1b[?2026h");
         assert!(app.frame_held());
         app.panes.clear();
+        assert!(app.frame_held());
+        // Without that list it falls back to what the last frame drew, and with neither, holds
+        // nothing.
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        app.next_panes.clear();
+        assert!(app.frame_held());
+        app.panes.clear();
+        assert!(!app.frame_held());
+    }
+
+    #[test]
+    fn layout_changes_wait_for_the_pane_to_repaint() {
+        let (mut app, _queued, _events) = interaction_app();
+        let directory = tempfile::tempdir().unwrap();
+        let session = sleeping_session(&app, directory.path(), 1);
+        let parser = session.parser.clone();
+        app.project.workspaces[0].sessions.push(session);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        draw_frame(&mut app, &mut terminal);
+        assert_eq!(parser.lock().screen().size(), (21, 118));
+
+        // A pane that has painted nothing shows a placeholder, so no resize holds its frame.
+        app.handle(key_event(KeyCode::F(2))).unwrap();
+        ui::resize_sessions(&mut app, terminal.size().unwrap()).unwrap();
+        assert_eq!(parser.lock().screen().size(), (21, 78));
+        assert!(!app.frame_held());
+        draw_frame(&mut app, &mut terminal);
+
+        // One that has painted is held, though the layout change emptied `panes`.
+        app.project.workspaces[0].sessions[0].mark_output();
+        app.handle(key_event(KeyCode::F(2))).unwrap();
+        assert!(app.panes.is_empty());
+        ui::resize_sessions(&mut app, terminal.size().unwrap()).unwrap();
+        assert_eq!(parser.lock().screen().size(), (21, 118));
+        assert_eq!(app.next_panes, [(0, 0)]);
+        assert!(app.frame_held());
+        // The pointer resizes a dragged divider's panes with every move; they are not waited for.
+        app.split_drag = Some(0);
+        assert!(!app.frame_held());
+        app.split_drag = None;
+        assert!(app.frame_held());
+        // Once its app has repainted and gone quiet, the frame is drawn.
+        app.project.workspaces[0].sessions[0].note_output();
+        std::thread::sleep(Duration::from_millis(40));
         assert!(!app.frame_held());
     }
 
@@ -6527,6 +6607,7 @@ mod tests {
             notice: None,
             notice_sticky: false,
             panes: Vec::new(),
+            next_panes: Vec::new(),
             scroll_drag: None,
             mouse_capture: None,
             selection: None,
@@ -7281,6 +7362,7 @@ mod tests {
             notice: None,
             notice_sticky: false,
             panes: Vec::new(),
+            next_panes: Vec::new(),
             scroll_drag: None,
             mouse_capture: None,
             selection: None,
@@ -7328,6 +7410,7 @@ mod tests {
             notice: None,
             notice_sticky: false,
             panes: Vec::new(),
+            next_panes: Vec::new(),
             scroll_drag: None,
             mouse_capture: None,
             selection: None,
@@ -7444,6 +7527,7 @@ mod tests {
             notice: None,
             notice_sticky: false,
             panes: Vec::new(),
+            next_panes: Vec::new(),
             scroll_drag: None,
             mouse_capture: None,
             selection: None,
@@ -7590,6 +7674,7 @@ mod tests {
             notice: None,
             notice_sticky: false,
             panes: Vec::new(),
+            next_panes: Vec::new(),
             scroll_drag: None,
             mouse_capture: None,
             selection: None,
