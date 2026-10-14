@@ -45,8 +45,8 @@ folders and worktrees; switch projects from the tab bar, F1, or F1 then F2.
 F2 opens a worktree pane on the right: click a branch to open or focus its tab,
 click 🗑 to delete the checkout (confirmation required), × or F2 closes it.
 Ctrl+Shift+, or . opens a split picker:
-New worktree creates a separate checkout; Split terminal opens another session
-in the same folder. Existing branch/worktree opens a destination picker.
+New worktree creates a separate checkout; Split terminal opens a shell in the
+same folder. Existing branch/worktree opens a destination picker.
 Ctrl+Shift+Enter opens a session.
 F12 persistently toggles Crit/native Kitty shortcuts. Run `crit setup kitty` once
 to enable the window-scoped mappings.
@@ -230,10 +230,11 @@ PROJECTS
   dialog is open.
   The split picker offers New worktree, Split terminal, and Existing branch/worktree.
   New worktree asks for a branch name and leaves the first pane's branch alone.
-  Split terminal starts an independent session of the current agent/shell kind
-  in the same folder, without creating a branch, worktree, or Docker environment.
-  It also works in non-Git folders. Mouse clicks or Ctrl+Shift+[ / ] switch panes.
-  Ctrl+Shift+W closes the focused session; its peer stays running.
+  Split terminal starts a shell in the same folder, whatever the focused pane
+  runs, without creating a branch, worktree, or Docker environment: a terminal
+  beside the agent. Ctrl+D in the agent then leaves the terminal at full
+  width. It also works in non-Git folders. Mouse clicks or Ctrl+Shift+[ / ]
+  switch panes. Ctrl+Shift+W closes the focused session; its peer stays running.
   Existing branch/worktree lists other registered checkouts and local branches
   without checkouts. Up/Down selects; Enter opens; Esc returns to the split menu.
   Existing checkouts keep their files and sessions. An unchecked-out branch gets

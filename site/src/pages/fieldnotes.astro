@@ -158,7 +158,7 @@ const requests: Request[] = [
       },
     ],
     note:
-      'The split picker offers New worktree for a separate checkout, Split terminal for another session in the same folder, and Existing branch/worktree for a list of checkouts and local branches. Existing checkouts are reused; a branch without one gets its own worktree at its own commit. Ctrl+Shift+, opens the picker by hand. Ctrl+Shift+L cycles full, vertical and horizontal layouts; returning to full width keeps the focused session.',
+      'The split picker offers New worktree for a separate checkout, Split terminal for a shell in the same folder beside whatever the pane runs, and Existing branch/worktree for a list of checkouts and local branches. Existing checkouts are reused; a branch without one gets its own worktree at its own commit. Ctrl+Shift+, opens the picker by hand. Ctrl+Shift+L cycles full, vertical and horizontal layouts; returning to full width keeps the focused session.',
   },
   {
     id: 'logs',
@@ -386,7 +386,7 @@ const prerequisites = [
         </div>
         <aside class="fn-margin" aria-label="Shortcuts for rooms">
           <p><kbd>Ctrl+Shift+T</kbd><br />New tab: a worktree here, another project folder, or an open project.</p>
-          <p><kbd>Ctrl+Shift+,</kbd> <kbd>Ctrl+Shift+.</kbd><br />Split side by side, or top and bottom. Choose New worktree, Split terminal in the same folder, or Existing branch/worktree to pick a checkout or local branch.</p>
+          <p><kbd>Ctrl+Shift+,</kbd> <kbd>Ctrl+Shift+.</kbd><br />Split side by side, or top and bottom. Choose New worktree, Split terminal for a shell in the same folder, or Existing branch/worktree to pick a checkout or local branch.</p>
           <p><kbd>Ctrl+Shift+Q</kbd><br />Close only, close and delete the worktree, or cancel. No is selected by default.</p>
           <p>Worktrees live under <code>.crit-worktrees/</code> beside the repository, one directory per branch.</p>
         </aside>

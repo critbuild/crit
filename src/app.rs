@@ -37,7 +37,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayoutMode {
     Full,
     Vertical,
@@ -1606,16 +1606,14 @@ impl App {
         Ok(())
     }
 
+    /// Opens a shell in the focused workspace's folder beside the focused session, whatever
+    /// that session runs: a terminal next to the agent, as its name says, so that Ctrl+D in
+    /// the agent leaves the terminal at full width rather than another agent.
     fn split_terminal(&mut self, layout: LayoutMode) -> Result<()> {
         let index = self.focused_index();
         self.ensure_session(index)?;
         let selected = self.focused_session_index();
-        let kind = match self.focused_session().map(|session| session.kind.as_str()) {
-            Some("omp") => "omp",
-            Some("opencode") => "opencode",
-            _ => "shell",
-        };
-        self.spawn(index, kind, None)?;
+        self.spawn(index, "shell", None)?;
         let secondary = self.project.workspaces[index].sessions.len() - 1;
         self.workspace_changed();
         self.project.workspaces[index].selected = selected;
@@ -7587,6 +7585,42 @@ mod tests {
             sandbox_due: Instant::now(),
         };
         (app, queued, events)
+    }
+
+    #[test]
+    fn split_terminal_opens_a_shell_beside_the_focused_agent() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        // A real folder, since the shell starts there.
+        app.project.workspaces[0].tree.path = directory.path().to_owned();
+        let mut agent = sleeping_session(&app, directory.path(), 1);
+        agent.kind = "omp".into();
+        app.project.workspaces[0].sessions.push(agent);
+        app.next_session = 2;
+        app.modal = Some(Modal::Split {
+            layout: LayoutMode::Vertical,
+            selected: 1,
+        });
+        app.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let sessions = &app.project.workspaces[0].sessions;
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(
+            (sessions[0].kind.as_str(), sessions[1].kind.as_str()),
+            ("omp", "shell")
+        );
+        // The shell takes the new pane and the focus; the agent keeps its pane.
+        assert_eq!(app.project.layout, LayoutMode::Vertical);
+        assert_eq!(app.project.secondary, Some(0));
+        assert_eq!(app.project.secondary_session, Some(1));
+        assert!(app.project.focus_secondary);
+        assert_eq!(app.project.workspaces[0].selected, 0);
+        assert_eq!(app.focused_session().unwrap().kind, "shell");
+        // The agent quitting leaves the terminal at full width, not another agent.
+        app.handle(exited(1, true)).unwrap();
+        assert_eq!(app.project.layout, LayoutMode::Full);
+        assert_eq!(app.focused().sessions.len(), 1);
+        assert_eq!(app.focused_session().unwrap().kind, "shell");
     }
 
     #[test]

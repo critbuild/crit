@@ -32,8 +32,9 @@ Deletion shows progress or a persistent refusal; Enter goes back and Esc dismiss
 Branch labels follow external Git switches and renames without restarting sessions.
 Split offers New worktree, Split terminal, and Existing branch/worktree.
 New worktree asks for a branch name.
-Split terminal opens an independent session in the same folder, including outside
-Git. No branch or checkout is created. Closing a split session keeps its peer alive.
+Split terminal opens a shell in the same folder, including outside Git, whatever
+the focused pane runs. No branch or checkout is created. Closing a split session
+leaves its peer at full width.
 Existing branch/worktree opens a picker: choose a checkout or local branch with
 Up/Down and Enter; Esc goes back. Checkouts are reused; unchecked-out branches get
 their own worktree at their own commit. The first pane's branch/session stay put.
