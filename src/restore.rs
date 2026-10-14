@@ -215,8 +215,13 @@ impl Drop for Store {
 
 impl Store {
     pub fn open() -> Result<Self> {
-        let base = match std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
-            Some(value) => PathBuf::from(value),
+        // The XDG spec says a relative XDG_STATE_HOME is invalid and must be ignored, as
+        // `compose::manifest` does; the Compose state and this store then share one base.
+        let base = match std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+        {
+            Some(base) => base,
             None => PathBuf::from(
                 std::env::var_os("HOME")
                     .filter(|value| !value.is_empty())
@@ -280,6 +285,12 @@ impl Store {
             directory_file,
             lock,
         })
+    }
+
+    /// The private state directory this store owns. Other state that belongs to the window
+    /// owning the saved workspace, such as when the updaters last ran, is kept here too.
+    pub fn directory(&self) -> &Path {
+        &self.directory
     }
 
     /// A load error never modifies snapshot bytes. The caller must disable saving

@@ -24,8 +24,18 @@
 //!   OSC 8 link, and OSC 8 URIs that vte may have truncated are ignored.
 //! - [`Parser::process`] drops OSC strings longer than 8 MiB instead of
 //!   buffering them.
-//! - `Row::new` builds its cells without a per-element clone, and scrolled
-//!   rows are reused instead of reallocated.
+//! - `Row::new` builds its cells without a per-element clone, and rows that
+//!   scroll out or that IL, DL and SD push out are reused instead of
+//!   reallocated.
+//! - [`Screen::visible_rows`] reads the screen a row at a time (exporting
+//!   [`Row`]), since [`Screen::cell`] finds the row again on every call, and
+//!   [`Screen::has_text`] answers whether the screen shows any text without
+//!   building [`Screen::contents`].
+//! - The OSC 8 URI is held behind a thin pointer, so that a cell is 48 bytes
+//!   on 64-bit targets rather than 56, and [`Cell::contents`] does not
+//!   validate its UTF-8 again on every call.
+//! - Unhandled CSI sequences reach [`Callbacks::unhandled_csi`] without a
+//!   heap allocation for their parameter list.
 //!
 //! # Overview
 //!
@@ -92,4 +102,5 @@ pub use attrs::Color;
 pub use callbacks::Callbacks;
 pub use cell::Cell;
 pub use parser::Parser;
+pub use row::Row;
 pub use screen::{MouseProtocolEncoding, MouseProtocolMode, Screen};

@@ -1,6 +1,6 @@
 // Regression tests for the local emulator fixes listed in the crate docs.
 use crate::parser::MAX_OSC_LEN;
-use crate::{Callbacks, Color, Parser, Screen};
+use crate::{Callbacks, Cell, Color, Parser, Screen};
 use std::time::{Duration, Instant};
 
 /// The number of rows in the scrollback, leaving the view where it was.
@@ -264,11 +264,42 @@ fn reused_rows_are_blank_and_match_the_current_width() {
     }
 }
 
+#[test]
+fn rows_that_il_dl_and_sd_push_out_come_back_blank() {
+    // (the operation, and the row of the scroll region it leaves blank)
+    for (ops, blank) in [
+        ("\x1b[2;1H\x1b[L", 1),
+        ("\x1b[2;1H\x1b[M", 2),
+        ("\x1b[T", 1),
+        ("\x1b[2;1H\x1bM", 1),
+    ] {
+        let mut parser = Parser::new(4, 6, 0);
+        // every row is styled and linked, and all but the last are wrapped
+        parser.process(b"\x1b]8;;https://example.com/\x1b\\\x1b[31;1;44m");
+        parser.process(b"AAAAAABBBBBBCCCCCCDDDDDD");
+        parser.process(b"\x1b]8;;\x1b\\\x1b[0m\x1b[2;3r");
+        parser.process(ops.as_bytes());
+        let screen = parser.screen();
+        assert!(!screen.row_wrapped(blank), "{ops:?}");
+        for col in 0..6 {
+            let cell = screen.cell(blank, col).unwrap();
+            assert!(!cell.has_contents(), "{ops:?} cell({blank}, {col})");
+            assert_eq!(cell.hyperlink(), None);
+            assert_eq!(cell.bgcolor(), Color::Default);
+            assert!(!cell.bold());
+        }
+        assert!(screen.cell(blank, 6).is_none());
+    }
+}
+
 #[derive(Default)]
 struct Recorder {
     /// The type and the length of the data of every OSC 52 copy.
     copies: Vec<(Vec<u8>, usize)>,
     titles: Vec<Vec<u8>>,
+    /// The first intermediate, the parameters and the final character of
+    /// every unhandled CSI sequence.
+    csis: Vec<(Option<u8>, Vec<Vec<u16>>, char)>,
 }
 
 impl Callbacks for Recorder {
@@ -278,6 +309,18 @@ impl Callbacks for Recorder {
 
     fn set_window_title(&mut self, _: &mut Screen, title: &[u8]) {
         self.titles.push(title.to_vec());
+    }
+
+    fn unhandled_csi(
+        &mut self,
+        _: &mut Screen,
+        i1: Option<u8>,
+        _: Option<u8>,
+        params: &[&[u16]],
+        c: char,
+    ) {
+        let params = params.iter().map(|param| param.to_vec()).collect();
+        self.csis.push((i1, params, c));
     }
 }
 
@@ -352,4 +395,92 @@ fn osc_strings_under_the_cap_are_dispatched() {
         parser.process(std::slice::from_ref(byte));
     }
     assert_eq!(parser.callbacks().titles, [b"title".to_vec()]);
+}
+
+#[test]
+fn unhandled_csi_sequences_keep_their_parameters() {
+    let mut parser = Parser::new_with_callbacks(3, 20, 0, Recorder::default());
+    parser.process(b"\x1b[>1;2:3;4u\x1b[?25;2026l\x1b[18t\x1b[q");
+    // vte keeps the first 32 parameters
+    parser.process(format!("\x1b[{}x", ["7"; 40].join(";")).as_bytes());
+    assert_eq!(
+        parser.callbacks().csis,
+        [
+            (Some(b'>'), vec![vec![1], vec![2, 3], vec![4]], 'u'),
+            (Some(b'?'), vec![vec![25], vec![2026]], 'l'),
+            (None, vec![vec![18]], 't'),
+            (None, vec![vec![0]], 'q'),
+            (None, vec![vec![7]; 32], 'x'),
+        ]
+    );
+}
+
+#[test]
+fn visible_rows_follow_the_scrollback_offset_like_cell() {
+    let mut parser = Parser::new(4, 10, 100);
+    parser.process(b"wrapped-row-text\r\n");
+    for line in 0..6 {
+        parser.process(format!("line-{line}\r\n").as_bytes());
+    }
+    // (scrollback offset, the text of the rows in view)
+    for (offset, shown) in [
+        (0, ["line-3", "line-4", "line-5", ""]),
+        (2, ["line-1", "line-2", "line-3", "line-4"]),
+        (5, ["wrapped-ro", "w-text", "line-0", "line-1"]),
+        (100, ["wrapped-ro", "w-text", "line-0", "line-1"]),
+    ] {
+        parser.screen_mut().set_scrollback(offset);
+        let screen = parser.screen();
+        let rows: Vec<_> = screen.visible_rows().collect();
+        let text: Vec<String> = rows
+            .iter()
+            .map(|row| row.cells().map(Cell::contents).collect())
+            .collect();
+        assert_eq!(text, shown, "offset {offset}");
+        assert_eq!(rows[0].wrapped(), offset >= 5);
+        for (row, cells) in (0..).zip(&rows) {
+            assert_eq!(cells.wrapped(), screen.row_wrapped(row));
+            assert_eq!(cells.cells().count(), 10);
+            for (col, cell) in (0..).zip(cells.cells()) {
+                assert_eq!(Some(cell), screen.cell(row, col), "({row}, {col})");
+            }
+        }
+    }
+}
+
+#[test]
+fn has_text_agrees_with_contents() {
+    // whether the screen shows text, checked against `contents`
+    fn shows(parser: &Parser) -> bool {
+        let screen = parser.screen();
+        let contents = screen.contents();
+        let text = contents.chars().any(|c| !c.is_whitespace());
+        assert_eq!(screen.has_text(), text, "{contents:?}");
+        text
+    }
+    let mut parser = Parser::new(3, 10, 10);
+    assert!(!shows(&parser));
+    // blanks are not text, whatever their colour
+    parser.process(b"   \t  \r\n\x1b[41m    \x1b[K\x1b[0m");
+    assert!(!shows(&parser));
+    parser.process("\r\n界".as_bytes());
+    assert!(shows(&parser));
+
+    // the alternate screen is honoured both ways
+    parser.process(b"\x1b[?1049h");
+    assert!(!shows(&parser));
+    parser.process(b"alt");
+    assert!(shows(&parser));
+    parser.process(b"\x1b[2J");
+    assert!(!shows(&parser));
+    parser.process(b"\x1b[?1049l");
+    assert!(shows(&parser));
+
+    // text in the history counts while it is scrolled into view
+    parser.process(b"\r\n\r\n\r\n\r\n\r\n\r\n");
+    assert!(!shows(&parser));
+    parser.screen_mut().set_scrollback(3);
+    assert!(!shows(&parser));
+    parser.screen_mut().set_scrollback(4);
+    assert!(shows(&parser));
 }

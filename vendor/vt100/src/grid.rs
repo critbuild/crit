@@ -250,6 +250,12 @@ impl Grid {
         }
     }
 
+    /// Whether `write_contents` would write a character other than
+    /// whitespace.
+    pub fn has_text(&self) -> bool {
+        self.visible_rows().any(|row| row.has_text(self.size.cols))
+    }
+
     pub fn write_contents_formatted(
         &self,
         contents: &mut Vec<u8>,
@@ -582,8 +588,10 @@ impl Grid {
             return;
         }
         for _ in 0..count.min(self.scroll_bottom - self.pos.row + 1) {
-            self.rows.remove(usize::from(self.scroll_bottom));
-            self.rows.insert(usize::from(self.pos.row), self.new_row());
+            // the row pushed out of the region comes back as the blank one
+            let mut row = self.rows.remove(usize::from(self.scroll_bottom));
+            row.reset(self.size.cols);
+            self.rows.insert(usize::from(self.pos.row), row);
             // self.scroll_bottom is maintained to always be a valid row
             self.rows[usize::from(self.scroll_bottom)].wrap(false);
         }
@@ -594,9 +602,10 @@ impl Grid {
             return;
         }
         for _ in 0..(count.min(self.size.rows - self.pos.row)) {
-            self.rows
-                .insert(usize::from(self.scroll_bottom) + 1, self.new_row());
-            self.rows.remove(usize::from(self.pos.row));
+            // the deleted row comes back as the blank one at the bottom
+            let mut row = self.rows.remove(usize::from(self.pos.row));
+            row.reset(self.size.cols);
+            self.rows.insert(usize::from(self.scroll_bottom), row);
         }
     }
 
@@ -631,9 +640,10 @@ impl Grid {
 
     pub fn scroll_down(&mut self, count: u16) {
         for _ in 0..count.min(self.scroll_bottom - self.scroll_top + 1) {
-            self.rows.remove(usize::from(self.scroll_bottom));
-            self.rows
-                .insert(usize::from(self.scroll_top), self.new_row());
+            // the row pushed out of the region comes back as the blank one
+            let mut row = self.rows.remove(usize::from(self.scroll_bottom));
+            row.reset(self.size.cols);
+            self.rows.insert(usize::from(self.scroll_top), row);
             // self.scroll_bottom is maintained to always be a valid row
             self.rows[usize::from(self.scroll_bottom)].wrap(false);
         }

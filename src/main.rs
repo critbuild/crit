@@ -108,13 +108,16 @@ COPY, PASTE, AND LINKS
   reload Kitty configuration with Ctrl+Shift+F5. Other Kitty windows are unaffected.
 
 UPDATES
-  Each interactive startup runs omp update and opencode upgrade together, in
-  the background while the workspace opens. Nothing waits for them: agents
-  start at once with the installed version, and updater banners stay out of
-  the UI. If an update fails, Crit shows a notice with its diagnostic and keeps
-  using the installed version. A tool that is not installed is not a failure.
-  An update that finishes during a session applies to panes started afterwards
-  and to the next launch. Quitting Crit leaves an update still running to finish.
+  At most once a day, Crit runs omp update and opencode upgrade together, in
+  the background while the workspace opens. Only the window that owns the
+  saved workspace (see RESTORE) runs them; other windows never do. The last
+  run's time is kept in updates.stamp beside workspace.json; delete it to
+  update at the next launch. Nothing waits for the updaters: agents start at
+  once with the installed version, and updater banners stay out of the UI. If
+  an update fails, Crit shows a notice with its diagnostic and keeps using the
+  installed version. A tool that is not installed is not a failure. An update
+  that finishes during a session applies to panes started afterwards and to
+  the next launch. Quitting Crit leaves an update still running to finish.
 
 PROJECTS
   Run crit from any folder, including a Git checkout, to choose New terminal
@@ -181,8 +184,10 @@ WORKTREE PANE
   width; it returns when the window is wide enough. While it shows, the
   terminal (and any split) lays out in the remaining width. It belongs to the
   window and is not saved.
-  The list is live: it refreshes with the one-second Git poll, so branches and
-  worktrees created, switched or removed elsewhere appear without reopening it.
+  The list is live: every second Crit checks the repository's Git files for
+  changes and re-reads the worktree list when they changed (and at least every
+  30 seconds), so branches and worktrees created, switched or removed elsewhere
+  appear without reopening it.
   Each row shows the branch (detached HEAD when there is none) and markers:
   ● a tab is open, main, locked, missing (checkout deleted outside Git; it
   cannot be opened). The focused tab's row is highlighted. Long lists scroll

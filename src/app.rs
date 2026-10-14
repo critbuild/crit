@@ -858,10 +858,11 @@ impl App {
         self.state_dirty = true;
     }
 
-    pub fn finish_split_drag(&mut self) {
-        if self.split_drag.take().is_some() {
-            self.state_dirty = true;
-        }
+    /// Lets go of the split divider, if it is being dragged; returns whether it was.
+    pub fn finish_split_drag(&mut self) -> bool {
+        let dragging = self.split_drag.take().is_some();
+        self.state_dirty |= dragging;
+        dragging
     }
 
     /// Opens or closes the worktree pane. The terminal's width changes with it, so the last
@@ -1260,10 +1261,9 @@ impl App {
     }
 
     /// Typing, pasting or clicking acknowledges an ordinary notice; a warning needs Esc.
-    fn clear_notice_on_input(&mut self, escape: bool) {
-        if escape || !self.notice_sticky {
-            self.notice = None;
-        }
+    /// Returns whether a notice was cleared.
+    fn clear_notice_on_input(&mut self, escape: bool) -> bool {
+        (escape || !self.notice_sticky) && self.notice.take().is_some()
     }
 
     fn git_repository(&self) -> Result<&worktree::Repository> {
@@ -2327,8 +2327,10 @@ impl App {
         }
         match event {
             Event::Input(crossterm::event::Event::Key(key)) => {
-                self.scroll_drag = None;
-                self.finish_split_drag();
+                // A key ends any drag. With a selection, a scrolled-back view and the notice it
+                // clears, that is all crit itself shows of a key that only goes to a pane.
+                let scroll_drag = self.scroll_drag.take().is_some();
+                let split_drag = self.finish_split_drag();
                 if key.kind == KeyEventKind::Release {
                     return Ok(false);
                 }
@@ -2360,17 +2362,19 @@ impl App {
                         _ => {}
                     }
                 }
-                self.selection = None;
+                let selected = self.selection.take().is_some();
                 let action = keys::action(key);
                 if action == Some(Action::ToggleNative) {
                     if key.kind == KeyEventKind::Press {
                         self.action(Action::ToggleNative)?;
                     }
                 } else if self.native_keys {
-                    if let Some(session) = self.focused_session() {
-                        session.key(key)?;
-                    }
-                    self.clear_notice_on_input(key.code == KeyCode::Esc);
+                    let scrolled = match self.focused_session() {
+                        Some(session) => session.key(key)?,
+                        None => false,
+                    };
+                    let cleared = self.clear_notice_on_input(key.code == KeyCode::Esc);
+                    return Ok(scroll_drag || split_drag || selected || scrolled || cleared);
                 } else if self.modal.is_some() {
                     self.modal_key(key)?;
                 } else if let Some(action) = action {
@@ -2385,21 +2389,27 @@ impl App {
                     self.notice = None;
                     self.select_shell()?;
                 } else {
-                    if let Some(session) = self.focused_session() {
-                        session.key(key)?;
-                    }
-                    self.clear_notice_on_input(key.code == KeyCode::Esc);
+                    // The program draws its answer, if any, through its own output; drawing now
+                    // as well would put out a frame before the echo, and the echo would then wait
+                    // out the frame interval.
+                    let scrolled = match self.focused_session() {
+                        Some(session) => session.key(key)?,
+                        None => false,
+                    };
+                    let cleared = self.clear_notice_on_input(key.code == KeyCode::Esc);
+                    return Ok(scroll_drag || split_drag || selected || scrolled || cleared);
                 }
             }
             Event::Input(crossterm::event::Event::Paste(text)) => {
-                self.selection = None;
-                self.finish_split_drag();
+                let selected = self.selection.take().is_some();
+                let split_drag = self.finish_split_drag();
                 // Routed like keys: the terminal gets it in native mode or with no dialog,
-                // even behind a progress dialog.
+                // even behind a progress dialog. Like a key, it draws through the program.
                 if self.native_keys || self.modal.is_none() {
                     if let Some(session) = self.focused_session() {
-                        session.paste(&text)?;
-                        self.clear_notice_on_input(false);
+                        let scrolled = session.paste(&text)?;
+                        let cleared = self.clear_notice_on_input(false);
+                        return Ok(selected || split_drag || scrolled || cleared);
                     }
                 } else {
                     match &mut self.modal {
@@ -3406,6 +3416,8 @@ fn start_worker(tx: SyncSender<Event>) -> Result<SyncSender<Job>> {
     std::thread::Builder::new()
         .name("commands".into())
         .spawn(move || {
+            // Polls list a repository again only after something Git would list changed.
+            let mut listing_cache = worktree::ListingCache::default();
             while let Ok(job) = rx.recv() {
                 let event = match job {
                     Job::Projects { request, base } => {
@@ -3498,10 +3510,12 @@ fn start_worker(tx: SyncSender<Event>) -> Result<SyncSender<Job>> {
                         for repository in repositories {
                             // Checkout can temporarily make Git metadata unreadable.
                             // Keep the previous labels and retry without notice spam.
-                            if let Ok(found) = worktree::list(&repository) {
+                            // An unchanged repository is left out: its labels stand.
+                            if let Ok(Some(found)) = listing_cache.refresh(&repository) {
                                 listings.push((repository.common_dir, found));
                             }
                         }
+                        // Sent even when empty: it ends the poll (`metadata_pending`).
                         Event::Metadata(listings)
                     }
                     Job::Remove { repository, tree } => {
@@ -3628,22 +3642,86 @@ fn install_panic_hook(use_kitty: bool) {
     }));
 }
 
+/// Where ratatui writes the outer terminal's frames: one buffer, which `draw_frame` sends to
+/// stdout in a single `write(2)`. Written to stdout itself, a frame would go out in up to 30
+/// pieces, each a wake-up and a partial parse for the outer terminal: stdout's `LineWriter`
+/// passes bytes on every 1 KiB, and the backend flushes after each cursor command. So `flush`
+/// keeps the bytes, and only `draw_frame` sends them. It leaves the buffer empty, so that what
+/// `TerminalGuard` and `kitty` write to stdout directly between frames keeps its order. Clones
+/// share the buffer, as ratatui keeps its backend's writer to itself.
+#[derive(Clone, Default)]
+struct FrameWriter(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+
+impl FrameWriter {
+    /// Sends what was written to stdout at once and empties the buffer, keeping its capacity.
+    /// It is emptied even when the write fails, so that no stale bytes lead the next frame.
+    fn send(&self) -> io::Result<()> {
+        let mut frame = self.0.borrow_mut();
+        let mut stdout = io::stdout().lock();
+        let sent = stdout.write_all(&frame).and_then(|()| stdout.flush());
+        frame.clear();
+        sent
+    }
+}
+
+impl Write for FrameWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.borrow_mut().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The outer terminal's size, read with one `ioctl` on stdout, which `run` has checked is a
+/// terminal. crossterm's `terminal::size` opens and closes `/dev/tty` around the same `ioctl`,
+/// and a full-screen ratatui viewport calls it on every frame, so `run` gives its terminal a
+/// fixed viewport, which `draw_frame` fits to this size.
+fn window_size() -> io::Result<ratatui::layout::Size> {
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ratatui::layout::Size::new(size.ws_col, size.ws_row))
+}
+
 /// Draws one frame on the real terminal as a single synchronized update (DEC mode 2026), so
-/// that Kitty never paints it half written. Terminals without the mode ignore it.
+/// that Kitty never paints it half written. Terminals without the mode ignore it. `output` is
+/// the writer of `terminal`'s backend; the whole frame leaves in one write. `size` is the
+/// terminal's, from `window_size`: when it has changed, the viewport is resized and cleared, as
+/// a full-screen one resizes itself, so that the frame is drawn whole and nothing of the last
+/// one stays.
 fn draw_frame(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<FrameWriter>>,
+    output: &FrameWriter,
+    size: ratatui::layout::Size,
     render: impl FnOnce(&mut ratatui::Frame),
 ) -> Result<()> {
-    queue!(io::stdout(), BeginSynchronizedUpdate)?;
-    let drawn = terminal.draw(render);
+    queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let area = Rect::from(size);
+    let fitted = if terminal.get_frame().area() == area {
+        Ok(())
+    } else {
+        terminal.resize(area)
+    };
+    let drawn = fitted.and_then(|()| terminal.draw(render).map(drop));
     // Ended even when drawing failed, so the terminal is not left waiting out its timeout.
-    execute!(io::stdout(), EndSynchronizedUpdate)?;
+    queue!(terminal.backend_mut(), EndSynchronizedUpdate)?;
+    output.send()?;
     drawn?;
     Ok(())
 }
 
 fn choose_project(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut Terminal<CrosstermBackend<FrameWriter>>,
+    output: &FrameWriter,
     rx: &mpsc::Receiver<Event>,
     jobs: &SyncSender<Job>,
     path: &Path,
@@ -3663,12 +3741,18 @@ fn choose_project(
     picker.terminal_path = Some(launch_path.clone());
     let mut native_keys = false;
     let mut interaction_visible = true;
+    // Drawn again only after an event it handles: mouse capture reports every pointer move,
+    // and the chooser shows nothing of the pointer.
+    let mut redraw = true;
     loop {
-        draw_frame(terminal, |frame| {
-            let bounds = frame.area();
-            interaction_visible = bounds.width >= 30 && bounds.height >= 10;
-            ui::draw_project_chooser(frame, &picker, &notice, native_keys);
-        })?;
+        if redraw {
+            draw_frame(terminal, output, window_size()?, |frame| {
+                let bounds = frame.area();
+                interaction_visible = bounds.width >= 30 && bounds.height >= 10;
+                ui::draw_project_chooser(frame, &picker, &notice, native_keys);
+            })?;
+        }
+        redraw = true;
         match rx.recv()? {
             Event::Input(crossterm::event::Event::Key(key))
                 if key.kind != KeyEventKind::Release =>
@@ -3699,6 +3783,7 @@ fn choose_project(
             Event::Input(crossterm::event::Event::Paste(text)) if interaction_visible => {
                 picker.paste(&text);
             }
+            Event::Input(crossterm::event::Event::Resize(..)) => {}
             Event::Projects { request, projects } if picker.request == request => {
                 picker.set_projects(projects);
             }
@@ -3713,7 +3798,7 @@ fn choose_project(
             },
             Event::Error(error) => notice = error,
             Event::Shutdown => return Ok(None),
-            _ => {}
+            _ => redraw = false,
         }
     }
 }
@@ -3969,8 +4054,14 @@ pub fn run(
                 }
             }
         })?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-    let mut checks = updates::start();
+    let output = FrameWriter::default();
+    // Fixed, as `draw_frame` fits it to the size read for each frame.
+    let mut terminal = Terminal::with_options(
+        CrosstermBackend::new(output.clone()),
+        ratatui::TerminalOptions {
+            viewport: ratatui::Viewport::Fixed(window_size()?.into()),
+        },
+    )?;
     // Everything startup has to say, shown together. `sticky` keeps it past terminal input:
     // it reports that saving is off or that saved items were left out.
     let mut notices: Vec<String> = Vec::new();
@@ -3985,6 +4076,8 @@ pub fn run(
             None
         }
     };
+    // Only the window that owns the saved workspace updates the agents, at most once a day.
+    let mut checks = updates::start(store.as_ref().map(restore::Store::directory));
     let snapshot = if fresh {
         None
     } else {
@@ -4066,6 +4159,7 @@ pub fn run(
                     let shown = notices.join("\n");
                     choose_project(
                         &mut terminal,
+                        &output,
                         &rx,
                         &jobs,
                         path,
@@ -4153,12 +4247,30 @@ pub fn run(
             app.set_notice(notice);
         }
     }
-    let frame_interval = Duration::from_millis(16);
+    // Frames go out at least 16 ms apart, so that what is typed shows at once. While app output
+    // keeps them coming, each within 100 ms of the one before, they go out at least 33 ms
+    // apart: still smooth, for half the drawing, in crit and in the outer terminal. Typing keeps
+    // the quick pace for 100 ms after each key: fast typing and key repeat draw frames that close
+    // together too, and an echo must not wait out the slow pace.
+    let quick_interval = Duration::from_millis(16);
+    let streaming_interval = Duration::from_millis(33);
+    let streaming_gap = Duration::from_millis(100);
+    let frame_interval = |streaming: bool, last_typed: Instant| {
+        if streaming && last_typed.elapsed() >= streaming_gap {
+            streaming_interval
+        } else {
+            quick_interval
+        }
+    };
     // The longest a frame stays held while panes keep repainting: a window drag resizes
     // them with every pointer move, and an app can stream output after a resize. Either
     // would otherwise freeze the screen until the resize is forgotten.
     let max_hold = Duration::from_millis(120);
-    let mut last_draw = Instant::now() - frame_interval;
+    // As if the last frame and keystroke were a quiet spell ago.
+    let mut last_draw = Instant::now() - streaming_gap;
+    let mut last_typed = last_draw;
+    // Whether the last frame came within `streaming_gap` of the one before it.
+    let mut streaming = false;
     let mut held_since: Option<Instant> = None;
     let mut redraw = true;
     while !app.should_quit {
@@ -4168,15 +4280,20 @@ pub fn run(
             app.append_notice(&failures.join("\n"));
             redraw = true;
         }
-        if redraw && last_draw.elapsed() >= frame_interval {
+        if redraw && last_draw.elapsed() >= frame_interval(streaming, last_typed) {
             // Sized before the hold is checked: the resize is what makes an app repaint, and
             // a frame drawn before that would show the pane's old content cut to its new size.
-            ui::resize_sessions(&mut app, terminal.size()?)?;
+            let size = window_size()?;
+            ui::resize_sessions(&mut app, size)?;
             let overdue = held_since.is_some_and(|since| since.elapsed() >= max_hold);
             if overdue || !app.frame_held() {
-                draw_frame(&mut terminal, |frame| ui::draw(frame, &mut app))?;
+                draw_frame(&mut terminal, &output, size, |frame| {
+                    ui::draw(frame, &mut app)
+                })?;
                 redraw = false;
-                last_draw = Instant::now();
+                let now = Instant::now();
+                streaming = now.duration_since(last_draw) < streaming_gap;
+                last_draw = now;
                 held_since = None;
             } else if held_since.is_none() {
                 held_since = Some(Instant::now());
@@ -4189,7 +4306,7 @@ pub fn run(
             let wait = if app.frame_held() {
                 Duration::from_millis(4)
             } else {
-                frame_interval.saturating_sub(last_draw.elapsed())
+                frame_interval(streaming, last_typed).saturating_sub(last_draw.elapsed())
             };
             match rx.recv_timeout(wait) {
                 Ok(event) => Some(event),
@@ -4204,17 +4321,15 @@ pub fn run(
             }
         };
         if let Some(event) = event {
-            match app.handle(event) {
-                Ok(changed) => redraw |= changed,
-                Err(error) => {
-                    app.set_notice(format!("{error:#}"));
-                    redraw = true;
+            let mut handle = |event: Event| {
+                if matches!(
+                    event,
+                    Event::Input(
+                        crossterm::event::Event::Key(_) | crossterm::event::Event::Paste(_)
+                    )
+                ) {
+                    last_typed = Instant::now();
                 }
-            }
-            for _ in 0..127 {
-                let Ok(event) = rx.try_recv() else {
-                    break;
-                };
                 match app.handle(event) {
                     Ok(changed) => redraw |= changed,
                     Err(error) => {
@@ -4222,6 +4337,13 @@ pub fn run(
                         redraw = true;
                     }
                 }
+            };
+            handle(event);
+            for _ in 0..127 {
+                let Ok(event) = rx.try_recv() else {
+                    break;
+                };
+                handle(event);
             }
         }
     }
@@ -5105,6 +5227,80 @@ mod tests {
                 // The notice row must disappear on the next frame.
                 assert!(app.handle(event).unwrap());
                 assert!(app.notice.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn input_forwarded_to_a_pane_draws_no_frame_of_its_own() {
+        // The program draws its answer, if any, through its own output.
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let session = sleeping_session(&app, directory.path(), 1);
+        app.project.workspaces[0].sessions.push(session);
+        for native_keys in [false, true] {
+            app.native_keys = native_keys;
+            assert!(!app.handle(key_event(KeyCode::Char('a'))).unwrap());
+            assert!(
+                !app.handle(Event::Input(crossterm::event::Event::Paste("a".into())))
+                    .unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn input_forwarded_to_a_scrolled_back_pane_redraws_it_live() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let session = sleeping_session(&app, directory.path(), 1);
+        session
+            .parser
+            .lock()
+            .process("line\r\n".repeat(30).as_bytes());
+        app.project.workspaces[0].sessions.push(session);
+        let scrollback = |app: &App| {
+            app.project.workspaces[0].sessions[0]
+                .parser
+                .lock()
+                .screen()
+                .scrollback()
+        };
+        for native_keys in [false, true] {
+            app.native_keys = native_keys;
+            for event in [
+                key_event(KeyCode::Char('a')),
+                Event::Input(crossterm::event::Event::Paste("a".into())),
+            ] {
+                app.project.workspaces[0].sessions[0].scroll_to(5);
+                assert_eq!(scrollback(&app), 5);
+                assert!(app.handle(event).unwrap());
+                assert_eq!(scrollback(&app), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn input_forwarded_to_a_pane_redraws_to_clear_the_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let session = sleeping_session(&app, directory.path(), 1);
+        app.project.workspaces[0].sessions.push(session);
+        for native_keys in [false, true] {
+            app.native_keys = native_keys;
+            for event in [
+                key_event(KeyCode::Char('a')),
+                Event::Input(crossterm::event::Event::Paste("a".into())),
+            ] {
+                let selection = Selection::new(
+                    1,
+                    Rect::new(0, 1, 40, 10),
+                    app.project.workspaces[0].sessions[0].parser.lock().screen(),
+                    0,
+                    1,
+                );
+                app.selection = Some(selection);
+                assert!(app.handle(event).unwrap());
+                assert!(app.selection.is_none());
             }
         }
     }

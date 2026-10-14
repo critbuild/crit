@@ -3,9 +3,12 @@ use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
 use std::ffi::OsStr;
 use std::fs;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 pub struct Repository {
@@ -251,6 +254,229 @@ pub fn list(repository: &Repository) -> Result<Vec<Worktree>> {
         main.path = path;
     }
     Ok(trees)
+}
+
+/// How long a listing is trusted while its fingerprint holds, for what `stat` cannot see: two
+/// updates within one timestamp tick that reuse an inode, a symlink retargeted above a
+/// checkout, configuration included from outside the repository.
+const LISTING_REFRESH: Duration = Duration::from_secs(30);
+
+/// Directory entries one fingerprint may visit, so a poll's cost stays bounded. A repository
+/// with more loose branch refs and linked worktrees is listed on every poll, as if it had no
+/// fingerprint.
+const FINGERPRINT_ENTRIES: usize = 4096;
+
+/// One path in a fingerprint. A directory records its identity only: its mtime moves with
+/// every file created inside it (an index rewritten by `git status`, an editor's temporary
+/// file), none of which changes the listing.
+#[derive(Hash)]
+enum Stamp {
+    Missing(std::io::ErrorKind),
+    Directory(u64),
+    /// Git replaces refs and `HEAD` by renaming a lock file over them, so the inode marks an
+    /// update even when the mtime cannot.
+    File {
+        inode: u64,
+        size: u64,
+        modified: (i64, i64),
+    },
+}
+
+impl Stamp {
+    fn of(metadata: std::io::Result<fs::Metadata>) -> Self {
+        match metadata {
+            Ok(metadata) if metadata.is_dir() => Self::Directory(metadata.ino()),
+            Ok(metadata) => Self::File {
+                inode: metadata.ino(),
+                size: metadata.size(),
+                modified: (metadata.mtime(), metadata.mtime_nsec()),
+            },
+            Err(error) => Self::Missing(error.kind()),
+        }
+    }
+}
+
+fn hash_one(value: impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `directory/name` in a reused buffer: a poll stats a fixed set of names per repository.
+fn join_into<'a>(buffer: &'a mut PathBuf, directory: &Path, name: &str) -> &'a Path {
+    buffer.as_mut_os_string().clear();
+    buffer.push(directory);
+    buffer.push(name);
+    buffer
+}
+
+/// Hashes what `git worktree list` reads from the common directory, without running Git: the
+/// main `HEAD`; the branches every `HEAD` resolves through (loose refs at any depth under
+/// `refs/heads`, `packed-refs`, or a reftable stack); the configuration (`core.bare`, a
+/// submodule's `core.worktree`); and per linked worktree its `HEAD`, the `gitdir` file naming
+/// its checkout, and its `locked` note. Indexes, logs and lock files are left out: Git rewrites
+/// them on every `git status` or commit without changing the listing. `None` once the walk
+/// passes `FINGERPRINT_ENTRIES`.
+fn metadata_fingerprint(common_dir: &Path) -> Option<u64> {
+    let mut budget = FINGERPRINT_ENTRIES;
+    let mut hasher = DefaultHasher::new();
+    let mut path = PathBuf::new();
+    for name in [
+        "HEAD",
+        "packed-refs",
+        "config",
+        "config.worktree",
+        "reftable/tables.list",
+    ] {
+        Stamp::of(fs::metadata(join_into(&mut path, common_dir, name))).hash(&mut hasher);
+    }
+    refs_fingerprint(common_dir.join("refs/heads"), &mut budget)?.hash(&mut hasher);
+    linked_fingerprint(&common_dir.join("worktrees"), &mut budget)?.hash(&mut hasher);
+    Some(hasher.finish())
+}
+
+/// Every loose branch ref, at any depth: `feature/x` lives in `refs/heads/feature`. Entries
+/// are combined regardless of order, which is the filesystem's.
+fn refs_fingerprint(root: PathBuf, budget: &mut usize) -> Option<u64> {
+    let mut sum = 0u64;
+    let mut pending = vec![root];
+    while let Some(directory) = pending.pop() {
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            // A reftable repository keeps a placeholder file here.
+            Err(error) => {
+                sum = sum.wrapping_add(hash_one((&directory, Stamp::Missing(error.kind()))));
+                continue;
+            }
+        };
+        for entry in entries {
+            *budget = budget.checked_sub(1)?;
+            let entry = entry.ok()?;
+            let name = entry.file_name();
+            // A ref being updated: the rename that completes the update changes the ref.
+            if name.as_bytes().ends_with(b".lock") {
+                continue;
+            }
+            // Not following symlinks keeps the walk inside `refs/heads`.
+            let metadata = entry.metadata();
+            if metadata.as_ref().is_ok_and(fs::Metadata::is_dir) {
+                pending.push(entry.path());
+            }
+            sum = sum.wrapping_add(hash_one((&directory, &name, Stamp::of(metadata))));
+        }
+    }
+    Some(sum)
+}
+
+/// Each linked worktree's registration, combined regardless of order. Git removes the
+/// directory along with the last one.
+fn linked_fingerprint(directory: &Path, budget: &mut usize) -> Option<u64> {
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) => return Some(hash_one(Stamp::Missing(error.kind()))),
+    };
+    let mut sum = 0u64;
+    let mut path = PathBuf::new();
+    for entry in entries {
+        *budget = budget.checked_sub(1)?;
+        let registration = entry.ok()?.path();
+        let mut hasher = DefaultHasher::new();
+        registration.hash(&mut hasher);
+        for name in ["HEAD", "gitdir", "locked", "reftable/tables.list"] {
+            Stamp::of(fs::metadata(join_into(&mut path, &registration, name))).hash(&mut hasher);
+        }
+        sum = sum.wrapping_add(hasher.finish());
+    }
+    Some(sum)
+}
+
+/// Each listed checkout and its `.git`: a checkout deleted outside Git turns prunable without
+/// touching the common directory.
+fn checkouts_fingerprint(paths: &[PathBuf]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    let mut git = PathBuf::new();
+    for path in paths {
+        path.hash(&mut hasher);
+        Stamp::of(fs::symlink_metadata(path)).hash(&mut hasher);
+        Stamp::of(fs::metadata(join_into(&mut git, path, ".git"))).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// A repository's last listing, as `ListingCache` remembers it.
+struct Listed {
+    common_dir: PathBuf,
+    /// Taken before the listing ran; `None` when the repository was too large to fingerprint.
+    metadata: Option<u64>,
+    checkouts: u64,
+    /// The listed checkouts, which the next `checkouts_fingerprint` stamps.
+    paths: Vec<PathBuf>,
+    at: Instant,
+}
+
+/// Lists a polled repository again only when something `list` reads may have changed, so an
+/// idle repository costs a `stat` per branch ref, worktree file and checkout per poll instead
+/// of a Git process.
+#[derive(Default)]
+pub struct ListingCache {
+    listed: Vec<Listed>,
+}
+
+impl ListingCache {
+    /// `Ok(None)` while nothing the repository's last listing depends on has changed and that
+    /// listing is younger than `LISTING_REFRESH`; otherwise lists afresh. A failed listing
+    /// changes nothing here, so the next call tries again.
+    pub fn refresh(&mut self, repository: &Repository) -> Result<Option<Vec<Worktree>>> {
+        self.refresh_at(repository, Instant::now())
+    }
+
+    fn refresh_at(
+        &mut self,
+        repository: &Repository,
+        now: Instant,
+    ) -> Result<Option<Vec<Worktree>>> {
+        let index = self
+            .listed
+            .iter()
+            .position(|listed| listed.common_dir == repository.common_dir);
+        // Taken before Git runs, so a change racing the listing differs from it next time.
+        let metadata = metadata_fingerprint(&repository.common_dir);
+        let mut checkouts =
+            checkouts_fingerprint(index.map_or(&[], |index| self.listed[index].paths.as_slice()));
+        if let Some(listed) = index.map(|index| &self.listed[index])
+            && metadata.is_some()
+            && listed.metadata == metadata
+            && listed.checkouts == checkouts
+            && now.saturating_duration_since(listed.at) < LISTING_REFRESH
+        {
+            return Ok(None);
+        }
+        let trees = list(repository)?;
+        let index = index.unwrap_or_else(|| {
+            self.listed.push(Listed {
+                common_dir: repository.common_dir.clone(),
+                metadata: None,
+                checkouts: 0,
+                paths: Vec::new(),
+                at: now,
+            });
+            self.listed.len() - 1
+        });
+        let listed = &mut self.listed[index];
+        if !trees.iter().map(|tree| &tree.path).eq(&listed.paths) {
+            // Checkouts new to this listing are stamped after it: one deleted in between
+            // shows at the next `LISTING_REFRESH`.
+            listed.paths.clear();
+            listed
+                .paths
+                .extend(trees.iter().map(|tree| tree.path.clone()));
+            checkouts = checkouts_fingerprint(&listed.paths);
+        }
+        listed.metadata = metadata;
+        listed.checkouts = checkouts;
+        listed.at = now;
+        Ok(Some(trees))
+    }
 }
 
 /// Registered checkouts first, then local branches not checked out anywhere.
@@ -1208,5 +1434,224 @@ mod tests {
         let trees = list(&repository);
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(trees.unwrap().len(), 2);
+    }
+
+    fn run(command: &mut Command) {
+        checked(command, "change test repository").unwrap();
+    }
+
+    fn commit(checkout: &Path, message: &str) {
+        run(git(checkout).args([
+            "-c",
+            "user.name=Crit Test",
+            "-c",
+            "user.email=crit@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            message,
+        ]));
+    }
+
+    fn listed_paths(repository: &Repository) -> Vec<PathBuf> {
+        list(repository)
+            .unwrap()
+            .into_iter()
+            .map(|tree| tree.path)
+            .collect()
+    }
+
+    /// What `ListingCache` compares: the common directory now, and the checkouts of the
+    /// listing taken before.
+    fn fingerprint(repository: &Repository, paths: &[PathBuf]) -> (Option<u64>, u64) {
+        (
+            metadata_fingerprint(&repository.common_dir),
+            checkouts_fingerprint(paths),
+        )
+    }
+
+    fn assert_changes(repository: &Repository, label: &str, change: impl FnOnce()) {
+        let paths = listed_paths(repository);
+        let before = fingerprint(repository, &paths);
+        assert!(before.0.is_some(), "{label}: walk bound");
+        change();
+        assert_ne!(fingerprint(repository, &paths), before, "{label}");
+    }
+
+    #[test]
+    fn fingerprint_sees_every_change_the_listing_shows() {
+        let (directory, repository) = repository();
+        let root = &repository.root;
+        assert_changes(&repository, "commit", || commit(root, "second"));
+        assert_changes(&repository, "switch -c", || {
+            run(git(root).args(["switch", "-c", "topic"]))
+        });
+        assert_changes(&repository, "branch -m", || {
+            run(git(root).args(["branch", "-m", "renamed"]))
+        });
+        let linked = directory.path().join("linked");
+        assert_changes(&repository, "worktree add", || {
+            run(git(root)
+                .args(["worktree", "add", "-b", "feature/x", "--"])
+                .arg(&linked))
+        });
+        assert_changes(&repository, "commit in a linked checkout", || {
+            commit(&linked, "linked")
+        });
+        assert_changes(&repository, "detached linked checkout", || {
+            run(git(&linked).args(["checkout", "--detach"]))
+        });
+        assert_changes(&repository, "worktree lock", || {
+            run(git(root).args(["worktree", "lock", "--"]).arg(&linked))
+        });
+        assert_changes(&repository, "worktree unlock", || {
+            run(git(root).args(["worktree", "unlock", "--"]).arg(&linked))
+        });
+        let moved = directory.path().join("moved");
+        assert_changes(&repository, "worktree move", || {
+            run(git(root)
+                .args(["worktree", "move", "--"])
+                .arg(&linked)
+                .arg(&moved))
+        });
+        assert_changes(&repository, "worktree remove", || {
+            run(git(root).args(["worktree", "remove", "--"]).arg(&moved))
+        });
+        let deleted = directory.path().join("deleted");
+        run(git(root)
+            .args(["worktree", "add", "-b", "deleted", "--"])
+            .arg(&deleted));
+        assert_changes(&repository, "checkout deleted outside Git", || {
+            fs::remove_dir_all(&deleted).unwrap()
+        });
+        assert!(list(&repository).unwrap()[1].prunable);
+        assert_changes(&repository, "worktree prune", || {
+            run(git(root).args(["worktree", "prune"]))
+        });
+    }
+
+    #[test]
+    fn fingerprint_ignores_work_that_leaves_the_listing_alone() {
+        let (directory, repository) = repository();
+        let linked = directory.path().join("linked");
+        run(git(&repository.root)
+            .args(["worktree", "add", "-b", "linked", "--"])
+            .arg(&linked));
+        let paths = listed_paths(&repository);
+        let before = fingerprint(&repository, &paths);
+        // Agents and shell prompts do this all the time: it rewrites indexes and both roots.
+        for checkout in [&repository.root, &linked] {
+            fs::write(checkout.join("new file"), "contents").unwrap();
+            run(git(checkout).args(["add", "--", "new file"]));
+            run(git(checkout).args(["status", "--porcelain"]));
+        }
+        assert_eq!(listed_paths(&repository), paths);
+        assert_eq!(fingerprint(&repository, &paths), before);
+    }
+
+    #[test]
+    fn fingerprint_sees_reftable_updates() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        // Git before 2.45 has no reftable backend.
+        if checked(
+            git(&root).args(["init", "-b", "main", "--ref-format=reftable"]),
+            "init reftable repository",
+        )
+        .is_err()
+        {
+            return;
+        }
+        commit(&root, "initial");
+        let repository = discover(&root).unwrap();
+        assert_changes(&repository, "commit", || commit(&root, "second"));
+        assert_changes(&repository, "switch -c", || {
+            run(git(&root).args(["switch", "-c", "topic"]))
+        });
+        let linked = directory.path().join("linked");
+        assert_changes(&repository, "worktree add", || {
+            run(git(&root)
+                .args(["worktree", "add", "-b", "linked", "--"])
+                .arg(&linked))
+        });
+        assert_changes(&repository, "commit in a linked checkout", || {
+            commit(&linked, "linked")
+        });
+        assert_changes(&repository, "detached linked checkout", || {
+            run(git(&linked).args(["checkout", "--detach"]))
+        });
+    }
+
+    #[test]
+    fn listing_cache_lists_again_after_a_change_or_the_safety_interval() {
+        let (directory, repository) = repository();
+        let mut cache = ListingCache::default();
+        let start = Instant::now();
+        let just_before = |time: Instant| time + LISTING_REFRESH - Duration::from_millis(1);
+        assert_eq!(
+            cache.refresh_at(&repository, start).unwrap(),
+            Some(list(&repository).unwrap())
+        );
+        assert_eq!(cache.refresh_at(&repository, start).unwrap(), None);
+        assert_eq!(
+            cache.refresh_at(&repository, just_before(start)).unwrap(),
+            None
+        );
+        commit(&repository.root, "second");
+        let listed = cache.refresh_at(&repository, start).unwrap();
+        assert_eq!(listed, Some(list(&repository).unwrap()));
+        assert_eq!(cache.refresh_at(&repository, start).unwrap(), None);
+        // A new checkout is stamped with its own listing: no second listing follows.
+        run(git(&repository.root)
+            .args(["worktree", "add", "-b", "linked", "--"])
+            .arg(directory.path().join("linked")));
+        let later = start + Duration::from_secs(1);
+        assert_eq!(
+            cache.refresh_at(&repository, later).unwrap().unwrap().len(),
+            2
+        );
+        assert_eq!(cache.refresh_at(&repository, later).unwrap(), None);
+        assert_eq!(
+            cache.refresh_at(&repository, just_before(later)).unwrap(),
+            None
+        );
+        assert!(
+            cache
+                .refresh_at(&repository, later + LISTING_REFRESH)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn listing_cache_retries_a_failed_listing() {
+        let (_directory, repository) = repository();
+        let mut cache = ListingCache::default();
+        assert!(cache.refresh(&repository).unwrap().is_some());
+        let config = repository.common_dir.join("config");
+        let valid = fs::read(&config).unwrap();
+        fs::write(&config, "[broken").unwrap();
+        assert!(cache.refresh(&repository).is_err());
+        // Nothing changed since the failure, and Git is still asked.
+        assert!(cache.refresh(&repository).is_err());
+        fs::write(&config, valid).unwrap();
+        assert!(cache.refresh(&repository).unwrap().is_some());
+        assert_eq!(cache.refresh(&repository).unwrap(), None);
+    }
+
+    #[test]
+    fn listing_cache_lists_every_time_past_the_walk_bound() {
+        let (_directory, repository) = repository();
+        let head = list(&repository).unwrap().remove(0).head;
+        let bulk = repository.common_dir.join("refs/heads/bulk");
+        fs::create_dir(&bulk).unwrap();
+        for index in 0..FINGERPRINT_ENTRIES {
+            fs::write(bulk.join(index.to_string()), format!("{head}\n")).unwrap();
+        }
+        assert_eq!(metadata_fingerprint(&repository.common_dir), None);
+        let mut cache = ListingCache::default();
+        assert!(cache.refresh(&repository).unwrap().is_some());
+        assert!(cache.refresh(&repository).unwrap().is_some());
     }
 }

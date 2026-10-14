@@ -1,4 +1,5 @@
 use ratatui::layout::Rect;
+use std::ops::Range;
 
 /// A frozen visible pane, not a copy of the session's scrollback. Output keeps
 /// running underneath it, so a repaint cannot change text during a drag.
@@ -22,11 +23,10 @@ impl Selection {
         let cols = cols.min(body.width);
         let mut cells = Vec::with_capacity(usize::from(rows) * usize::from(cols));
         let mut wrapped = Vec::with_capacity(usize::from(rows));
-        for row in 0..rows {
-            wrapped.push(screen.row_wrapped(row));
-            for col in 0..cols {
-                cells.push(screen.cell(row, col).unwrap().clone());
-            }
+        // vt100 gives every visible row at least the screen's width in cells.
+        for row in screen.visible_rows().take(usize::from(rows)) {
+            wrapped.push(row.wrapped());
+            cells.extend(row.cells().take(usize::from(cols)).cloned());
         }
         let point = (
             y.saturating_sub(body.y).min(rows.saturating_sub(1)),
@@ -56,7 +56,7 @@ impl Selection {
         self.moved |= self.end != self.start;
     }
 
-    pub fn cell(&self, row: u16, col: u16) -> Option<&vt100::Cell> {
+    fn cell(&self, row: u16, col: u16) -> Option<&vt100::Cell> {
         if row >= self.rows || col >= self.cols {
             return None;
         }
@@ -82,9 +82,25 @@ impl Selection {
         (start, end)
     }
 
-    pub fn selected(&self, row: u16, col: u16) -> bool {
-        let (start, end) = self.range();
-        self.moved && (row, col) >= start && (row, col) <= end
+    /// The frozen rows from the top, each with the columns the selection highlights on it
+    /// (an empty range where it highlights none), so a frame draws them a row at a time.
+    pub fn rows(&self) -> impl Iterator<Item = (&[vt100::Cell], Range<u16>)> {
+        let ((top, left), (bottom, right)) = self.range();
+        let (moved, cols) = (self.moved, self.cols);
+        // `chunks` rejects a size of zero, and a snapshot without columns has no cells.
+        self.cells
+            .chunks(usize::from(cols).max(1))
+            .zip(0..self.rows)
+            .map(move |(cells, row)| {
+                let highlight = if moved && (top..=bottom).contains(&row) {
+                    let first = if row == top { left } else { 0 };
+                    let end = if row == bottom { right + 1 } else { cols };
+                    first..end
+                } else {
+                    0..0
+                };
+                (cells, highlight)
+            })
     }
 
     pub fn text(&self) -> String {
@@ -207,5 +223,28 @@ mod tests {
         let mut selection = Selection::new(1, Rect::new(1, 3, 80, 4), parser.screen(), 1, 3);
         selection.update(80, 6);
         assert_eq!(selection.text(), "line-11\nline-12\nline-13\nline-14");
+    }
+    #[test]
+    fn highlights_cover_whole_wide_characters_and_full_middle_rows() {
+        let mut parser = vt100::Parser::new(4, 8, 0);
+        parser.process("one\r\ntwo\r\nab界def\r\n界x".as_bytes());
+        let body = Rect::new(2, 1, 8, 4);
+        let highlights = |selection: &Selection| {
+            selection
+                .rows()
+                .map(|(_, columns)| columns)
+                .collect::<Vec<_>>()
+        };
+        // Nothing shows before the pointer moves; ending on the left half of 界 takes both.
+        let mut selection = Selection::new(1, body, parser.screen(), 3, 1);
+        assert_eq!(highlights(&selection), [0..0, 0..0, 0..0, 0..0]);
+        selection.update(4, 3);
+        assert_eq!(highlights(&selection), [1..8, 0..8, 0..4, 0..0]);
+        assert_eq!(selection.text(), "ne\ntwo\nab界");
+        // Starting on the right half of 界 takes both as well.
+        let mut selection = Selection::new(1, body, parser.screen(), 5, 3);
+        selection.update(4, 4);
+        assert_eq!(highlights(&selection), [0..0, 0..0, 2..8, 0..3]);
+        assert_eq!(selection.text(), "界def\n界x");
     }
 }

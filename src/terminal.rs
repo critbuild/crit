@@ -204,10 +204,12 @@ impl Session {
                             if let Some((ty, data)) = copy {
                                 let _ = tx.send(Event::Clipboard { ty, data });
                             }
-                            if !reader_dirty.swap(true, Ordering::AcqRel)
-                                && tx.try_send(Event::Dirty(id)).is_err()
-                            {
-                                reader_dirty.store(false, Ordering::Release);
+                            // Wakes the UI once per frame: the flag stays set until a frame has
+                            // drawn the pane. A full queue is waited out, as dropping the wake-up
+                            // would leave the pane stale until the app wrote again. Only this
+                            // thread waits, and it holds no lock, so the UI never waits on it.
+                            if !reader_dirty.swap(true, Ordering::AcqRel) {
+                                let _ = tx.send(Event::Dirty(id));
                             }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -289,14 +291,18 @@ impl Session {
         Ok(())
     }
 
-    pub fn key(&self, key: KeyEvent) -> Result<()> {
+    /// Sends a key to the program, showing its live output again: returns whether the pane was
+    /// scrolled back, so that its view moved.
+    pub fn key(&self, key: KeyEvent) -> Result<bool> {
         if !self.alive.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(false);
         }
-        let (application_cursor, keyboard) = {
+        let (scrolled, application_cursor, keyboard) = {
             let mut parser = self.parser.lock();
+            let scrolled = parser.screen().scrollback() != 0;
             parser.screen_mut().set_scrollback(0);
             (
+                scrolled,
                 parser.screen().application_cursor(),
                 parser
                     .callbacks()
@@ -306,19 +312,24 @@ impl Session {
         };
         let mut bytes = Vec::new();
         keys::write_key(&mut bytes, key, application_cursor, keyboard)?;
-        self.send(bytes)
+        self.send(bytes)?;
+        Ok(scrolled)
     }
 
-    pub fn paste(&self, text: &str) -> Result<()> {
+    /// Pastes into the program, showing its live output again: returns whether the pane was
+    /// scrolled back, as `key` does.
+    pub fn paste(&self, text: &str) -> Result<bool> {
         if !self.alive.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(false);
         }
-        let bracketed = {
+        let (scrolled, bracketed) = {
             let mut parser = self.parser.lock();
+            let scrolled = parser.screen().scrollback() != 0;
             parser.screen_mut().set_scrollback(0);
-            parser.screen().bracketed_paste()
+            (scrolled, parser.screen().bracketed_paste())
         };
-        self.send(paste_bytes(text, bracketed))
+        self.send(paste_bytes(text, bracketed))?;
+        Ok(scrolled)
     }
 
     pub fn scroll_to(&self, offset: usize) {
@@ -448,7 +459,7 @@ impl Session {
 
 /// Whether any cell of the screen holds a character that shows: a blank does not.
 fn shows_text(screen: &vt100::Screen) -> bool {
-    screen.contents().chars().any(|c| !c.is_whitespace())
+    screen.has_text()
 }
 
 /// The bytes for one paste: bracketed when the app asked for it, with escape
@@ -1212,6 +1223,35 @@ mod tests {
                 Err(_) => panic!("the OSC 52 copy was not forwarded as an event"),
             }
         }
+    }
+
+    #[test]
+    fn output_wakes_the_ui_even_when_its_queue_was_full() {
+        // The queue's one slot is taken before the child writes, so the wake-up for its output
+        // finds the queue full.
+        let (tx, events) = std::sync::mpsc::sync_channel(1);
+        tx.send(Event::Shutdown).unwrap();
+        let session = spawn_program(
+            "/bin/sh",
+            &["-c", "sleep 0.2; printf painted; exec sleep 30"],
+            tx,
+        );
+        // As a frame does, so that the next output wakes the UI.
+        session.dirty.store(false, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !session.has_output() {
+            assert!(
+                Instant::now() < deadline,
+                "the child's output never reached the parser"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // Once the UI catches up with its queue, it still hears of the output.
+        assert!(matches!(events.recv(), Ok(Event::Shutdown)));
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(5)),
+            Ok(Event::Dirty(1))
+        ));
     }
 
     #[test]

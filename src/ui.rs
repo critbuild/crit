@@ -15,6 +15,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
+use std::ops::Range;
 use std::sync::atomic::Ordering;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -677,64 +678,20 @@ fn draw_workspace(
             selection.filter(|selection| selection.session == session.id && selection.body == body);
         let scrollbar = scrollbar(parser.screen_mut(), body);
         let screen = parser.screen();
-        for row in 0..body.height {
-            for col in 0..body.width {
-                let Some(cell) = selection.map_or_else(
-                    || screen.cell(row, col),
-                    |selection| selection.cell(row, col),
-                ) else {
-                    continue;
-                };
-                let target = &mut frame.buffer_mut()[(body.x + col, body.y + row)];
-                if cell.is_wide_continuation() {
-                    target.set_diff_option(ratatui::buffer::CellDiffOption::Skip);
-                    continue;
-                }
-                let symbol = if cell.has_contents() {
-                    cell.contents()
-                } else {
-                    " "
-                };
-                if !cell.is_wide() && symbol.len() > 3 && symbol.contains('\u{fe0f}') {
-                    // vt100 gave this emoji presentation sequence one column; drop VS16 so the
-                    // outer terminal uses one column too. Cells hold at most 22 bytes.
-                    let mut text = [0_u8; 32];
-                    let mut len = 0;
-                    for ch in symbol.chars().filter(|&ch| ch != '\u{fe0f}') {
-                        len += ch.encode_utf8(&mut text[len..]).len();
+        if !body.is_empty() {
+            let buffer = frame.buffer_mut();
+            let rows = body.y..body.bottom();
+            match selection {
+                Some(selection) => {
+                    for ((cells, highlight), y) in selection.rows().zip(rows) {
+                        copy_row(buffer, body, y, cells.iter(), highlight);
                     }
-                    target.set_symbol(std::str::from_utf8(&text[..len]).unwrap_or(" "));
-                } else {
-                    target.set_symbol(symbol);
                 }
-                let mut style = Style::default()
-                    .fg(vt_color(cell.fgcolor(), FG))
-                    .bg(vt_color(cell.bgcolor(), BG));
-                if cell.bold() {
-                    style = style.add_modifier(Modifier::BOLD);
+                None => {
+                    for (row, y) in screen.visible_rows().zip(rows) {
+                        copy_row(buffer, body, y, row.cells(), 0..0);
+                    }
                 }
-                if cell.dim() {
-                    style = style.add_modifier(Modifier::DIM);
-                }
-                if cell.italic() {
-                    style = style.add_modifier(Modifier::ITALIC);
-                }
-                if cell.underline() {
-                    style = style.add_modifier(Modifier::UNDERLINED);
-                }
-                if cell.inverse() {
-                    style = style.add_modifier(Modifier::REVERSED);
-                }
-                if cell.hyperlink().is_some() {
-                    style = style.add_modifier(Modifier::UNDERLINED);
-                }
-                if selection.is_some_and(|selection| selection.selected(row, col)) {
-                    style = style
-                        .fg(SURFACE)
-                        .bg(ACCENT)
-                        .remove_modifier(Modifier::REVERSED);
-                }
-                target.set_style(style);
             }
         }
         // The copy loop blanked the body; until the program paints, say what it is waiting for.
@@ -779,6 +736,75 @@ fn draw_workspace(
         );
     }
     None
+}
+
+/// Copies one row of a pane's terminal cells into row `y` of `body`, as far as the body is
+/// wide, giving the `highlight` columns the selection's colours.
+///
+/// The cells must still be as the frame starts them, blank and without modifiers: nothing
+/// draws under a pane's body before this. So a blank is left alone, as setting a symbol is the
+/// costliest step here and most cells of a screen are usually blank, and the colours and
+/// modifiers are assigned outright rather than merged in from a `Style`.
+fn copy_row<'a>(
+    buffer: &mut Buffer,
+    body: Rect,
+    y: u16,
+    cells: impl Iterator<Item = &'a vt100::Cell>,
+    highlight: Range<u16>,
+) {
+    // One bounds check for the row instead of one per cell.
+    let start = buffer.index_of(body.x, y);
+    let end = buffer.index_of(body.right() - 1, y) + 1;
+    let targets = &mut buffer.content[start..end];
+    for ((col, cell), target) in (0..body.width).zip(cells).zip(targets) {
+        if cell.is_wide_continuation() {
+            target.set_diff_option(ratatui::buffer::CellDiffOption::Skip);
+            continue;
+        }
+        let symbol = cell.contents();
+        if symbol.len() > 3 && !cell.is_wide() && symbol.contains('\u{fe0f}') {
+            set_symbol_without_vs16(target, symbol);
+        } else if !symbol.is_empty() && symbol != " " {
+            target.set_symbol(symbol);
+        }
+        let mut modifier = Modifier::empty();
+        if cell.bold() {
+            modifier |= Modifier::BOLD;
+        }
+        if cell.dim() {
+            modifier |= Modifier::DIM;
+        }
+        if cell.italic() {
+            modifier |= Modifier::ITALIC;
+        }
+        if cell.underline() || cell.hyperlink().is_some() {
+            modifier |= Modifier::UNDERLINED;
+        }
+        if highlight.contains(&col) {
+            target.fg = SURFACE;
+            target.bg = ACCENT;
+        } else {
+            target.fg = vt_color(cell.fgcolor(), FG);
+            target.bg = vt_color(cell.bgcolor(), BG);
+            if cell.inverse() {
+                modifier |= Modifier::REVERSED;
+            }
+        }
+        target.modifier = modifier;
+    }
+}
+
+/// vt100 gave this emoji presentation sequence one column; drop VS16 so the outer terminal
+/// uses one column too. Out of `copy_row`, whose loop this rare case slowed down twice over.
+#[cold]
+fn set_symbol_without_vs16(target: &mut ratatui::buffer::Cell, symbol: &str) {
+    // Cells hold at most 22 bytes.
+    let mut text = [0_u8; 32];
+    let mut len = 0;
+    for ch in symbol.chars().filter(|&ch| ch != '\u{fe0f}') {
+        len += ch.encode_utf8(&mut text[len..]).len();
+    }
+    target.set_symbol(std::str::from_utf8(&text[..len]).unwrap_or(" "));
 }
 
 fn scrollbar(screen: &mut vt100::Screen, body: Rect) -> Option<Scrollbar> {

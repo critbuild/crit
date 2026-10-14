@@ -92,11 +92,12 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
         c: char,
     ) {
         let unhandled = |screen: &mut crate::screen::Screen| {
-            self.callbacks.unhandled_csi(
+            unhandled_csi(
+                &mut self.callbacks,
                 screen,
                 intermediates.first().copied(),
                 intermediates.get(1).copied(),
-                &params.iter().collect::<Vec<_>>(),
+                params,
                 c,
             );
         };
@@ -145,21 +146,23 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                             });
                         self.callbacks.resize(&mut self.screen, (rows, cols));
                     } else {
-                        self.callbacks.unhandled_csi(
+                        unhandled_csi(
+                            &mut self.callbacks,
                             &mut self.screen,
                             None,
                             None,
-                            &params.iter().collect::<Vec<_>>(),
+                            params,
                             c,
                         );
                     }
                 }
                 _ => {
-                    self.callbacks.unhandled_csi(
+                    unhandled_csi(
+                        &mut self.callbacks,
                         &mut self.screen,
                         None,
                         None,
-                        &params.iter().collect::<Vec<_>>(),
+                        params,
                         c,
                     );
                 }
@@ -174,21 +177,23 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
                 'h' => self.screen.decset(params, unhandled),
                 'l' => self.screen.decrst(params, unhandled),
                 _ => {
-                    self.callbacks.unhandled_csi(
+                    unhandled_csi(
+                        &mut self.callbacks,
                         &mut self.screen,
                         Some(b'?'),
                         intermediates.get(1).copied(),
-                        &params.iter().collect::<Vec<_>>(),
+                        params,
                         c,
                     );
                 }
             },
             Some(i) => {
-                self.callbacks.unhandled_csi(
+                unhandled_csi(
+                    &mut self.callbacks,
                     &mut self.screen,
                     Some(*i),
                     intermediates.get(1).copied(),
-                    &params.iter().collect::<Vec<_>>(),
+                    params,
                     c,
                 );
             }
@@ -237,6 +242,31 @@ impl<CB: crate::callbacks::Callbacks> vte::Perform for WrappedScreen<CB> {
             }
         }
     }
+}
+
+/// vte keeps at most this many parameters and subparameters per sequence.
+const MAX_CSI_PARAMS: usize = 32;
+
+/// Hands a CSI sequence to [`Callbacks::unhandled_csi`], with its parameters
+/// collected on the stack: apps send unhandled sequences such as the
+/// synchronized update mode (`CSI ? 2026 h`) for every frame they draw.
+///
+/// [`Callbacks::unhandled_csi`]: crate::Callbacks::unhandled_csi
+fn unhandled_csi<CB: crate::callbacks::Callbacks>(
+    callbacks: &mut CB,
+    screen: &mut crate::screen::Screen,
+    i1: Option<u8>,
+    i2: Option<u8>,
+    params: &vte::Params,
+    c: char,
+) {
+    let mut slices: [&[u16]; MAX_CSI_PARAMS] = [&[]; MAX_CSI_PARAMS];
+    let mut len = 0;
+    for (slot, param) in slices.iter_mut().zip(params) {
+        *slot = param;
+        len += 1;
+    }
+    callbacks.unhandled_csi(screen, i1, i2, &slices[..len], c);
 }
 
 fn canonicalize_params_1(params: &vte::Params, default: u16) -> u16 {

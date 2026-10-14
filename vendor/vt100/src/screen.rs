@@ -532,6 +532,9 @@ impl Screen {
 
     /// Returns the [`Cell`](crate::Cell) object at the given location in the
     /// terminal, if it exists.
+    ///
+    /// This finds the row again on every call: to read the whole screen, use
+    /// [`visible_rows`](Self::visible_rows) instead.
     #[must_use]
     pub fn cell(&self, row: u16, col: u16) -> Option<&crate::Cell> {
         self.grid().visible_cell(crate::grid::Pos { row, col })
@@ -543,6 +546,25 @@ impl Screen {
         self.grid()
             .visible_row(row)
             .is_some_and(crate::row::Row::wrapped)
+    }
+
+    /// Returns the rows of the terminal from top to bottom, after taking the
+    /// scrollback offset into account like [`cell`](Self::cell) does.
+    ///
+    /// A row from the scrollback can be wider than the screen, see
+    /// [`Row::cells`](crate::Row::cells).
+    pub fn visible_rows(&self) -> impl Iterator<Item = &crate::Row> {
+        self.grid().visible_rows()
+    }
+
+    /// Returns whether any cell of the terminal shows a character other than
+    /// whitespace, after taking the scrollback offset into account.
+    ///
+    /// This gives the same answer as looking for such a character in
+    /// [`contents`](Self::contents), without building the string.
+    #[must_use]
+    pub fn has_text(&self) -> bool {
+        self.grid().has_text()
     }
 
     /// Returns whether the alternate screen is currently in use.
@@ -728,33 +750,26 @@ impl Screen {
         {
             return;
         }
-        for part in uri {
+        // vte split the URI at its semicolons: join the parts again, and keep
+        // the URI only once every part is known to be valid
+        let mut joined = String::with_capacity(
+            uri.iter().map(|part| part.len()).sum::<usize>() + uri.len() - 1,
+        );
+        for (i, part) in uri.iter().enumerate() {
             let Ok(part) = std::str::from_utf8(part) else {
                 return;
             };
             if part.chars().any(char::is_control) {
                 return;
             }
-            // Validate every segment before allocating a retained URI.
+            if i > 0 {
+                joined.push(';');
+            }
+            joined.push_str(part);
         }
-        if let [part] = uri {
-            if !part.is_empty() {
-                // Validated above; no temporary allocation for ordinary URIs.
-                self.attrs.hyperlink = Some(std::sync::Arc::from(
-                    std::str::from_utf8(part).unwrap(),
-                ));
-            }
-        } else {
-            let mut joined = String::with_capacity(
-                uri.iter().map(|part| part.len()).sum::<usize>() + uri.len() - 1,
-            );
-            for (i, part) in uri.iter().enumerate() {
-                if i > 0 {
-                    joined.push(';');
-                }
-                joined.push_str(std::str::from_utf8(part).unwrap());
-            }
-            self.attrs.hyperlink = Some(std::sync::Arc::from(joined));
+        // an empty URI ends the link
+        if !joined.is_empty() {
+            self.attrs.hyperlink = Some(std::sync::Arc::new(joined));
         }
     }
 

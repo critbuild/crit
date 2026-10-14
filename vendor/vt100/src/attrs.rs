@@ -26,7 +26,9 @@ pub struct Attrs {
     pub fgcolor: Color,
     pub bgcolor: Color,
     pub mode: u8,
-    pub hyperlink: Option<std::sync::Arc<str>>,
+    // `Arc<String>` is a thin pointer where `Arc<str>` is a fat one: this
+    // keeps every cell 48 bytes instead of 56 on 64-bit targets.
+    pub hyperlink: Option<std::sync::Arc<String>>,
 }
 
 impl Attrs {

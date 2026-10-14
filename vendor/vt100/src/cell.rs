@@ -82,11 +82,16 @@ impl Cell {
     /// Can include multiple unicode characters if combining characters are
     /// used, but will contain at most one character with a non-zero character
     /// width.
-    // Since contents has been constructed by appending chars encoded as UTF-8 it will be valid UTF-8
-    #[allow(clippy::missing_panics_doc)]
     #[must_use]
     pub fn contents(&self) -> &str {
-        std::str::from_utf8(&self.contents[..self.len()]).unwrap()
+        let bytes = &self.contents[..self.len()];
+        debug_assert!(std::str::from_utf8(bytes).is_ok());
+        // SAFETY: the contents are only ever written by `append_char`, which
+        // encodes a whole `char` as UTF-8 and adds its length to `len` (and by
+        // `append`, which first writes an ASCII space), so the first `len`
+        // bytes are always valid UTF-8. This runs for every cell of every
+        // frame, so it does not validate them again.
+        unsafe { std::str::from_utf8_unchecked(bytes) }
     }
 
     /// Returns whether the cell contains any text data.
@@ -132,10 +137,13 @@ impl Cell {
     /// Returns the OSC 8 URI attached to this cell, independent of its label.
     #[must_use]
     pub fn hyperlink(&self) -> Option<&str> {
-        self.attrs.hyperlink.as_deref()
+        self.attrs.hyperlink.as_deref().map(String::as_str)
     }
 
-    pub(crate) fn set_hyperlink(&mut self, uri: Option<std::sync::Arc<str>>) {
+    pub(crate) fn set_hyperlink(
+        &mut self,
+        uri: Option<std::sync::Arc<String>>,
+    ) {
         self.attrs.hyperlink = uri;
     }
 

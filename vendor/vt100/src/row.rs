@@ -1,5 +1,7 @@
 use crate::term::BufWrite as _;
 
+/// A row of terminal cells, as returned by
+/// [`Screen::visible_rows`](crate::Screen::visible_rows).
 #[derive(Clone, Debug)]
 pub struct Row {
     cells: Vec<crate::Cell>,
@@ -7,7 +9,7 @@ pub struct Row {
 }
 
 impl Row {
-    pub fn new(cols: u16) -> Self {
+    pub(crate) fn new(cols: u16) -> Self {
         Self {
             cells: std::iter::repeat_with(crate::Cell::new)
                 .take(usize::from(cols))
@@ -17,7 +19,7 @@ impl Row {
     }
 
     /// Clears the row for reuse at the given width, keeping its allocation.
-    pub fn reset(&mut self, cols: u16) {
+    pub(crate) fn reset(&mut self, cols: u16) {
         self.cells.truncate(usize::from(cols));
         for cell in &mut self.cells {
             *cell = crate::Cell::new();
@@ -26,7 +28,7 @@ impl Row {
         self.wrapped = false;
     }
 
-    pub fn cols(&self) -> u16 {
+    pub(crate) fn cols(&self) -> u16 {
         self.cells
             .len()
             .try_into()
@@ -34,37 +36,42 @@ impl Row {
             .unwrap()
     }
 
-    pub fn clear(&mut self, attrs: crate::attrs::Attrs) {
+    pub(crate) fn clear(&mut self, attrs: crate::attrs::Attrs) {
         for cell in &mut self.cells {
             cell.clear(attrs.without_hyperlink());
         }
         self.wrapped = false;
     }
 
-    fn cells(&self) -> impl Iterator<Item = &crate::Cell> {
+    /// Returns the cells of the row, from left to right.
+    ///
+    /// A row from the scrollback can be wider than the screen: history is
+    /// only padded, never cut, when the screen gets narrower, so take as many
+    /// cells as are shown.
+    pub fn cells(&self) -> impl Iterator<Item = &crate::Cell> {
         self.cells.iter()
     }
 
-    pub fn get(&self, col: u16) -> Option<&crate::Cell> {
+    pub(crate) fn get(&self, col: u16) -> Option<&crate::Cell> {
         self.cells.get(usize::from(col))
     }
 
-    pub fn get_mut(&mut self, col: u16) -> Option<&mut crate::Cell> {
+    pub(crate) fn get_mut(&mut self, col: u16) -> Option<&mut crate::Cell> {
         self.cells.get_mut(usize::from(col))
     }
 
-    pub fn insert(&mut self, i: u16, cell: crate::Cell) {
+    pub(crate) fn insert(&mut self, i: u16, cell: crate::Cell) {
         self.cells.insert(usize::from(i), cell);
         self.wrapped = false;
     }
 
-    pub fn remove(&mut self, i: u16) {
+    pub(crate) fn remove(&mut self, i: u16) {
         self.clear_wide(i);
         self.cells.remove(usize::from(i));
         self.wrapped = false;
     }
 
-    pub fn erase(&mut self, i: u16, attrs: crate::attrs::Attrs) {
+    pub(crate) fn erase(&mut self, i: u16, attrs: crate::attrs::Attrs) {
         let wide = self.cells[usize::from(i)].is_wide();
         self.clear_wide(i);
         self.cells[usize::from(i)].clear(attrs);
@@ -73,7 +80,7 @@ impl Row {
         }
     }
 
-    pub fn truncate(&mut self, len: u16) {
+    pub(crate) fn truncate(&mut self, len: u16) {
         self.cells.truncate(usize::from(len));
         self.wrapped = false;
         let last_cell = &mut self.cells[usize::from(len) - 1];
@@ -82,7 +89,7 @@ impl Row {
         }
     }
 
-    pub fn resize(&mut self, len: u16, cell: crate::Cell) {
+    pub(crate) fn resize(&mut self, len: u16, cell: crate::Cell) {
         if len > 0 && usize::from(len) < self.cells.len() {
             // Shrinking may cut away a wide character's continuation cell.
             // Use the same cleanup as insert/delete truncation.
@@ -93,15 +100,17 @@ impl Row {
         self.wrapped = false;
     }
 
-    pub fn wrap(&mut self, wrap: bool) {
+    pub(crate) fn wrap(&mut self, wrap: bool) {
         self.wrapped = wrap;
     }
 
+    /// Returns whether the text in the row continues on the next row.
+    #[must_use]
     pub fn wrapped(&self) -> bool {
         self.wrapped
     }
 
-    pub fn clear_wide(&mut self, col: u16) {
+    pub(crate) fn clear_wide(&mut self, col: u16) {
         let cell = &self.cells[usize::from(col)];
         let other = if cell.is_wide() {
             &mut self.cells[usize::from(col + 1)]
@@ -113,7 +122,22 @@ impl Row {
         other.clear(other.attrs().without_hyperlink());
     }
 
-    pub fn write_contents(
+    /// Whether any of the first `width` cells shows a character other than
+    /// whitespace. Like `write_contents`, this skips the cell after a wide
+    /// character.
+    pub(crate) fn has_text(&self, width: u16) -> bool {
+        let mut prev_was_wide = false;
+        self.cells().take(usize::from(width)).any(|cell| {
+            if prev_was_wide {
+                prev_was_wide = false;
+                return false;
+            }
+            prev_was_wide = cell.is_wide();
+            cell.contents().chars().any(|c| !c.is_whitespace())
+        })
+    }
+
+    pub(crate) fn write_contents(
         &self,
         contents: &mut String,
         start: u16,
@@ -152,7 +176,7 @@ impl Row {
         }
     }
 
-    pub fn write_contents_formatted(
+    pub(crate) fn write_contents_formatted(
         &self,
         contents: &mut Vec<u8>,
         start: u16,
@@ -299,7 +323,7 @@ impl Row {
     // while it's true that most of the logic in this is identical to
     // write_contents_formatted, i can't figure out how to break out the
     // common parts without making things noticeably slower.
-    pub fn write_contents_diff(
+    pub(crate) fn write_contents_diff(
         &self,
         contents: &mut Vec<u8>,
         prev: &Self,

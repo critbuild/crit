@@ -74,8 +74,9 @@ pub enum Event {
         preparation_error: Option<String>,
         result: Result<(Worktree, bool), String>,
     },
-    /// Background Git discovery: each repository that listed successfully, keyed by its common
-    /// directory. Failures leave the last known metadata intact.
+    /// Background Git discovery: each repository that changed since its last listing and listed
+    /// successfully, keyed by its common directory. Unchanged repositories and failures leave the
+    /// last known metadata intact.
     Metadata(Vec<(PathBuf, Vec<Worktree>)>),
     Removed {
         tree: String,

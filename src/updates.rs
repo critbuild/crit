@@ -1,9 +1,14 @@
 use anyhow::{Context, Result};
 use std::{
-    fs::File,
+    fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom},
-    os::unix::process::CommandExt,
+    os::unix::{
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        process::CommandExt,
+    },
+    path::Path,
     process::{Child, Command, Stdio},
+    time::{Duration, SystemTime},
 };
 
 const TOOLS: [(&str, &str, &str); 2] = [
@@ -11,6 +16,12 @@ const TOOLS: [(&str, &str, &str); 2] = [
     ("OpenCode", "opencode", "upgrade"),
 ];
 const DIAGNOSTIC_BYTES: u64 = 4096;
+/// In the workspace state directory. Its modification time is when the updaters last started;
+/// it holds no data.
+const STAMP_FILE: &str = "updates.stamp";
+/// The updaters start at most this often. Each one boots a heavy runtime that a low-power machine
+/// feels at every launch, while the tools release far less often than Crit starts.
+const UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
 // A private, automatically removed file captures both streams without pipe
 // backpressure, updater banners, or unbounded in-memory output buffers.
@@ -80,18 +91,39 @@ impl UpdateProcess {
 
 /// The updaters running in the background, each reported on once, when it finishes. Dropping
 /// this leaves the ones still running alone: an interrupted install is worse than an orphan.
+#[derive(Default)]
 pub struct Checks {
     /// In tool order, by the name their notice carries. An updater that could not start keeps
     /// its error here for the first `poll`.
     updaters: Vec<(String, Result<UpdateProcess, String>)>,
 }
 
-/// Starts every updater at once and returns without waiting for any of them.
-pub fn start() -> Checks {
-    Checks::spawn(&TOOLS)
+/// Starts every updater at once, unless they already started less than `UPDATE_INTERVAL` ago, and
+/// returns without waiting for any of them. `state_dir` is the directory of the workspace store
+/// this window owns, which keeps the stamp. Without one nothing starts: updating is the job of the
+/// window that owns the saved workspace, and with no usable state directory at all, nothing
+/// would keep every launch from updating again.
+pub fn start(state_dir: Option<&Path>) -> Checks {
+    Checks::start(state_dir, &TOOLS)
 }
 
 impl Checks {
+    /// `start`, with `tools` in place of the real updaters.
+    fn start(state_dir: Option<&Path>, tools: &[(&str, &str, &str)]) -> Self {
+        let Some(directory) = state_dir else {
+            return Self::default();
+        };
+        let stamp = directory.join(STAMP_FILE);
+        let now = SystemTime::now();
+        if fresh(&stamp, now) {
+            return Self::default();
+        }
+        // Updating matters more than the stamp: one that cannot be written only means the next
+        // launch updates again.
+        let _ = touch(&stamp, now);
+        Self::spawn(tools)
+    }
+
     fn spawn(tools: &[(&str, &str, &str)]) -> Self {
         let updaters = tools
             .iter()
@@ -130,14 +162,49 @@ impl Checks {
     }
 }
 
+/// Whether `stamp` says the updaters started less than `UPDATE_INTERVAL` before `now`. Only a
+/// private file counts. A time in the future counts as fresh: the clock has gone back since it
+/// was written (as on a machine without a battery-backed clock, before it syncs), so the stamp's
+/// own time is the likelier one.
+fn fresh(stamp: &Path, now: SystemTime) -> bool {
+    fs::symlink_metadata(stamp).is_ok_and(|metadata| {
+        private_file(&metadata)
+            && metadata.modified().is_ok_and(|modified| {
+                now.duration_since(modified)
+                    .map_or(true, |age| age < UPDATE_INTERVAL)
+            })
+    })
+}
+
+/// Sets `stamp`'s modification time to `now`, creating it if it is missing. Like the workspace
+/// state beside it, it is owner-private and never written through a link.
+fn touch(stamp: &Path, now: SystemTime) -> io::Result<()> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(stamp)?;
+    if !private_file(&file.metadata()?) {
+        return Err(io::Error::other(
+            "updates stamp is not a regular, singly linked file owned by the current user",
+        ));
+    }
+    file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    file.set_modified(now)
+}
+
+/// What `restore` requires of its state files: a regular, singly linked file owned by the
+/// current user.
+fn private_file(metadata: &fs::Metadata) -> bool {
+    metadata.is_file() && metadata.uid() == unsafe { libc::geteuid() } && metadata.nlink() == 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        fs,
-        path::Path,
-        time::{Duration, Instant},
-    };
+    use std::time::Instant;
 
     /// Polls until every updater has finished; the notices, in the order they came.
     fn finish(checks: &mut Checks) -> Vec<String> {
@@ -258,5 +325,110 @@ exit 9"#,
         drop(checks);
         fs::write(directory.path().join("go"), "").unwrap();
         wait_for(&directory.path().join("finished"));
+    }
+
+    /// One updater that always starts, so a start that is not skipped has one running.
+    const ALWAYS: [(&str, &str, &str); 1] = [("True", "/bin/true", "update")];
+
+    fn modified(path: &Path) -> SystemTime {
+        fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    fn set_modified(path: &Path, time: SystemTime) {
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    #[test]
+    fn without_the_saved_workspace_nothing_starts() {
+        assert!(Checks::start(None, &ALWAYS).updaters.is_empty());
+    }
+
+    #[test]
+    fn a_missing_stamp_starts_the_updaters_and_is_written() {
+        let directory = tempfile::tempdir().unwrap();
+        let stamp = directory.path().join(STAMP_FILE);
+        let mut checks = Checks::start(Some(directory.path()), &ALWAYS);
+        assert_eq!(checks.updaters.len(), 1);
+        assert!(finish(&mut checks).is_empty());
+        let metadata = fs::symlink_metadata(&stamp).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        // A launch later the same day leaves both the updaters and the stamp alone.
+        assert!(
+            Checks::start(Some(directory.path()), &ALWAYS)
+                .updaters
+                .is_empty()
+        );
+        assert_eq!(modified(&stamp), metadata.modified().unwrap());
+    }
+
+    #[test]
+    fn a_stale_stamp_starts_the_updaters_and_is_renewed() {
+        let directory = tempfile::tempdir().unwrap();
+        let stamp = directory.path().join(STAMP_FILE);
+        fs::write(&stamp, "").unwrap();
+        fs::set_permissions(&stamp, fs::Permissions::from_mode(0o644)).unwrap();
+        let stale = SystemTime::now() - UPDATE_INTERVAL - Duration::from_secs(60);
+        set_modified(&stamp, stale);
+        let mut checks = Checks::start(Some(directory.path()), &ALWAYS);
+        assert_eq!(checks.updaters.len(), 1);
+        assert!(finish(&mut checks).is_empty());
+        assert!(modified(&stamp) > stale + UPDATE_INTERVAL);
+        assert_eq!(
+            fs::metadata(&stamp).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(
+            Checks::start(Some(directory.path()), &ALWAYS)
+                .updaters
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_fresh_stamp_starts_nothing_and_is_left_alone() {
+        let directory = tempfile::tempdir().unwrap();
+        let stamp = directory.path().join(STAMP_FILE);
+        fs::write(&stamp, "").unwrap();
+        let now = SystemTime::now();
+        // A stamp from the future is fresh too: the clock went back after it was written.
+        for written in [
+            now - UPDATE_INTERVAL + Duration::from_secs(60),
+            now + UPDATE_INTERVAL,
+        ] {
+            set_modified(&stamp, written);
+            let before = modified(&stamp);
+            assert!(
+                Checks::start(Some(directory.path()), &ALWAYS)
+                    .updaters
+                    .is_empty()
+            );
+            assert_eq!(modified(&stamp), before);
+        }
+    }
+
+    #[test]
+    fn a_stamp_that_cannot_be_written_does_not_hold_updates_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let stamp = directory.path().join(STAMP_FILE);
+        let target = directory.path().join("elsewhere");
+        fs::write(&target, "").unwrap();
+        // Stale, so a stamp written through the link would renew it.
+        set_modified(&target, SystemTime::now() - UPDATE_INTERVAL * 2);
+        let before = modified(&target);
+        std::os::unix::fs::symlink(&target, &stamp).unwrap();
+        // The link is never followed, so every launch updates, as before there were stamps.
+        for _ in 0..2 {
+            let mut checks = Checks::start(Some(directory.path()), &ALWAYS);
+            assert_eq!(checks.updaters.len(), 1);
+            assert!(finish(&mut checks).is_empty());
+        }
+        assert_eq!(modified(&target), before);
+        assert!(fs::symlink_metadata(&stamp).unwrap().is_symlink());
     }
 }
