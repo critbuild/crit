@@ -89,7 +89,7 @@ const layouts = [
   { id: 'horizontal', label: 'Top & bottom', key: 'Ctrl+Shift+.' },
 ];
 
-const MARK: Record<State, string> = { working: '*', input: '!', idle: '·' };
+const MARK: Record<State, string> = { working: '⠹', input: '◆', idle: '●' };
 const STATE_WORD: Record<State, string> = { working: 'working', input: 'waiting for input', idle: 'idle' };
 const STATE_TEXT: Record<State, string> = { working: 'is working', input: 'is waiting for input', idle: 'is idle' };
 const GLYPH: Partial<Record<Line['kind'], string>> = { cmd: '$', prompt: '$', agent: '›', busy: '•', ask: '?' };

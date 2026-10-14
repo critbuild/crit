@@ -4456,11 +4456,18 @@ pub fn run(
     let mut streaming = false;
     let mut held_since: Option<Instant> = None;
     let mut redraw = true;
+    // How long after `last_draw` the tab bar's animations (spinners, a blinking decision
+    // mark, a scrolling label) next change; `None` while nothing on it moves, so an idle
+    // window draws nothing.
+    let mut tick: Option<Duration> = None;
     while !app.should_quit {
         app.refresh_metadata();
         let failures = checks.poll();
         if !failures.is_empty() {
             app.append_notice(&failures.join("\n"));
+            redraw = true;
+        }
+        if tick.is_some_and(|tick| last_draw.elapsed() >= tick) {
             redraw = true;
         }
         if redraw && last_draw.elapsed() >= frame_interval(streaming, last_typed) {
@@ -4471,7 +4478,7 @@ pub fn run(
             let overdue = held_since.is_some_and(|since| since.elapsed() >= max_hold);
             if overdue || !app.frame_held() {
                 draw_frame(&mut terminal, &output, size, |frame| {
-                    ui::draw(frame, &mut app)
+                    tick = ui::draw(frame, &mut app);
                 })?;
                 redraw = false;
                 let now = Instant::now();
@@ -4497,7 +4504,12 @@ pub fn run(
                 Err(_) => break,
             }
         } else {
-            match rx.recv_timeout(App::METADATA_INTERVAL) {
+            // Up to the next animation frame, else the metadata poll.
+            let wait = tick.map_or(App::METADATA_INTERVAL, |tick| {
+                tick.saturating_sub(last_draw.elapsed())
+                    .min(App::METADATA_INTERVAL)
+            });
+            match rx.recv_timeout(wait) {
                 Ok(event) => Some(event),
                 Err(mpsc::RecvTimeoutError::Timeout) => None,
                 Err(_) => break,
@@ -4573,7 +4585,11 @@ mod tests {
             app.project.split_ratio = 6_000;
             let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
             ui::resize_sessions(&mut app, ratatui::layout::Size::new(120, 24)).unwrap();
-            terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+            terminal
+                .draw(|frame| {
+                    ui::draw(frame, &mut app);
+                })
+                .unwrap();
             for pane in &app.panes {
                 assert_eq!(
                     app.project.workspaces[0].sessions[pane.session]
@@ -4645,7 +4661,11 @@ mod tests {
         assert!(!app.frame_held());
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
         ui::resize_sessions(&mut app, ratatui::layout::Size::new(120, 24)).unwrap();
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         assert!(!app.panes.is_empty());
         assert!(!app.frame_held());
         let parser = app.project.workspaces[0].sessions[0].parser.clone();
@@ -4660,7 +4680,11 @@ mod tests {
         assert!(app.frame_held());
         // Without that list it falls back to what the last frame drew, and with neither, holds
         // nothing.
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         app.next_panes.clear();
         assert!(app.frame_held());
         app.panes.clear();
@@ -5054,7 +5078,11 @@ mod tests {
         ));
 
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(160, 24)).unwrap();
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         let row = |y| {
             (0..160)
                 .map(|x| terminal.backend().buffer()[(x, y)].symbol())
@@ -5100,7 +5128,11 @@ mod tests {
             app.project.secondary = Some(1);
             app.project.focus_secondary = true;
             let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
-            terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+            terminal
+                .draw(|frame| {
+                    ui::draw(frame, &mut app);
+                })
+                .unwrap();
             let handle = app.split_divider.unwrap().handle;
             let mouse = |kind, column, row| {
                 Event::Input(crossterm::event::Event::Mouse(
@@ -5128,7 +5160,11 @@ mod tests {
             assert_eq!(app.project.split_ratio, initial_ratio);
             app.handle(mouse(MouseEventKind::Drag(MouseButton::Left), 78 + grab, 0))
                 .unwrap();
-            terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+            terminal
+                .draw(|frame| {
+                    ui::draw(frame, &mut app);
+                })
+                .unwrap();
             assert_eq!(app.split_divider.unwrap().track.x, 79);
             assert_eq!(app.panes[0].body.width, 77);
             assert_eq!(app.panes[1].body.width, 39);
@@ -5138,7 +5174,11 @@ mod tests {
             // Capture continues outside the grip, but neither pane can collapse.
             app.handle(mouse(MouseEventKind::Drag(MouseButton::Left), 0, 0))
                 .unwrap();
-            terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+            terminal
+                .draw(|frame| {
+                    ui::draw(frame, &mut app);
+                })
+                .unwrap();
             assert_eq!(app.panes[0].body.width, 26);
             app.handle(mouse(
                 MouseEventKind::Up(MouseButton::Left),
@@ -5146,7 +5186,11 @@ mod tests {
                 u16::MAX,
             ))
             .unwrap();
-            terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+            terminal
+                .draw(|frame| {
+                    ui::draw(frame, &mut app);
+                })
+                .unwrap();
             assert_eq!(app.panes[1].body.width, 26);
             assert!(app.split_drag.is_none());
             let released = app.project.split_ratio;
@@ -5162,7 +5206,11 @@ mod tests {
         app.project.layout = LayoutMode::Vertical;
         app.project.secondary = Some(1);
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         let mouse = |kind, column, row| {
             Event::Input(crossterm::event::Event::Mouse(
                 crossterm::event::MouseEvent {
@@ -5188,11 +5236,19 @@ mod tests {
         assert_eq!(app.project.split_ratio, ratio);
         assert!(app.split_drag.is_none());
         let mut small = Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
-        small.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        small
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         assert!(app.split_divider.is_none());
         assert_eq!(app.panes.len(), 1);
 
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         let handle = app.split_divider.unwrap().handle;
         app.handle(mouse(
             MouseEventKind::Down(MouseButton::Left),
@@ -5265,7 +5321,11 @@ mod tests {
         }
         app.project.workspaces[0].sessions.push(session);
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 14)).unwrap();
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         let bar = app.panes[0].scrollbar.unwrap();
         assert_eq!(app.panes[0].body.bottom(), 14);
         assert_eq!(bar.thumb.bottom(), bar.track.bottom());
@@ -5292,7 +5352,11 @@ mod tests {
                 .contents()
                 .starts_with("row-00")
         );
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         // A drag remains captured even after the pointer leaves the narrow gutter.
         app.handle(mouse(
             MouseEventKind::Drag(MouseButton::Left),
@@ -5313,11 +5377,19 @@ mod tests {
         assert!(app.scroll_drag.is_none());
         app.notice = Some("Environment ready".into());
         ui::resize_sessions(&mut app, ratatui::layout::Size::new(40, 14)).unwrap();
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         assert_eq!(app.panes[0].body.bottom(), 13);
         app.notice = None;
         ui::resize_sessions(&mut app, ratatui::layout::Size::new(40, 14)).unwrap();
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         assert_eq!(app.panes[0].body.bottom(), 14);
     }
 
@@ -5329,7 +5401,11 @@ mod tests {
         app.project.secondary = Some(1);
         app.project.focus_secondary = true;
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         let old_body = app.panes[1].body;
         app.close_workspace();
         app.handle(Event::Input(crossterm::event::Event::Mouse(MouseEvent {
@@ -5343,7 +5419,11 @@ mod tests {
         assert_eq!(app.focused().tree.id, "main");
         assert_eq!(app.project.workspaces.len(), 1);
         assert!(!app.project.focus_secondary);
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         assert_eq!(app.panes.len(), 1);
         assert_eq!(app.panes[0].workspace, 0);
     }
@@ -6061,7 +6141,11 @@ mod tests {
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 14)).unwrap();
         app.notice = Some("Environment ready".into());
         ui::resize_sessions(&mut app, size).unwrap();
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         let reduced = app.panes[0].body;
         app.handle(mouse_event(
             MouseEventKind::Down(MouseButton::Left),
@@ -6072,7 +6156,11 @@ mod tests {
         assert!(app.notice.is_none());
         // The press removed the notice, so the next frame's body is one row taller.
         ui::resize_sessions(&mut app, size).unwrap();
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         let full = app.panes[0].body;
         assert_eq!(full.height, reduced.height + 1);
         app.handle(mouse_event(
@@ -6131,7 +6219,11 @@ mod tests {
             ),
         ] {
             app.modal = Some(modal);
-            terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+            terminal
+                .draw(|frame| {
+                    ui::draw(frame, &mut app);
+                })
+                .unwrap();
             let buffer = terminal.backend().buffer();
             let rows: Vec<String> = (0..buffer.area.height)
                 .map(|row| {
@@ -6169,7 +6261,11 @@ mod tests {
                 .collect::<String>(),
         );
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 14)).unwrap();
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         let buffer = terminal.backend().buffer();
         let last: String = (0..40)
             .map(|column| buffer[(column, 13)].symbol())
@@ -6187,7 +6283,11 @@ mod tests {
             // The window is tall enough for both panes; the rows a notice takes are not.
             for notice in [None, Some("one\ntwo\nthree")] {
                 app.notice = notice.map(Into::into);
-                terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        ui::draw(frame, &mut app);
+                    })
+                    .unwrap();
                 assert_eq!(app.panes.len(), 2);
             }
         }
@@ -6243,7 +6343,11 @@ mod tests {
         let session = sleeping_session(&app, directory.path(), 1);
         app.project.workspaces[0].sessions.push(session);
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         app.state_dirty = false;
         let body = app.panes[0].body;
         for kind in [
@@ -6258,7 +6362,11 @@ mod tests {
         // Clicking the other pane really moves focus, and that is saved.
         app.project.layout = LayoutMode::Vertical;
         app.project.secondary = Some(1);
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         let other = app.panes[1].body;
         app.handle(mouse_event(
             MouseEventKind::Down(MouseButton::Left),
@@ -6312,7 +6420,11 @@ mod tests {
         let session = sleeping_session(&app, directory.path(), 1);
         app.project.workspaces[0].sessions.push(session);
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         let body = app.panes[0].body;
         // Over the pane, then over the tab bar.
         for (column, row) in [(body.x + 1, body.y + 1), (1, 0)] {
@@ -6354,7 +6466,11 @@ mod tests {
         app.project.secondary_session = Some(1);
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
         ui::resize_sessions(&mut app, ratatui::layout::Size::new(120, 24)).unwrap();
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         let (left, right) = (app.panes[0].body, app.panes[1].body);
         assert!(right.x >= left.right());
 
@@ -6404,7 +6520,11 @@ mod tests {
 
         // A release over a dialog hides the pane, but still ends the drag at the program that
         // took the press, so nothing stays captured for a later click.
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         app.handle(mouse_event(
             MouseEventKind::Down(MouseButton::Left),
             left.x + 1,
@@ -8272,16 +8392,60 @@ mod tests {
             ("beta", 0)
         );
 
-        // The bar renders both projects; clicking another project's tab switches to it.
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
-        let row: String = terminal.backend().buffer().content[..100]
+        // The bar renders both projects; clicking another project's tab switches to it. Each
+        // worktree tab is 24 columns now, so the five cells need a wide window.
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(160, 24)).unwrap();
+        let mut tick = None;
+        terminal
+            .draw(|frame| {
+                tick = ui::draw(frame, &mut app);
+            })
+            .unwrap();
+        let row: String = terminal.backend().buffer().content[..160]
             .iter()
             .map(|cell| cell.symbol())
             .collect();
         for expected in ["alpha", "1 main", "2 dev", "beta"] {
             assert!(row.contains(expected), "{expected:?} missing from {row:?}");
         }
+        // Every worktree tab is the same width (number, an 18-column label slot, mark) and
+        // shows the ready mark; nothing on the bar moves, so no frame is asked for.
+        let widths: Vec<u16> = app
+            .tab_hits
+            .iter()
+            .filter(|hit| hit.workspace.is_some())
+            .map(|hit| hit.area.width)
+            .collect();
+        assert_eq!(widths, [24, 24, 24]);
+        assert_eq!(row.matches('●').count(), 3, "{row:?}");
+        assert_eq!(tick, None);
+        // A long label scrolls and a working tab spins, in a background project too: both
+        // ask for a next frame. beta is current here; alpha is `saved_projects[0]`.
+        app.saved_projects[0].workspaces[1].tree.branch = "fix-juror-ranker-silent-fallback".into();
+        terminal
+            .draw(|frame| {
+                tick = ui::draw(frame, &mut app);
+            })
+            .unwrap();
+        assert!(
+            tick.is_some_and(|tick| tick <= Duration::from_millis(2500)),
+            "{tick:?}"
+        );
+        app.saved_projects[0].workspaces[1].tree.branch = "dev".into();
+        let directory = tempfile::tempdir().unwrap();
+        let session = sleeping_session(&app, directory.path(), 1);
+        app.saved_projects[0].workspaces[0].sessions.push(session);
+        app.saved_projects[0].workspaces[0].sessions[0].state = AgentState::Working;
+        terminal
+            .draw(|frame| {
+                tick = ui::draw(frame, &mut app);
+            })
+            .unwrap();
+        assert!(
+            tick.is_some_and(|tick| tick <= Duration::from_millis(125)),
+            "{tick:?}"
+        );
+        app.saved_projects[0].workspaces[0].sessions.clear();
         let dev = app
             .tab_hits
             .iter()
@@ -8308,7 +8472,11 @@ mod tests {
         assert_eq!(names(&app), ["alpha", "beta"]);
 
         // Clicking a project name switches to that project's focused worktree.
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         let beta = app
             .tab_hits
             .iter()
@@ -8576,7 +8744,11 @@ mod tests {
             dialog.error = Some(error.into());
             let mut terminal =
                 Terminal::new(ratatui::backend::TestBackend::new(80, height)).unwrap();
-            terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+            terminal
+                .draw(|frame| {
+                    ui::draw(frame, app);
+                })
+                .unwrap();
             let buffer = terminal.backend().buffer();
             (0..height)
                 .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
@@ -8608,7 +8780,11 @@ mod tests {
         let (mut app, _queued, _events) = interaction_app();
         app.project.active = 1;
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(30, 10)).unwrap();
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         let hit = app
             .tab_hits
             .iter()
@@ -8658,7 +8834,11 @@ mod tests {
     /// One frame the way the main loop makes it: sessions sized first, then the screen.
     fn draw_frame(app: &mut App, terminal: &mut Terminal<ratatui::backend::TestBackend>) {
         ui::resize_sessions(app, terminal.size().unwrap()).unwrap();
-        terminal.draw(|frame| ui::draw(frame, app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, app);
+            })
+            .unwrap();
     }
 
     fn screen_row(terminal: &Terminal<ratatui::backend::TestBackend>, row: u16) -> String {
@@ -8913,7 +9093,11 @@ mod tests {
             &app.modal,
             Some(Modal::Confirm(Confirm::RemoveWorktree { tree: Some(tree) })) if tree.id == "feature/login"
         ));
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         let rows = screen_rows(&terminal);
         assert!(
             rows.iter()
@@ -8932,7 +9116,11 @@ mod tests {
             Some(Modal::Removal { tree, error: None, .. }) if tree == "feature/login"
         ));
         // No tab will close, so the progress dialog does not promise one.
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         let rows = screen_rows(&terminal);
         assert!(
             rows.iter()
@@ -8972,7 +9160,11 @@ mod tests {
         };
         assert_eq!(tree.id, "other");
         assert!(app.project.workspaces[1].pending);
-        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        terminal
+            .draw(|frame| {
+                ui::draw(frame, &mut app);
+            })
+            .unwrap();
         let rows = screen_rows(&terminal);
         assert!(
             rows.iter()

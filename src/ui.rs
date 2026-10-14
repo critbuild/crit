@@ -16,7 +16,9 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use std::ops::Range;
+use std::sync::LazyLock;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
@@ -29,6 +31,26 @@ const SURFACE: Color = Color::Rgb(32, 44, 56);
 const ACCENT: Color = Color::Rgb(144, 191, 255);
 const GREEN: Color = Color::Rgb(165, 214, 179);
 const AMBER: Color = Color::Rgb(232, 188, 128);
+
+/// Columns every worktree tab gives its label, so that tabs line up and keep their places
+/// when a branch is switched or renamed. A longer label scrolls through the slot.
+const LABEL_WIDTH: usize = 18;
+/// The working mark's frames: a braille spinner, one frame per `SPINNER_STEP`.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_STEP: Duration = Duration::from_millis(125);
+/// The decision mark alternates between its filled and hollow forms at this pace.
+const BLINK_STEP: Duration = Duration::from_millis(500);
+/// A long label rests at its start for this long before it scrolls, like a departures board,
+/// so that its beginning can be read, then moves one column per `TICKER_STEP` until it has
+/// come round to the start again.
+const TICKER_DWELL: Duration = Duration::from_millis(2500);
+const TICKER_STEP: Duration = Duration::from_millis(200);
+/// Separates the end of a scrolling label from its next beginning.
+const TICKER_GAP: &str = "  ·  ";
+
+/// The clock behind the tab bar's animations: one for all of them, so every spinner and
+/// scrolling label moves in step.
+static ANIMATION: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 fn areas(app: &App, size: Size) -> ([Rect; 2], usize) {
     let mut content = size;
@@ -197,7 +219,10 @@ pub fn resize_sessions(app: &mut App, size: Size) -> Result<()> {
     Ok(())
 }
 
-pub fn draw(frame: &mut Frame, app: &mut App) {
+/// Draws the whole window. Returns how long until the tab bar's animations (a working mark's
+/// spinner, a blinking decision mark, a scrolling label) next change, so the main loop can
+/// draw again then; `None` while nothing on the bar moves.
+pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Duration> {
     app.split_divider = None;
     let bounds = frame.area();
     app.interaction_visible = bounds.width >= 30 && bounds.height >= 10;
@@ -215,10 +240,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 .wrap(Wrap { trim: false }),
             bounds,
         );
-        return;
+        return None;
     }
     let width = draw_key_mode(frame, app.native_keys, Some(app.limiter.hint()));
-    draw_tabs(frame, app, bounds.width.saturating_sub(width));
+    let tick = draw_tabs(frame, app, bounds.width.saturating_sub(width));
     let (regions, count) = areas(app, Size::new(bounds.width, bounds.height));
     let pane_width = worktree_pane_width(app, bounds.width);
     let content_width = bounds.width - pane_width;
@@ -305,13 +330,17 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(modal) = &app.modal {
         draw_modal(frame, app, modal);
     }
+    tick
 }
 
 /// Every open project contributes a name cell and one cell per worktree, in
 /// opening order, so other projects stay visible and clickable. Cells are
 /// staged in `tab_hits` (capacity reused across frames) and trimmed to the
-/// visible window around the focused tab.
-fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) {
+/// visible window around the focused tab. Worktree cells are all the same width
+/// (`LABEL_WIDTH` for the label), so tabs stay put when labels change; a long
+/// label scrolls through its slot. Returns how long until a mark or label drawn
+/// here next changes, `None` when none of them moves.
+fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
     let focused = app.focused_index();
     let App {
         project,
@@ -327,12 +356,12 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) {
             project: slot,
             workspace: None,
         });
-        for (index, workspace) in open.workspaces.iter().enumerate() {
+        for index in 0..open.workspaces.len() {
             if slot.is_none() && index == focused {
                 focused_cell = tab_hits.len();
             }
             tab_hits.push(TabHit {
-                area: Rect::new(0, 0, (workspace.label().width() as u16 + 8).min(34), 1),
+                area: Rect::new(0, 0, tab_cell_width(index), 1),
                 project: slot,
                 workspace: Some(index),
             });
@@ -352,6 +381,8 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) {
         );
         x = 2;
     }
+    let clock = ANIMATION.elapsed();
+    let mut tick: Option<Duration> = None;
     let mut end = start;
     for (cell, hit) in tab_hits.iter_mut().enumerate().skip(start) {
         let cell_width = hit.area.width.min(width.saturating_sub(x));
@@ -375,12 +406,14 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) {
             ),
             Some(index) => {
                 let workspace = &open.workspaces[index];
-                let (mark, color) = state_style(workspace.state());
+                let (mark, color, mark_tick) = tab_mark(workspace.state(), clock);
+                let (label, label_tick) = ticker(workspace.label(), LABEL_WIDTH, clock);
+                tick = [tick, mark_tick, label_tick].into_iter().flatten().min();
                 let selected = current && index == focused;
                 (
                     Line::from(vec![
                         Span::raw(format!(" {} ", index + 1)),
-                        Span::raw(workspace.label()),
+                        Span::raw(label),
                         Span::styled(format!(" {mark} "), Style::default().fg(color)),
                     ]),
                     Style::default()
@@ -398,6 +431,86 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) {
     }
     tab_hits.truncate(end);
     tab_hits.drain(..start);
+    tick
+}
+
+/// Columns of worktree tab `index`: its number, the label slot and the mark, each with a
+/// space on either side.
+fn tab_cell_width(index: usize) -> u16 {
+    let number = (index + 1).to_string().len();
+    (number + 2 + LABEL_WIDTH + 3) as u16
+}
+
+/// The mark of a tab in `state` at `clock` on the animation clock, its colour, and how long
+/// until it changes (`None`: it does not). A working agent shows a spinner, one waiting for a
+/// decision a diamond that blinks, one that is ready for the next prompt a steady dot.
+fn tab_mark(state: AgentState, clock: Duration) -> (&'static str, Color, Option<Duration>) {
+    match state {
+        AgentState::Working => {
+            let (frame, next) = phase(clock, SPINNER_STEP);
+            (SPINNER[frame % SPINNER.len()], ACCENT, Some(next))
+        }
+        AgentState::Blocked => {
+            let (frame, next) = phase(clock, BLINK_STEP);
+            (if frame % 2 == 0 { "◆" } else { "◇" }, AMBER, Some(next))
+        }
+        AgentState::Idle => ("●", GREEN, None),
+        AgentState::Unknown => ("○", MUTED, None),
+        AgentState::Exited => ("×", MUTED, None),
+    }
+}
+
+/// Which `step` of an animation `clock` falls in, and how long until the next one begins.
+fn phase(clock: Duration, step: Duration) -> (usize, Duration) {
+    let steps = clock.as_millis() / step.as_millis();
+    let next = step - Duration::from_millis((clock.as_millis() % step.as_millis()) as u64);
+    (steps as usize, next)
+}
+
+/// `label` as a worktree tab shows it in `width` columns at `clock`: padded when it fits,
+/// else scrolled like a departures board, resting at its start for `TICKER_DWELL` and then
+/// moving one column per `TICKER_STEP`, `TICKER_GAP` apart from its next beginning, until it
+/// has come round. The second value is how long until the text changes; `None` when it fits.
+fn ticker(label: &str, width: usize, clock: Duration) -> (String, Option<Duration>) {
+    let length = label.width();
+    if length <= width {
+        return (format!("{label}{:pad$}", "", pad = width - length), None);
+    }
+    let loop_width = length + TICKER_GAP.width();
+    let scroll = TICKER_STEP * loop_width as u32;
+    let cycle = (TICKER_DWELL + scroll).as_millis();
+    let at = Duration::from_millis((clock.as_millis() % cycle) as u64);
+    let (offset, next) = if at < TICKER_DWELL {
+        (0, TICKER_DWELL - at)
+    } else {
+        phase(at - TICKER_DWELL, TICKER_STEP)
+    };
+    // The text that goes round: the label, the gap, and the label again for the wrap.
+    let band = format!("{label}{TICKER_GAP}{label}");
+    let mut shown = String::with_capacity(width * 4);
+    let mut skipped = 0;
+    let mut filled = 0;
+    for grapheme in band.graphemes(true) {
+        let columns = grapheme.width();
+        if skipped < offset {
+            // A wide character cut by the window's left edge shows as a blank.
+            skipped += columns;
+            if skipped > offset {
+                shown.push(' ');
+                filled += skipped - offset;
+            }
+            continue;
+        }
+        if filled + columns > width {
+            break;
+        }
+        shown.push_str(grapheme);
+        filled += columns;
+    }
+    for _ in filled..width {
+        shown.push(' ');
+    }
+    (shown, Some(next))
 }
 
 /// The longest prefix of `text`, in whole grapheme clusters, that fits `width` columns, and
@@ -619,7 +732,7 @@ fn draw_workspace(
             .bold(),
     );
     for (index, session) in workspace.sessions.iter().enumerate() {
-        let (_, color) = state_style(session.state);
+        let color = state_color(session.state);
         let active = index == selected;
         // An agent that has not drawn yet is starting, not in an unknown state.
         let name = if session.state == AgentState::Unknown && !session.has_output() {
@@ -831,13 +944,13 @@ fn scrollbar(screen: &mut vt100::Screen, body: Rect) -> Option<Scrollbar> {
     })
 }
 
-fn state_style(state: AgentState) -> (&'static str, Color) {
+/// The colour of a session's state in a workspace header: the colours of `tab_mark`, except
+/// that a ready session is muted here, where every idle shell would otherwise stand out.
+fn state_color(state: AgentState) -> Color {
     match state {
-        AgentState::Working => ("*", GREEN),
-        AgentState::Blocked => ("!", AMBER),
-        AgentState::Idle => ("·", MUTED),
-        AgentState::Unknown => ("?", MUTED),
-        AgentState::Exited => ("x", MUTED),
+        AgentState::Working => ACCENT,
+        AgentState::Blocked => AMBER,
+        AgentState::Idle | AgentState::Unknown | AgentState::Exited => MUTED,
     }
 }
 fn state_name(state: AgentState) -> &'static str {
@@ -2639,5 +2752,68 @@ mod tests {
                 assert!(seen.iter().all(|&shown| shown) || capacity == 0);
             }
         }
+    }
+
+    #[test]
+    fn ticker_pads_short_labels_and_scrolls_long_ones_round_after_a_rest() {
+        let (text, tick) = ticker("main", 8, Duration::from_secs(7));
+        assert_eq!((text.as_str(), tick), ("main    ", None));
+        // A wide label is padded by columns, not characters.
+        let (text, _) = ticker("日本", 6, Duration::ZERO);
+        assert_eq!(text, "日本  ");
+
+        let label = "fix-juror-ranker";
+        let width = 8;
+        // The start rests for the dwell, and asks for a frame when the dwell ends.
+        let (text, tick) = ticker(label, width, Duration::from_millis(1000));
+        assert_eq!(text, "fix-juro");
+        assert_eq!(tick, Some(TICKER_DWELL - Duration::from_millis(1000)));
+        // Then one column per step: three steps in, three columns are gone.
+        let (text, tick) = ticker(label, width, TICKER_DWELL + TICKER_STEP * 3);
+        assert_eq!(text, "-juror-r");
+        assert_eq!(tick, Some(TICKER_STEP));
+        let (text, _) = ticker(
+            label,
+            width,
+            TICKER_DWELL + TICKER_STEP * 3 + Duration::from_millis(50),
+        );
+        assert_eq!(text, "-juror-r");
+        // Past the end, the gap and the label's beginning come round.
+        let steps = (label.width() + TICKER_GAP.width()) as u32;
+        let (text, _) = ticker(label, width, TICKER_DWELL + TICKER_STEP * (steps - 3));
+        assert_eq!(text, "·  fix-j");
+        // A full cycle later it rests at the start again.
+        let (text, tick) = ticker(label, width, TICKER_DWELL + TICKER_STEP * steps);
+        assert_eq!(text, "fix-juro");
+        assert_eq!(tick, Some(TICKER_DWELL));
+        // Every frame is exactly as wide as the slot, wide characters included.
+        let wide = "日本語のブランチ名です";
+        for step in 0..60 {
+            let (text, _) = ticker(wide, 7, TICKER_DWELL + TICKER_STEP * step);
+            assert_eq!(text.width(), 7, "{text:?} at step {step}");
+        }
+    }
+
+    #[test]
+    fn tab_marks_animate_only_while_an_agent_works_or_waits_for_a_decision() {
+        let (first, _, tick) = tab_mark(AgentState::Working, Duration::ZERO);
+        assert_eq!((first, tick), (SPINNER[0], Some(SPINNER_STEP)));
+        let (second, _, tick) = tab_mark(
+            AgentState::Working,
+            SPINNER_STEP + Duration::from_millis(25),
+        );
+        assert_eq!(
+            (second, tick),
+            (SPINNER[1], Some(SPINNER_STEP - Duration::from_millis(25)))
+        );
+        let (wrapped, _, _) = tab_mark(AgentState::Working, SPINNER_STEP * SPINNER.len() as u32);
+        assert_eq!(wrapped, SPINNER[0]);
+        let (filled, _, _) = tab_mark(AgentState::Blocked, Duration::ZERO);
+        let (hollow, _, tick) = tab_mark(AgentState::Blocked, BLINK_STEP);
+        assert_eq!((filled, hollow, tick), ("◆", "◇", Some(BLINK_STEP)));
+        for state in [AgentState::Idle, AgentState::Unknown, AgentState::Exited] {
+            assert_eq!(tab_mark(state, Duration::from_secs(3)).2, None);
+        }
+        assert_eq!(tab_mark(AgentState::Idle, Duration::ZERO).0, "●");
     }
 }
