@@ -1,3 +1,4 @@
+use crate::sandbox::Scratch;
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
@@ -420,18 +421,31 @@ pub type Launch = (String, Vec<String>, Vec<(String, String)>);
 
 /// Return launch-scoped injection; inherited auth, profiles and plugin discovery stay intact.
 /// `resume` is passed through unchecked: callers validate it first (`validate_resume`, plus
-/// `opencode_chats` for OpenCode), because restore checks every chat up front.
+/// `opencode_chats` for OpenCode), because restore checks every chat up front. `scratch` is
+/// the pane's directory in the sandbox, whose note the agent gets in its system prompt.
 pub fn command(
     kind: &str,
     session: u64,
     socket: &Path,
     resume: Option<Resume<'_>>,
+    scratch: Option<&Scratch>,
 ) -> Result<Launch> {
     if !matches!(kind, "omp" | "opencode") {
         bail!("unsupported agent {kind:?}; expected omp or opencode");
     }
     install()?;
-    let directory = assets_directory()?;
+    launch(kind, session, socket, resume, scratch, &assets_directory()?)
+}
+
+/// `command` for the assets installed in `directory`.
+fn launch(
+    kind: &str,
+    session: u64,
+    socket: &Path,
+    resume: Option<Resume<'_>>,
+    scratch: Option<&Scratch>,
+    directory: &Path,
+) -> Result<Launch> {
     let mut env = vec![
         ("CRIT_ENV".into(), "1".into()),
         ("CRIT_SESSION".into(), session.to_string()),
@@ -447,6 +461,10 @@ pub fn command(
     if let Some(Resume::Chat(identity)) = resume {
         env.push(("CRIT_RESUME_ID".into(), identity.into()));
     }
+    // OpenCode has no flag for it: Crit's plugin adds it to every request's system prompt.
+    if let Some(scratch) = scratch {
+        env.push(("CRIT_SANDBOX_NOTE".into(), scratch.note.clone()));
+    }
     let mut args = Vec::new();
     if kind == "omp" {
         // Crit has already chosen the workspace; do not relocate home to /tmp.
@@ -459,6 +477,9 @@ pub fn command(
                 .context("extension path is not UTF-8")?
                 .into(),
         );
+        if let Some(scratch) = scratch {
+            args.extend(["--append-system-prompt".into(), scratch.note.clone()]);
+        }
         match resume {
             Some(Resume::Chat(identity)) => args.extend(["--resume".into(), identity.into()]),
             Some(Resume::Continue) => args.push("--continue".into()),
@@ -842,6 +863,40 @@ mod tests {
         client.write_all(frame).unwrap();
         let mut ack = [0];
         client.read_exact(&mut ack).is_ok() && ack == *b"\n"
+    }
+
+    #[test]
+    fn agents_are_told_where_their_scratch_goes() {
+        // `launch` is `command` without installing the assets in the real data folder.
+        let assets = tempfile::tempdir().unwrap();
+        let socket = assets.path().join("agent.sock");
+        let scratch = Scratch {
+            dir: PathBuf::from("/var/tmp/crit-u/app-0123456789abcdef01234567"),
+            note: "Scratch space: under $TMPDIR (/var/tmp/crit-u/app-0123456789abcdef01234567)."
+                .into(),
+        };
+        let note = ("CRIT_SANDBOX_NOTE".to_owned(), scratch.note.clone());
+        let (program, args, env) =
+            launch("omp", 7, &socket, None, Some(&scratch), assets.path()).unwrap();
+        assert_eq!(program, "omp");
+        let flag = args
+            .iter()
+            .position(|arg| arg == "--append-system-prompt")
+            .expect("OMP gets the note as a system-prompt addition");
+        assert_eq!(args[flag + 1], scratch.note);
+        assert!(env.contains(&note), "{env:?}");
+
+        let (program, args, env) =
+            launch("opencode", 7, &socket, None, Some(&scratch), assets.path()).unwrap();
+        assert_eq!(program, "opencode");
+        let flagged = |args: &[String]| args.iter().any(|arg| arg == "--append-system-prompt");
+        assert!(!flagged(&args), "{args:?}");
+        assert!(env.contains(&note), "{env:?}");
+
+        // Without a sandbox there is nothing to say.
+        let (_, args, env) = launch("omp", 7, &socket, None, None, assets.path()).unwrap();
+        let noted = env.iter().any(|(name, _)| name == "CRIT_SANDBOX_NOTE");
+        assert!(!flagged(&args) && !noted, "{args:?} {env:?}");
     }
 
     #[test]

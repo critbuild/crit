@@ -236,24 +236,7 @@ impl Drop for Store {
 
 impl Store {
     pub fn open() -> Result<Self> {
-        // The XDG spec says a relative XDG_STATE_HOME is invalid and must be ignored, as
-        // `compose::manifest` does; the Compose state and this store then share one base.
-        let base = match std::env::var_os("XDG_STATE_HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-        {
-            Some(base) => base,
-            None => PathBuf::from(
-                std::env::var_os("HOME")
-                    .filter(|value| !value.is_empty())
-                    .context("neither XDG_STATE_HOME nor HOME is set for workspace state")?,
-            )
-            .join(".local/state"),
-        };
-        if !base.is_absolute() {
-            bail!("workspace state base directory must be absolute");
-        }
-        Self::open_in(base.join("crit"))
+        Self::open_in(state_directory()?)
     }
 
     /// Uses this exact directory, without reading or changing global environment.
@@ -317,38 +300,12 @@ impl Store {
     /// A load error never modifies snapshot bytes. The caller must disable saving
     /// after failed recovery rather than overwrite the unreadable snapshot.
     pub fn load(&self) -> Result<Option<Snapshot>> {
-        let path = self.directory.join(SNAPSHOT_FILE);
-        let file = match OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .open(&path)
-        {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(error).with_context(|| format!("opening snapshot {}", path.display()));
-            }
+        let Some(file) = open_snapshot(&self.directory.join(SNAPSHOT_FILE))? else {
+            return Ok(None);
         };
-        private_regular_file(&file).context("invalid workspace snapshot file")?;
         file.set_permissions(fs::Permissions::from_mode(0o600))
             .context("making workspace snapshot private")?;
-        let length = file.metadata()?.len();
-        if length > MAX_SNAPSHOT_BYTES {
-            bail!("workspace snapshot exceeds the {MAX_SNAPSHOT_BYTES}-byte limit");
-        }
-        let mut bytes = Vec::with_capacity(length as usize);
-        file.take(MAX_SNAPSHOT_BYTES + 1)
-            .read_to_end(&mut bytes)
-            .context("reading workspace snapshot")?;
-        if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
-            bail!("workspace snapshot exceeds the {MAX_SNAPSHOT_BYTES}-byte limit");
-        }
-        let snapshot: Snapshot =
-            serde_json::from_slice(&bytes).context("decoding workspace snapshot")?;
-        snapshot
-            .validate()
-            .context("validating workspace snapshot")?;
-        Ok(Some(snapshot))
+        read_snapshot(file).map(Some)
     }
 
     pub fn save(&self, snapshot: &Snapshot) -> Result<()> {
@@ -397,6 +354,81 @@ impl Store {
             .context("snapshot replaced, but syncing its directory failed")?;
         Ok(())
     }
+}
+
+/// The workspace state directory, `$XDG_STATE_HOME/crit`, else `~/.local/state/crit`.
+fn state_directory() -> Result<PathBuf> {
+    // The XDG spec says a relative XDG_STATE_HOME is invalid and must be ignored, as
+    // `compose::manifest` does; the Compose state and this store then share one base.
+    let base = match std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        Some(base) => base,
+        None => PathBuf::from(
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .context("neither XDG_STATE_HOME nor HOME is set for workspace state")?,
+        )
+        .join(".local/state"),
+    };
+    if !base.is_absolute() {
+        bail!("workspace state base directory must be absolute");
+    }
+    Ok(base.join("crit"))
+}
+
+/// The saved workspace as it is on disk, read without the lock that a running window holds
+/// and without changing anything, for commands that only need to know what it names. `None`
+/// when there is none.
+pub fn peek() -> Result<Option<Snapshot>> {
+    peek_in(&state_directory()?)
+}
+
+/// `peek` in this exact state directory.
+fn peek_in(directory: &Path) -> Result<Option<Snapshot>> {
+    match open_snapshot(&directory.join(SNAPSHOT_FILE))? {
+        Some(file) => read_snapshot(file).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// The snapshot file at `path`, the user's own regular file; `None` when there is none.
+fn open_snapshot(path: &Path) -> Result<Option<File>> {
+    let file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("opening snapshot {}", path.display()));
+        }
+    };
+    private_regular_file(&file).context("invalid workspace snapshot file")?;
+    Ok(Some(file))
+}
+
+/// The snapshot `file` holds, validated.
+fn read_snapshot(file: File) -> Result<Snapshot> {
+    let length = file.metadata()?.len();
+    if length > MAX_SNAPSHOT_BYTES {
+        bail!("workspace snapshot exceeds the {MAX_SNAPSHOT_BYTES}-byte limit");
+    }
+    let mut bytes = Vec::with_capacity(length as usize);
+    file.take(MAX_SNAPSHOT_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("reading workspace snapshot")?;
+    if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
+        bail!("workspace snapshot exceeds the {MAX_SNAPSHOT_BYTES}-byte limit");
+    }
+    let snapshot: Snapshot =
+        serde_json::from_slice(&bytes).context("decoding workspace snapshot")?;
+    snapshot
+        .validate()
+        .context("validating workspace snapshot")?;
+    Ok(snapshot)
 }
 
 fn private_regular_file(file: &File) -> Result<()> {
@@ -721,6 +753,23 @@ mod tests {
                 .is_some()
         );
         assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn peeking_reads_what_a_running_owner_saved_without_changing_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = Store::open_in(directory.path()).unwrap();
+        assert_eq!(peek_in(directory.path()).unwrap(), None);
+        owner.save(&snapshot()).unwrap();
+        let path = directory.path().join(SNAPSHOT_FILE);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        assert_eq!(peek_in(directory.path()).unwrap(), Some(snapshot()));
+        // `load` would make it private again; a reader without the lock leaves it as it is.
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o640);
+        fs::write(&path, b"{broken").unwrap();
+        assert!(peek_in(directory.path()).is_err());
+        drop(owner);
     }
 
     #[test]

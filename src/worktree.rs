@@ -84,7 +84,7 @@ fn output_path(bytes: &[u8]) -> PathBuf {
     PathBuf::from(OsStr::from_bytes(bytes))
 }
 
-fn digest(bytes: &[u8]) -> String {
+pub(crate) fn digest(bytes: &[u8]) -> String {
     let hash = Sha256::digest(bytes);
     let mut result = String::with_capacity(24);
     use std::fmt::Write;
@@ -96,7 +96,7 @@ fn digest(bytes: &[u8]) -> String {
 
 // Git may retain registrations for deleted worktrees. Resolve the existing parent
 // in that case as well, so recreating the checkout does not change its identity.
-fn canonical_path(path: &Path) -> Result<PathBuf> {
+pub(crate) fn canonical_path(path: &Path) -> Result<PathBuf> {
     match fs::canonicalize(path) {
         Ok(path) => Ok(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

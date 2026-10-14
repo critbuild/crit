@@ -3,6 +3,7 @@ use crate::{
     integration::{self, AgentState, Resume},
     keys, kitty,
     limits::Limiter,
+    sandbox::Sandbox,
 };
 use anyhow::{Context, Result, bail};
 use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -90,7 +91,11 @@ impl Session {
         cols: u16,
         command: Option<(String, Vec<String>)>,
         limiter: Option<&Limiter>,
+        sandbox: Option<&Sandbox>,
     ) -> Result<Self> {
+        // Every pane keeps its scratch in its workspace's directory in the sandbox. One that
+        // cannot be made is no reason to refuse the pane: it then uses Crit's own temp folder.
+        let scratch = sandbox.and_then(|sandbox| sandbox.workspace(cwd).ok());
         let (program, args, extra_env) = if let Some((program, args)) = command {
             (program, args, Vec::new())
         } else if kind == "shell" {
@@ -100,7 +105,7 @@ impl Session {
                 Vec::new(),
             )
         } else {
-            integration::command(kind, id, socket, resume)?
+            integration::command(kind, id, socket, resume, scratch.as_ref())?
         };
         // Agent panes, with everything they start, run under the agent CPU limit; shells and
         // log followers never do.
@@ -147,6 +152,11 @@ impl Session {
         builder.env("TERM_PROGRAM", "crit");
         builder.env("COLORTERM", "truecolor");
         builder.env("CRIT_WORKTREE", cwd);
+        if let Some(scratch) = &scratch {
+            for name in ["TMPDIR", "TMP", "TEMP"] {
+                builder.env(name, &scratch.dir);
+            }
+        }
         for (key, value) in extra_env {
             builder.env(key, value);
         }
@@ -896,6 +906,7 @@ mod tests {
             80,
             Some((program.into(), args.iter().map(|&arg| arg.into()).collect())),
             None,
+            None,
         )
         .unwrap()
     }
@@ -1189,6 +1200,7 @@ mod tests {
                 vec!["-c".into(), "IFS= read -r line".into()],
             )),
             None,
+            None,
         )
         .unwrap();
         {
@@ -1387,6 +1399,7 @@ mod tests {
             1,
             Some(("/bin/sleep".into(), vec!["5".into()])),
             None,
+            None,
         )
         .unwrap();
         // vt100 panics on 1-row and 1-column grids, which would kill the reader thread.
@@ -1432,6 +1445,7 @@ mod tests {
             80,
             Some(("/bin/sh".into(), vec!["-c".into(), script.into()])),
             Some(&limiter),
+            None,
         )
         .unwrap();
         // The pane is released only once it is in the scope, but its trampoline may not have

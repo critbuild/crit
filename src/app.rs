@@ -5,6 +5,7 @@ use crate::{
     intent::{self, Agent as AgentKind, Command as IntentCommand, Plan},
     keys::{self, Action},
     kitty, limits, restore,
+    sandbox::{self, Sandbox},
     selection::Selection,
     terminal::Session,
     ui, updates,
@@ -700,6 +701,12 @@ pub struct App {
     tx: SyncSender<Event>,
     jobs: SyncSender<Job>,
     use_kitty: bool,
+    /// Where every pane keeps its scratch; `None` when no sandbox could be made.
+    sandbox: Option<Sandbox>,
+    /// A pass over the sandbox runs; its `Event::SandboxCleaned` clears this.
+    sandbox_cleaning: bool,
+    /// When the next pass over the sandbox is due.
+    sandbox_due: Instant,
 }
 
 enum Job {
@@ -755,6 +762,10 @@ enum Job {
     },
     /// Apply the agent CPU limit's setting, as it is when this runs, to the running agents.
     RetuneAgentCpu(limits::Limiter),
+    /// One pass over the sandbox, keeping the workspaces open in this window.
+    CleanSandbox {
+        open: Vec<PathBuf>,
+    },
 }
 #[derive(Clone, Copy)]
 pub enum EnvironmentOp {
@@ -819,6 +830,8 @@ impl App {
     /// does, rather than closing like a Kitty window: it most likely never got going (a tool that
     /// refuses to run can still exit 0), and closing it could end Crit before anyone saw why.
     const AGENT_STARTUP: Duration = Duration::from_secs(1);
+    /// How often a window cleans the sandbox after its pass at startup.
+    const SANDBOX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
     fn refresh_metadata(&mut self) {
         if self.metadata_pending || self.metadata_checked.elapsed() < Self::METADATA_INTERVAL {
@@ -836,6 +849,25 @@ impl App {
                 .is_ok()
         {
             self.metadata_pending = true;
+        }
+    }
+
+    /// Queues a pass over the sandbox when one is due, at startup and then every
+    /// `SANDBOX_INTERVAL`, and none is running.
+    fn clean_sandbox(&mut self) {
+        if self.sandbox.is_none() || self.sandbox_cleaning || Instant::now() < self.sandbox_due {
+            return;
+        }
+        // Every workspace open in this window, in every project.
+        let open = std::iter::once(&self.project)
+            .chain(&self.saved_projects)
+            .flat_map(|project| &project.workspaces)
+            .map(|workspace| workspace.tree.path.clone())
+            .collect();
+        // A full queue is tried again on the main loop's next turn.
+        if self.jobs.try_send(Job::CleanSandbox { open }).is_ok() {
+            self.sandbox_cleaning = true;
+            self.sandbox_due = Instant::now() + Self::SANDBOX_INTERVAL;
         }
     }
 
@@ -1464,6 +1496,7 @@ impl App {
             cols.saturating_sub(2),
             command,
             Some(&self.limiter),
+            self.sandbox.as_ref(),
         )?;
         self.next_session += 1;
         let workspace = &mut self.project.workspaces[index];
@@ -3297,7 +3330,11 @@ impl App {
                     }
                 }
             }
-            Event::Removed { tree, result } => match result {
+            Event::Removed {
+                tree,
+                result,
+                scratch,
+            } => match result {
                 Ok(warning) => {
                     self.workspace_changed();
                     // The progress dialog is this removal's, whichever tab (if any) held the
@@ -3347,6 +3384,9 @@ impl App {
                             "Checkout removed; Git branch and Docker volumes retained.".to_owned()
                         }
                     });
+                    if let Some(error) = scratch {
+                        self.append_notice(&format!("Its scratch stays in the sandbox: {error}"));
+                    }
                 }
                 Err(error) => {
                     if let Some(workspace) = self.all_workspaces_mut().find(|w| w.tree.id == tree) {
@@ -3366,6 +3406,15 @@ impl App {
                 }
             },
             Event::CpuLimit(message) => self.append_notice(&message),
+            Event::SandboxCleaned(result) => {
+                self.sandbox_cleaning = false;
+                // Only what a pass freed, or a sandbox it could not read, is news.
+                match result.map(|report| report.summary()) {
+                    Ok(Some(summary)) => self.append_notice(&summary),
+                    Ok(None) => return Ok(false),
+                    Err(error) => self.append_notice(&error),
+                }
+            }
             Event::Error(error) => self.set_notice(error),
             Event::Shutdown => self.should_quit = true,
         }
@@ -3583,7 +3632,9 @@ fn environment_event(tree: Worktree, operation: EnvironmentOp, source: Option<Pa
     }
 }
 
-fn start_worker(tx: SyncSender<Event>) -> Result<SyncSender<Job>> {
+/// Runs the jobs the UI queues, one at a time, on a thread of their own. `sandbox` is where
+/// panes keep their scratch: deleting a checkout removes its scratch, and passes clean it.
+fn start_worker(tx: SyncSender<Event>, sandbox: Option<Sandbox>) -> Result<SyncSender<Job>> {
     let (jobs, rx) = mpsc::sync_channel(16);
     std::thread::Builder::new()
         .name("commands".into())
@@ -3708,9 +3759,19 @@ fn start_worker(tx: SyncSender<Event>) -> Result<SyncSender<Job>> {
                             worktree::remove(&repository, &tree)?;
                             Ok(warning)
                         })();
+                        // The checkout's scratch has nothing left to serve. One that stays only
+                        // warns: the checkout itself is gone.
+                        let scratch = match (&result, &sandbox) {
+                            (Ok(_), Some(sandbox)) => sandbox
+                                .remove_workspace(&tree.path)
+                                .err()
+                                .map(|error| error.to_string()),
+                            _ => None,
+                        };
                         Event::Removed {
                             tree: tree.id,
                             result: result.map_err(|e| format!("{e:#}")),
+                            scratch,
                         }
                     }
                     Job::Environment {
@@ -3743,6 +3804,29 @@ fn start_worker(tx: SyncSender<Event>) -> Result<SyncSender<Job>> {
                     Job::RetuneAgentCpu(limiter) => match limiter.retune() {
                         Ok(()) => continue,
                         Err(error) => Event::CpuLimit(error),
+                    },
+                    Job::CleanSandbox { open } => match &sandbox {
+                        // A pass walks all the scratch there is: other jobs must not queue
+                        // behind it. `App::sandbox_cleaning` keeps it to one at a time.
+                        Some(sandbox) => {
+                            let cleaner = sandbox.clone();
+                            let cleaned_tx = tx.clone();
+                            match std::thread::Builder::new()
+                                .name("sandbox".into())
+                                .spawn(move || {
+                                    // It must never compete with a game or the agents.
+                                    sandbox::idle_priority();
+                                    let report = cleaner.pass(&open);
+                                    let _ = cleaned_tx.send(Event::SandboxCleaned(report));
+                                }) {
+                                Ok(_) => continue,
+                                Err(error) => Event::SandboxCleaned(Err(format!(
+                                    "The sandbox could not be cleaned: no thread could start: {error}"
+                                ))),
+                            }
+                        }
+                        // Never queued without one; the report still ends the pass.
+                        None => Event::SandboxCleaned(Ok(sandbox::CleanReport::default())),
                     },
                 };
                 if tx.send(event).is_err() {
@@ -3988,6 +4072,7 @@ fn restore_projects(
     snapshot: &restore::Snapshot,
     socket: &Path,
     limiter: &limits::Limiter,
+    sandbox: Option<&Sandbox>,
     tx: &SyncSender<Event>,
     size: ratatui::layout::Size,
     next_session: &mut u64,
@@ -4011,7 +4096,8 @@ fn restore_projects(
     }
     let opencode_chats = integration::opencode_chats(&opencode_ids, &opencode_folders)
         .map_err(|error| format!("{error:#}"));
-    // Every pane reopens as the next session, sized for the window, under the agent CPU limit.
+    // Every pane reopens as the next session, sized for the window, under the agent CPU limit,
+    // with its scratch in the sandbox.
     let mut spawn = |kind: &str, resume: Option<integration::Resume<'_>>, cwd: &Path| {
         let id = *next_session;
         *next_session += 1;
@@ -4026,6 +4112,7 @@ fn restore_projects(
             size.width.saturating_sub(2),
             None,
             Some(limiter),
+            sandbox,
         )
     };
     let mut skipped = Vec::new();
@@ -4193,8 +4280,22 @@ pub fn run(
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         anyhow::bail!("Crit needs an interactive terminal; use --help for noninteractive commands");
     }
+    // Everything startup has to say, shown together. `sticky` keeps it past terminal input:
+    // it reports that saving is off or that saved items were left out.
+    let mut notices: Vec<String> = Vec::new();
+    let mut sticky = false;
+    let sandbox = Sandbox::open(&mut notices);
+    if let Some(sandbox) = &sandbox {
+        for name in ["TMPDIR", "TMP", "TEMP"] {
+            // SAFETY: no other thread exists yet, as `start_worker` below starts the first, so
+            // nothing reads the environment while it changes. Every helper Crit runs (the
+            // updaters, Ask Crit's `omp --print`, Git, Docker) then keeps its temp files in the
+            // sandbox too.
+            unsafe { std::env::set_var(name, sandbox.root()) };
+        }
+    }
     let (tx, rx) = mpsc::sync_channel(128);
-    let jobs = start_worker(tx.clone())?;
+    let jobs = start_worker(tx.clone(), sandbox.clone())?;
     let input_tx = tx.clone();
     let signal_tx = tx.clone();
     let mut signals =
@@ -4235,10 +4336,6 @@ pub fn run(
             viewport: ratatui::Viewport::Fixed(window_size()?.into()),
         },
     )?;
-    // Everything startup has to say, shown together. `sticky` keeps it past terminal input:
-    // it reports that saving is off or that saved items were left out.
-    let mut notices: Vec<String> = Vec::new();
-    let mut sticky = false;
     let mut store = match restore::Store::open() {
         Ok(store) => Some(store),
         Err(error) => {
@@ -4283,6 +4380,7 @@ pub fn run(
             snapshot,
             &server.socket_path,
             &limiter,
+            sandbox.as_ref(),
             &tx,
             terminal.size()?,
             &mut next_session,
@@ -4397,6 +4495,9 @@ pub fn run(
         tx: tx.clone(),
         jobs,
         use_kitty,
+        sandbox,
+        sandbox_cleaning: false,
+        sandbox_due: Instant::now(),
     };
     if !was_restored {
         let launched = if start_shell {
@@ -4462,6 +4563,7 @@ pub fn run(
     let mut tick: Option<Duration> = None;
     while !app.should_quit {
         app.refresh_metadata();
+        app.clean_sandbox();
         let failures = checks.poll();
         if !failures.is_empty() {
             app.append_notice(&failures.join("\n"));
@@ -4575,6 +4677,7 @@ mod tests {
                         40,
                         Some(("/bin/sleep".into(), vec!["30".into()])),
                         None,
+                        None,
                     )
                     .unwrap(),
                 );
@@ -4653,6 +4756,7 @@ mod tests {
                 10,
                 40,
                 Some(("/bin/sleep".into(), vec!["30".into()])),
+                None,
                 None,
             )
             .unwrap(),
@@ -4766,6 +4870,7 @@ mod tests {
                     40,
                     Some(("/bin/sleep".into(), vec!["30".into()])),
                     None,
+                    None,
                 )
                 .unwrap(),
             );
@@ -4829,6 +4934,7 @@ mod tests {
         app.handle(Event::Removed {
             tree: "other".into(),
             result: Err("Docker environment is running".into()),
+            scratch: None,
         })
         .unwrap();
         assert!(
@@ -4883,6 +4989,7 @@ mod tests {
         app.handle(Event::Removed {
             tree: "other".into(),
             result: Err("local changes".into()),
+            scratch: None,
         })
         .unwrap();
         assert!(matches!(
@@ -4936,6 +5043,7 @@ mod tests {
         app.handle(Event::Removed {
             tree: "other".into(),
             result: Err("local changes".into()),
+            scratch: None,
         })
         .unwrap();
         assert!(app.modal.is_none());
@@ -4952,6 +5060,7 @@ mod tests {
         app.handle(Event::Removed {
             tree: "other".into(),
             result: Ok(None),
+            scratch: None,
         })
         .unwrap();
         assert_eq!(app.project.workspaces.len(), 1);
@@ -5020,6 +5129,7 @@ mod tests {
                 "/bin/sh".into(),
                 vec!["-c".into(), "IFS= read -r line".into()],
             )),
+            None,
             None,
         )
         .unwrap();
@@ -5310,6 +5420,7 @@ mod tests {
                 "/bin/sh".into(),
                 vec!["-c".into(), "IFS= read -r line".into()],
             )),
+            None,
             None,
         )
         .unwrap();
@@ -5970,9 +6081,18 @@ mod tests {
         let socket = directory.path().join("unused.sock");
         let size = ratatui::layout::Size::new(80, 24);
         let limiter = limits::Limiter::off();
+        let sandbox = Sandbox::at(&directory.path().join("sandbox"), false);
+        std::fs::create_dir(sandbox.root()).unwrap();
         let mut next_session = 1;
-        let (restored, skipped) =
-            restore_projects(&both, &socket, &limiter, &tx, size, &mut next_session);
+        let (restored, skipped) = restore_projects(
+            &both,
+            &socket,
+            &limiter,
+            Some(&sandbox),
+            &tx,
+            size,
+            &mut next_session,
+        );
         let (current, others) = restored.expect("the surviving project reopens");
         assert_eq!(current.name, "kept");
         assert!(others.is_empty());
@@ -5993,6 +6113,23 @@ mod tests {
                 .iter()
                 .any(|line| line.contains(gone.to_str().unwrap()))
         );
+        // The pane that reopened keeps its scratch in its workspace's directory.
+        let made: Vec<PathBuf> = std::fs::read_dir(sandbox.root())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(made, [sandbox.workspace(&kept).unwrap().dir]);
+        let pid = current.workspaces[0].sessions[0].pid().unwrap();
+        let environment = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+        for name in ["TMPDIR", "TMP", "TEMP"] {
+            let entry = format!("{name}={}", made[0].display());
+            assert!(
+                environment
+                    .split(|&byte| byte == 0)
+                    .any(|variable| variable == entry.as_bytes()),
+                "{name}"
+            );
+        }
 
         // What is left is a state that can be saved again.
         let (mut app, _queued, _app_events) = interaction_app();
@@ -6006,8 +6143,15 @@ mod tests {
         // With every project gone nothing reopens, and no session id is used up.
         let before = next_session;
         let only_gone = snapshot(vec![saved(&gone, &["shell"], false)], 0);
-        let (restored, skipped) =
-            restore_projects(&only_gone, &socket, &limiter, &tx, size, &mut next_session);
+        let (restored, skipped) = restore_projects(
+            &only_gone,
+            &socket,
+            &limiter,
+            None,
+            &tx,
+            size,
+            &mut next_session,
+        );
         assert!(restored.is_none());
         assert_eq!(skipped.len(), 1);
         assert_eq!(next_session, before);
@@ -6050,6 +6194,7 @@ mod tests {
                     "--test-threads=1".into(),
                 ],
             )),
+            None,
             None,
         )
         .unwrap();
@@ -7301,6 +7446,7 @@ mod tests {
             40,
             Some(("/bin/sleep".into(), vec!["30".into()])),
             None,
+            None,
         )
         .unwrap()
     }
@@ -7330,6 +7476,7 @@ mod tests {
                     output.to_string_lossy().into_owned(),
                 ],
             )),
+            None,
             None,
         )
         .unwrap();
@@ -7435,6 +7582,9 @@ mod tests {
             tx,
             jobs,
             use_kitty: false,
+            sandbox: None,
+            sandbox_cleaning: false,
+            sandbox_due: Instant::now(),
         };
         (app, queued, events)
     }
@@ -7566,6 +7716,7 @@ mod tests {
                     10,
                     40,
                     Some(("/bin/sleep".into(), vec!["30".into()])),
+                    None,
                     None,
                 )
                 .unwrap(),
@@ -8015,6 +8166,7 @@ mod tests {
         app.handle(Event::Removed {
             tree: "other".into(),
             result: Ok(None),
+            scratch: None,
         })
         .unwrap();
         assert_eq!(app.focused().tree.id, "third");
@@ -8032,6 +8184,7 @@ mod tests {
         app.handle(Event::Removed {
             tree: "other".into(),
             result: Ok(Some("daemon down".into())),
+            scratch: None,
         })
         .unwrap();
         assert_eq!(app.project.workspaces.len(), 1);
@@ -8045,11 +8198,180 @@ mod tests {
     }
 
     #[test]
+    fn removal_warns_when_the_checkouts_scratch_stays() {
+        let (mut app, _queued, _events) = interaction_app();
+        app.handle(Event::Removed {
+            tree: "other".into(),
+            result: Ok(None),
+            scratch: Some("Permission denied (os error 13)".into()),
+        })
+        .unwrap();
+        assert_eq!(app.project.workspaces.len(), 1);
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(
+                "Checkout removed; Git branch and Docker volumes retained.\nIts scratch stays in the sandbox: Permission denied (os error 13)"
+            )
+        );
+    }
+
+    #[test]
+    fn sandbox_passes_run_on_an_idle_thread_of_their_own_and_report() {
+        let root = tempfile::tempdir().unwrap();
+        let sandbox = Sandbox::at(root.path(), false);
+        let folder = tempfile::tempdir().unwrap();
+        let scratch = sandbox.workspace(folder.path()).unwrap();
+        std::fs::write(scratch.dir.join("clone"), vec![1; 8192]).unwrap();
+        // Its folder is gone, so its scratch goes whatever its age.
+        drop(folder);
+        let open = tempfile::tempdir().unwrap();
+        let kept = sandbox.workspace(open.path()).unwrap();
+        let (tx, events) = mpsc::sync_channel(4);
+        let jobs = start_worker(tx, Some(sandbox)).unwrap();
+        jobs.send(Job::CleanSandbox {
+            open: vec![open.path().to_owned()],
+        })
+        .unwrap();
+        let Event::SandboxCleaned(Ok(report)) =
+            events.recv_timeout(Duration::from_secs(10)).unwrap()
+        else {
+            panic!("the pass did not report");
+        };
+        assert_eq!((report.removed_workspaces, report.removed_entries), (1, 0));
+        assert!(report.removed_bytes >= 8192, "{report:?}");
+        assert!(!scratch.dir.exists() && kept.dir.exists());
+        // A worker without a sandbox still ends every pass it is given with a report.
+        let (tx, events) = mpsc::sync_channel(4);
+        let jobs = start_worker(tx, None).unwrap();
+        jobs.send(Job::CleanSandbox { open: Vec::new() }).unwrap();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(10)).unwrap(),
+            Event::SandboxCleaned(Ok(report)) if report == sandbox::CleanReport::default()
+        ));
+    }
+
+    #[test]
+    fn deleting_a_checkout_removes_its_scratch_and_nothing_else() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        std::fs::create_dir(&root).unwrap();
+        for args in [
+            &["init", "-b", "main"][..],
+            &[
+                "-c",
+                "user.name=Crit Test",
+                "-c",
+                "user.email=crit@example.invalid",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        ] {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let repository = worktree::discover(&root).unwrap();
+        let tree = worktree::create(&repository, "scratch-test", None).unwrap();
+        let sandbox = Sandbox::at(&directory.path().join("sandbox"), false);
+        std::fs::create_dir(sandbox.root()).unwrap();
+        let scratch = sandbox.workspace(&tree.path).unwrap();
+        std::fs::write(scratch.dir.join("venv"), "packages").unwrap();
+        let kept = sandbox.workspace(&root).unwrap();
+        let (tx, events) = mpsc::sync_channel(4);
+        let jobs = start_worker(tx, Some(sandbox)).unwrap();
+        jobs.send(Job::Remove {
+            repository,
+            tree: tree.clone(),
+        })
+        .unwrap();
+        let Event::Removed {
+            tree: removed,
+            result,
+            scratch: warning,
+        } = events.recv_timeout(Duration::from_secs(30)).unwrap()
+        else {
+            panic!("the removal did not report");
+        };
+        assert_eq!(removed, tree.id);
+        assert_eq!((result, warning), (Ok(None), None));
+        assert!(!tree.path.exists() && !scratch.dir.exists());
+        assert!(kept.dir.join(".crit-workspace").exists());
+    }
+
+    #[test]
+    fn the_sandbox_is_cleaned_at_startup_then_daily_one_pass_at_a_time() {
+        let root = tempfile::tempdir().unwrap();
+        let (mut app, queued, _events) = interaction_app();
+        app.clean_sandbox();
+        assert!(queued.try_recv().is_err(), "no sandbox, nothing to clean");
+
+        app.sandbox = Some(Sandbox::at(root.path(), false));
+        app.clean_sandbox();
+        let Ok(Job::CleanSandbox { open }) = queued.try_recv() else {
+            panic!("the first pass is due at once");
+        };
+        assert_eq!(
+            open,
+            ["/interaction-fixture/main", "/interaction-fixture/other"].map(PathBuf::from)
+        );
+        app.sandbox_due = Instant::now();
+        app.clean_sandbox();
+        assert!(queued.try_recv().is_err(), "one pass at a time");
+
+        // A pass that removed nothing says nothing, and asks for no frame.
+        let nothing = sandbox::CleanReport {
+            errors: vec!["unmarked-0123456789abcdef01234567: no marker".into()],
+            ..sandbox::CleanReport::default()
+        };
+        assert!(!app.handle(Event::SandboxCleaned(Ok(nothing))).unwrap());
+        assert_eq!(app.notice, None);
+        app.clean_sandbox();
+        assert!(matches!(queued.try_recv(), Ok(Job::CleanSandbox { .. })));
+
+        app.set_notice("Checkout removed; Git branch and Docker volumes retained.");
+        app.handle(Event::SandboxCleaned(Ok(sandbox::CleanReport {
+            removed_bytes: 2_469_606_195,
+            removed_workspaces: 2,
+            removed_entries: 5,
+            errors: Vec::new(),
+        })))
+        .unwrap();
+        assert_eq!(
+            app.notice.as_deref(),
+            Some(
+                "Checkout removed; Git branch and Docker volumes retained.\nSandbox: removed 2.3 GiB of scratch unused for 30 days (2 workspaces gone, 5 entries)."
+            )
+        );
+        // The next pass is a day away.
+        app.clean_sandbox();
+        assert!(queued.try_recv().is_err());
+        assert!(app.sandbox_due > Instant::now() + App::SANDBOX_INTERVAL - Duration::from_secs(60));
+
+        // A sandbox that cannot be read is the one failure worth a notice.
+        app.notice = None;
+        app.handle(Event::SandboxCleaned(Err(
+            "Sandbox /var/tmp/crit-u could not be cleaned: Permission denied (os error 13)".into(),
+        )))
+        .unwrap();
+        let notice = app.notice.as_deref().unwrap_or_default();
+        assert!(notice.contains("could not be cleaned"), "{notice}");
+        assert!(!app.sandbox_cleaning);
+    }
+
+    #[test]
     fn removed_preparation_source_is_forgotten() {
         let directory = tempfile::tempdir().unwrap();
         let (app, _queued, _events) = interaction_app();
         let (tx, events) = mpsc::sync_channel(8);
-        let jobs = start_worker(tx).unwrap();
+        let jobs = start_worker(tx, None).unwrap();
         // A checkout with no Compose file, so Up fails before Docker is involved.
         let mut tree = app.project.workspaces[0].tree.clone();
         tree.path = directory.path().to_path_buf();
@@ -8192,6 +8514,9 @@ mod tests {
             tx,
             jobs,
             use_kitty: false,
+            sandbox: None,
+            sandbox_cleaning: false,
+            sandbox_due: Instant::now(),
         };
         app.open_project(project, None, false).unwrap();
         assert_eq!(app.project.name, "jyq");
@@ -8241,6 +8566,9 @@ mod tests {
             tx,
             jobs,
             use_kitty: false,
+            sandbox: None,
+            sandbox_cleaning: false,
+            sandbox_due: Instant::now(),
         };
         for command in [
             IntentCommand::OpenWorktree,
@@ -8359,6 +8687,9 @@ mod tests {
             tx,
             jobs,
             use_kitty: false,
+            sandbox: None,
+            sandbox_cleaning: false,
+            sandbox_due: Instant::now(),
         };
         let names = |app: &App| {
             project_slots(&app.project, &app.saved_projects)
@@ -8555,6 +8886,9 @@ mod tests {
             tx,
             jobs,
             use_kitty: false,
+            sandbox: None,
+            sandbox_cleaning: false,
+            sandbox_due: Instant::now(),
         };
         let dialog = |request, id: &str| {
             Modal::Intent(IntentDialog {
@@ -9140,6 +9474,7 @@ mod tests {
         app.handle(Event::Removed {
             tree: "feature/login".into(),
             result: Ok(None),
+            scratch: None,
         })
         .unwrap();
         assert!(app.modal.is_none());
@@ -9175,6 +9510,7 @@ mod tests {
         app.handle(Event::Removed {
             tree: "other".into(),
             result: Ok(None),
+            scratch: None,
         })
         .unwrap();
         assert!(app.modal.is_none(), "the dialog was this removal's");
@@ -9502,6 +9838,7 @@ mod tests {
             10,
             40,
             Some(("/bin/sleep".into(), vec!["30".into()])),
+            None,
             None,
         )
         .unwrap();

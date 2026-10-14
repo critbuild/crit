@@ -128,7 +128,12 @@ impl Limiter {
     /// names the scope, and the trampolines' FIFOs live in it. Whether a scope can hold the
     /// agents is checked once, here, from files alone.
     pub fn new(directory: &Path, percent: u8, limited: bool) -> Self {
-        let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get() as u32);
+        // The share is of the machine, like the memory share: `available_parallelism` would
+        // report a quota Crit itself runs under, as when it is started from an agent pane.
+        let cores = match unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) } {
+            count if count >= 1 => count as u32,
+            _ => 1,
+        };
         // Where it cannot be read, the agents get no memory share.
         let memory = fs::read_to_string("/proc/meminfo")
             .ok()

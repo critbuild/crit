@@ -131,6 +131,7 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
     for branch in ["picker-00", "picker-01"] {
         git_output(&repo, &["branch", branch]);
     }
+    let sandbox = home.path().join("sandbox");
 
     // Never run the user's real agent updaters from a test.
     let bin = home.path().join("bin");
@@ -190,6 +191,8 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
         command.env("PATH", &bin);
         command.env("PS1", "CRIT_TEST> ");
         command.env("XDG_RUNTIME_DIR", home.path());
+        // Scratch must land in the throwaway home, never in the user's sandbox.
+        command.env("CRIT_SANDBOX", &sandbox);
         let mut child = ChildGuard(pair.slave.spawn_command(command).unwrap());
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().unwrap();
@@ -225,12 +228,18 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
             "runtime-ready:{}",
             checkout.canonicalize().unwrap().display()
         );
+        // Every pane's temp folder is its workspace's directory in the sandbox.
+        let scratch = format!(
+            "case \"$TMPDIR\" in '{}'/*) [ -d \"$TMPDIR\" ] && [ \"$TMP\" = \"$TMPDIR\" ] && [ \"$TEMP\" = \"$TMPDIR\" ] && printf 'scratch-%s\\n' sandboxed;; esac\r",
+            sandbox.display()
+        );
         for (input, marker) in [
             ("", "CRIT_TEST>"),
             (
                 "printf 'runtime-%s:%s\\n' ready \"$PWD\"\r",
                 expected.as_str(),
             ),
+            (scratch.as_str(), "scratch-sandboxed"),
         ] {
             writer.write_all(input.as_bytes()).unwrap();
             writer.flush().unwrap();
@@ -855,6 +864,8 @@ impl Crit {
         command.env("PATH", &bin);
         command.env("PS1", "CRIT_TEST> ");
         command.env("XDG_RUNTIME_DIR", home);
+        // Scratch must land in the throwaway home, never in the user's sandbox.
+        command.env("CRIT_SANDBOX", home.join("sandbox"));
         let child = ChildGuard(pair.slave.spawn_command(command).unwrap());
         drop(pair.slave);
         let mut reader = pair.master.try_clone_reader().unwrap();

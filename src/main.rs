@@ -8,6 +8,7 @@ mod keys;
 mod kitty;
 mod limits;
 mod restore;
+mod sandbox;
 mod selection;
 mod terminal;
 mod ui;
@@ -30,6 +31,7 @@ USAGE
   crit env up|restart --source PATH [--repo PATH]
   crit setup kitty|agents|all
   crit keys
+  crit sandbox [status|clean [--all]]
 
 Crit restores your saved workspace on startup. With no saved workspace, choose
 New terminal or any folder. F1 opens Ask Crit. Ctrl+D goes to the focused pane:
@@ -143,6 +145,38 @@ AGENT CPU
   the limit is on instead, the key hint shows LOW, and a notice says why. No
   process can raise that priority again, so turning the limit off then
   applies only to agents started afterwards.
+
+SCRATCH SPACE
+  Agents leave scratch behind: clones, virtualenvs, builds, downloads. In a
+  RAM-backed /tmp those files hold memory, then swap, until they are deleted,
+  and ending the agents frees none of it. So every pane's TMPDIR, TMP and TEMP
+  point to its workspace's folder in a disk-backed sandbox, shells included:
+  the agents' own temp files, worktrees and shell snapshots go there. OMP and
+  OpenCode also get a system-prompt note telling the agent to keep clones,
+  virtualenvs, builds and downloads there, never under /tmp. Crit's own
+  helpers (the updaters, Ask Crit, Git, Docker) use the sandbox too.
+  The sandbox is the first of these that works: CRIT_SANDBOX=DIR, on any
+  filesystem; $TMPDIR/crit-USER when TMPDIR is on a disk (inside a Crit pane,
+  the sandbox TMPDIR is in); /var/tmp/crit-USER; $XDG_CACHE_HOME/crit/sandbox
+  (default ~/.cache/crit/sandbox). It must be a directory you own, not a
+  symlink, and Crit makes it private. Each workspace has SANDBOX/FOLDER-ID
+  there: its folder's name, then an ID of its path.
+  Crit cleans the sandbox by itself. A checkout deleted from Crit, or with
+  crit worktree remove, takes its scratch with it at once. A pass at startup
+  and then daily, in the background at idle CPU and I/O priority, removes the
+  scratch of folders that no longer exist, anything inside a workspace's
+  scratch untouched for 30 days, and the empty folders of workspaces unused
+  for 30 days; a notice says what it freed. A sandbox under /var/tmp is also
+  aged by the system (systemd-tmpfiles).
+  crit sandbox status (or just crit sandbox) shows the sandbox, the space each
+  workspace's scratch takes, and your largest entries in a RAM-backed /tmp.
+  crit sandbox clean runs a pass now; with --all it deletes all scratch, but
+  only while no window owns the saved workspace.
+  At startup a notice says when a RAM-backed /tmp holds over 1 GiB. Files an
+  agent writes to a literal /tmp/... path despite the note still land in RAM,
+  and Crit never deletes them: it did not make them. Without a usable
+  sandbox, scratch stays in the default temp folder, and a notice says why
+  when that is in RAM.
 
 UPDATES
   At most once a day, Crit runs omp update and opencode upgrade together, in
@@ -351,6 +385,7 @@ fn run() -> Result<()> {
     let mut fresh = false;
     let mut agent_cpu = None;
     let mut source = None;
+    let mut all = false;
     while let Some(arg) = args.next() {
         // A non-UTF-8 argument cannot be an option, so it is a positional (a path).
         match arg.to_str() {
@@ -394,6 +429,7 @@ fn run() -> Result<()> {
                     args.next().context("--source requires a checkout path")?,
                 ))
             }
+            Some("--all") => all = true,
             Some("--no-kitty") => use_kitty = false,
             Some(option) if option.starts_with('-') => {
                 bail!("unknown option {option}; use --help")
@@ -427,6 +463,16 @@ fn run() -> Result<()> {
                 .is_some_and(|operation| matches!(operation.to_str(), Some("up" | "restart"))))
     {
         bail!("--source is only available with crit env up|restart");
+    }
+    if all
+        && !(positionals
+            .first()
+            .is_some_and(|command| command.to_str() == Some("sandbox"))
+            && positionals
+                .get(1)
+                .is_some_and(|operation| operation.to_str() == Some("clean")))
+    {
+        bail!("--all is only available with crit sandbox clean");
     }
     match positionals
         .first()
@@ -480,7 +526,9 @@ fn run() -> Result<()> {
                     })?;
                 }
                 Some("remove") if positionals.len() == 3 => {
-                    let path = Path::new(&positionals[2]).canonicalize()?;
+                    // Resolved as the listing resolves it, so a checkout deleted outside Git
+                    // (which the UI's 🗑 can remove) is still found by its registration.
+                    let path = worktree::canonical_path(Path::new(&positionals[2]))?;
                     let tree = worktree::list(&repository)?
                         .into_iter()
                         .find(|t| t.path == path)
@@ -504,6 +552,16 @@ fn run() -> Result<()> {
                     }
                     worktree::remove(&repository, &tree)?;
                     println!("Removed checkout {}; branch retained.", path.display());
+                    // Its scratch has nothing left to serve. One that stays only warns: the
+                    // checkout itself is gone.
+                    if let Ok(sandbox) = sandbox::Sandbox::locate()
+                        && let Err(error) = sandbox.remove_workspace(&path)
+                    {
+                        eprintln!(
+                            "crit: its scratch in {} could not be removed: {error}",
+                            sandbox.root().display()
+                        );
+                    }
                 }
                 _ => bail!("use crit worktree list|create BRANCH|remove PATH [--repo PATH]"),
             }
@@ -535,6 +593,15 @@ fn run() -> Result<()> {
                 _ => bail!("use crit env up|down|restart|status|logs [--repo PATH]"),
             };
             println!("{}", serde_json::to_string_pretty(&environment)?);
+            Ok(())
+        }
+        Some("sandbox") => {
+            match positionals.get(1).map(|operation| operation.to_str()) {
+                None => print!("{}", sandbox::status()),
+                Some(Some("status")) if positionals.len() == 2 => print!("{}", sandbox::status()),
+                Some(Some("clean")) if positionals.len() == 2 => sandbox::clean_command(all)?,
+                _ => bail!("use crit sandbox [status|clean [--all]]"),
+            }
             Ok(())
         }
         _ => bail!("unknown command; use crit --help"),

@@ -22,6 +22,12 @@ const pinOwner = {
   "shell.env": async (_input, output) => {
     if (process.env.CRIT_ENV === "1") output.env.CRIT_AGENT_PID = String(process.pid);
   },
+  // Crit's note on where scratch goes: its sandbox, not a RAM-backed /tmp. OMP takes it as
+  // --append-system-prompt; OpenCode has no such flag, so every request's system prompt gets it.
+  "experimental.chat.system.transform": async (_input, output) => {
+    const note = process.env.CRIT_SANDBOX_NOTE;
+    if (note && !output.system.includes(note)) output.system.push(note);
+  },
 };
 async function server() {
   if (claimed || !ownsLocalLifecycle()) return pinOwner;

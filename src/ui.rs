@@ -1888,6 +1888,7 @@ mod tests {
                     bodies[0].width,
                     Some(("/bin/cat".into(), Vec::new())),
                     None,
+                    None,
                 )
                 .unwrap(),
             );
@@ -2034,6 +2035,7 @@ mod tests {
                 body.width,
                 Some(("/bin/cat".into(), Vec::new())),
                 None,
+                None,
             )
             .unwrap(),
         );
@@ -2112,6 +2114,7 @@ mod tests {
                     content.height,
                     content.width,
                     Some((program.into(), args.iter().map(|&arg| arg.into()).collect())),
+                    None,
                     None,
                 )
                 .unwrap(),

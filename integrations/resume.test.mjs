@@ -318,3 +318,30 @@ test("OpenCode pins the pane owner for child shells", async () => {
     }
   }
 });
+
+test("OpenCode adds Crit's sandbox note to the system prompt once", async () => {
+  const saved = process.env.CRIT_SANDBOX_NOTE;
+  const previousArgs = process.argv;
+  const note = "Scratch space: create every scratch file under $TMPDIR (/var/tmp/crit-u/app-0123); never under /tmp.";
+  try {
+    // The TUI's server worker, and a local `opencode run` that claims the pane.
+    for (const argv of [["node", "opencode"], ["node", "opencode", "run", "hello"]]) {
+      process.argv = argv;
+      const fixture = await hook("opencode.js");
+      const transform = (await fixture.module.default.server())["experimental.chat.system.transform"];
+      process.env.CRIT_SANDBOX_NOTE = note;
+      const output = { system: ["You are OpenCode."] };
+      await transform({ sessionID: "ses_a", model: {} }, output);
+      await transform({ sessionID: "ses_a", model: {} }, output);
+      assert.deepEqual(output.system, ["You are OpenCode.", note], argv.join(" "));
+      delete process.env.CRIT_SANDBOX_NOTE;
+      const outside = { system: ["You are OpenCode."] };
+      await transform({ sessionID: "ses_a", model: {} }, outside);
+      assert.deepEqual(outside.system, ["You are OpenCode."], "outside Crit nothing is added");
+    }
+  } finally {
+    process.argv = previousArgs;
+    if (saved === undefined) delete process.env.CRIT_SANDBOX_NOTE;
+    else process.env.CRIT_SANDBOX_NOTE = saved;
+  }
+});

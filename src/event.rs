@@ -3,6 +3,7 @@ use crate::{
     compose::Environment,
     integration::AgentUpdate,
     intent::{Agent, Plan},
+    sandbox::CleanReport,
     worktree::Worktree,
 };
 use std::path::PathBuf;
@@ -87,6 +88,9 @@ pub enum Event {
         tree: String,
         /// `Ok` carries why Docker could not be checked, when it could not.
         result: Result<Option<String>, String>,
+        /// Why the removed checkout's scratch could not be removed from the sandbox, when it
+        /// could not: only a warning, as the checkout itself is gone.
+        scratch: Option<String>,
     },
     Environment {
         tree: String,
@@ -97,6 +101,8 @@ pub enum Event {
     /// The agent CPU limit could not be applied: what happened. It joins the notice row rather
     /// than replacing it, as it can arrive at any time.
     CpuLimit(String),
+    /// A pass over the sandbox ended: what it removed, or why the sandbox could not be read.
+    SandboxCleaned(Result<CleanReport, String>),
     Error(String),
     Shutdown,
 }
