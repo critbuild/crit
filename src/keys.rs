@@ -18,7 +18,7 @@ pub const HELP: &str = "Crit shortcuts (same as Kitty's terminal/window actions)
   F1                     Ask Crit in natural language (Haiku 5.5)
   F1 then F2             Manual controls: Up/Down and Enter, no AI needed
   F2                     Toggle the worktree pane (click a row to open, 🗑 to delete)
-  F3                     Toggle the OMP/OpenCode CPU limit (default 50%, persistent)
+  F3                     Toggle the agent CPU and memory limit (default 50%, persistent)
   F10                    Exit Crit (confirmation required)
 
 When a shell or agent ends, or Ctrl+Shift+W closes a pane, the pane closes like a

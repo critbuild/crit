@@ -118,22 +118,27 @@ COPY, PASTE, AND LINKS
   reload Kitty configuration with Ctrl+Shift+F5. Other Kitty windows are unaffected.
 
 AGENT CPU
-  Crit limits how much CPU OMP and OpenCode panes use, together with
-  everything they run (builds, tests, tools), so that a game or other apps
-  stay responsive while agents work. Shell panes are never limited. By default
-  the agent panes of a window share 50% of the machine's CPU (half of its
-  cores); --agent-cpu PERCENT (1-100) chooses another share and turns the
-  limit on. F3 turns the limit off and on again, for running agents too; the
-  key hint shows the share, or OFF. The share and F3's choice are saved with
-  the workspace, like F12; --fresh starts over with the default. In native
-  Kitty mode F3 goes to the terminal like every key except F12.
+  Crit limits how much CPU and memory OMP and OpenCode panes use, together
+  with everything they run (builds, tests, tools), so that a game or other
+  apps stay responsive while agents work. Shell panes are never limited. By
+  default the agent panes of a window share 50% of the machine's CPU (half of
+  its cores) and 50% of its memory; --agent-cpu PERCENT (1-100) sets both
+  shares and turns the limit on. F3 turns the limit off and on again, for
+  running agents too; the key hint shows the share, or OFF. The share and
+  F3's choice are saved with the workspace, like F12; --fresh starts over
+  with the default. In native Kitty mode F3 goes to the terminal like every
+  key except F12.
   The agents run in a transient systemd user scope named after the window
-  (crit-<pid>-<random>.scope) that holds the CPU quota. While limited they
-  also get a low CPU weight, so a game and other apps take precedence whenever
-  the CPUs are contended, even while the agents use less than their share.
+  (crit-<pid>-<random>.scope) that holds the CPU quota and the memory share
+  (MemoryHigh). While limited they also get a low CPU weight, so a game and
+  other apps take precedence whenever the CPUs are contended, even while the
+  agents use less than their share. A scope past its memory share is not
+  killed: it is throttled and reclaimed, its pages swapped out first, though
+  systemd-oomd may still kill it when swap runs out. The notice after F3
+  says what is limited; the lower priority below never limits memory.
   An agent that cannot join the scope still starts, unlimited, and a notice
   says so. Docker containers run under the Docker daemon, outside the limit.
-  Without cgroup v2, a systemd user session, busctl and systemctl, or a user
+  Without cgroup v2, a systemd user session, busctl, or a user
   manager that can limit CPU, agents run at a lower priority (nice 10) while
   the limit is on instead, the key hint shows LOW, and a notice says why. No
   process can raise that priority again, so turning the limit off then

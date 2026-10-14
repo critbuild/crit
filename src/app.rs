@@ -9426,14 +9426,18 @@ mod tests {
     fn f3_retunes_the_agent_scope_through_the_worker_and_is_saved() {
         let directory = tempfile::tempdir().unwrap();
         let (mut app, queued, _events) = interaction_app();
-        app.limiter = limits::Limiter::scope(directory.path(), "crit-test.scope", 50, 8, true);
+        app.limiter =
+            limits::Limiter::scope(directory.path(), "crit-test.scope", 50, 8, 32 << 30, true);
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
         draw_frame(&mut app, &mut terminal);
         assert!(screen_row(&terminal, 0).ends_with(" F3 CPU 50% · F12 CRIT KEYS "));
 
         app.handle(key_event(KeyCode::F(3))).unwrap();
         assert!(!app.limiter.limited());
-        assert_eq!(app.notice.as_deref(), Some("Agent CPU limit off."));
+        assert_eq!(
+            app.notice.as_deref(),
+            Some("Agent CPU and memory limit off.")
+        );
         // systemd is never waited for here: the worker retunes the running agents.
         assert!(matches!(queued.try_recv(), Ok(Job::RetuneAgentCpu(_))));
         let snapshot = app.snapshot();
@@ -9449,7 +9453,7 @@ mod tests {
         assert!(app.limiter.limited());
         assert_eq!(
             app.notice.as_deref(),
-            Some("Agents limited to 50% of the CPU (4 of 8 cores).")
+            Some("Agents limited to 50% of the CPU (4 of 8 cores) and memory (16.0 GiB).")
         );
         assert!(matches!(queued.try_recv(), Ok(Job::RetuneAgentCpu(_))));
 

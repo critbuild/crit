@@ -1397,14 +1397,19 @@ mod tests {
         assert_eq!(session.parser.lock().screen().size(), (2, 2));
     }
 
-    /// An OMP pane that runs `script` under a limit of `percent` of one CPU, with the cgroup of
-    /// the scope it runs in; `None` where no systemd user scope can hold agents.
+    /// The memory that `limited_pane`'s limit takes its share of: whole pages, which the kernel
+    /// keeps as they are, and far more than the panes' busy loops use.
+    const PANE_MEMORY: u64 = 4 << 30;
+
+    /// An OMP pane that runs `script` under a limit of `percent` of one CPU and of
+    /// `PANE_MEMORY`, with the cgroup of the scope it runs in; `None` where no systemd user
+    /// scope can hold agents.
     fn limited_pane(
         directory: &Path,
         percent: u8,
         script: &str,
     ) -> Option<(Limiter, Session, std::path::PathBuf)> {
-        let limiter = Limiter::with_cores(directory, percent, 1, true);
+        let limiter = Limiter::with_cores(directory, percent, 1, PANE_MEMORY, true);
         let unit = match limiter.unit() {
             Ok(unit) => unit.to_owned(),
             Err(reason) => {
@@ -1412,6 +1417,9 @@ mod tests {
                 return None;
             }
         };
+        if limiter.memory_high().is_none() {
+            eprintln!("memory not checked: the systemd user manager cannot limit memory here");
+        }
         let (tx, events) = std::sync::mpsc::sync_channel(32);
         let session = Session::spawn(
             1,
@@ -1483,12 +1491,12 @@ mod tests {
     }
 
     #[test]
-    fn agent_panes_run_in_their_scope_at_its_quota() {
+    fn agent_panes_run_in_their_scope_at_its_shares() {
         let directory = tempfile::Builder::new()
             .prefix("crit-test-")
             .tempdir()
             .unwrap();
-        let Some((_limiter, _session, cgroup)) = limited_pane(
+        let Some((limiter, _session, cgroup)) = limited_pane(
             directory.path(),
             100,
             "yes >/dev/null & yes >/dev/null & sleep 3; kill $!",
@@ -1499,6 +1507,11 @@ mod tests {
         // All of one CPU, and other apps go first while the CPUs are contended.
         assert_eq!(read("cpu.max"), "100000 100000\n");
         assert_eq!(read("cpu.weight"), "20\n");
+        // All of `PANE_MEMORY` too, past which the kernel throttles and reclaims the agents
+        // rather than killing them.
+        if limiter.memory_high().is_some() {
+            assert_eq!(read("memory.high"), format!("{PANE_MEMORY}\n"));
+        }
         // What the agent starts runs in its scope too: the shell, both loops and `sleep`.
         wait_for_processes(&cgroup, 4);
         // Two busy processes would keep two CPUs busy; the quota holds them to one. Other
@@ -1508,7 +1521,7 @@ mod tests {
     }
 
     #[test]
-    fn retuning_lifts_and_restores_the_quota_of_running_agents() {
+    fn retuning_lifts_and_restores_the_shares_of_running_agents() {
         let directory = tempfile::Builder::new()
             .prefix("crit-test-")
             .tempdir()
@@ -1522,6 +1535,7 @@ mod tests {
             return;
         };
         let read = |name| std::fs::read_to_string(cgroup.join(name)).unwrap();
+        let memory = limiter.memory_high().is_some();
         wait_for_processes(&cgroup, 4);
         // Over a window the rate strays a little from the quota, either way.
         let window = Duration::from_secs(2);
@@ -1535,12 +1549,19 @@ mod tests {
             (read("cpu.max"), read("cpu.weight")),
             ("max 100000\n".into(), "100\n".into())
         );
+        // The memory share goes with the quota, back to no limit at all, and returns with it.
+        if memory {
+            assert_eq!(read("memory.high"), "max\n");
+        }
         limiter.set_limited(true);
         limiter.retune().unwrap();
         assert_eq!(
             (read("cpu.max"), read("cpu.weight")),
             ("100000 100000\n".into(), "20\n".into())
         );
+        if memory {
+            assert_eq!(read("memory.high"), format!("{PANE_MEMORY}\n"));
+        }
         // The scheduler lets the agents overrun the quota for a moment as it returns, and
         // takes that time back right after.
         std::thread::sleep(Duration::from_secs(1));

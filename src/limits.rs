@@ -1,10 +1,13 @@
-//! Keeps the agents from taking the CPU that a game or other apps need.
+//! Keeps the agents from taking the CPU and memory that a game or other apps need.
 //!
 //! Every OMP and OpenCode pane of a Crit window runs in one transient systemd user scope,
-//! with everything it starts, so that one CPU quota holds the agents back as a whole and a low
-//! CPU weight lets other apps go first whenever the CPUs are contended. Shells are never
-//! limited. Where no scope can hold the agents, those started while the limit is on run at a
-//! lower priority instead.
+//! with everything it starts, so that one CPU quota and one memory share hold the agents back
+//! as a whole and a low CPU weight lets other apps go first whenever the CPUs are contended.
+//! The memory share is `MemoryHigh`: past it the kernel slows the agents down and reclaims
+//! their memory, so that their pages go to swap before a game's, where a hard cap
+//! (`MemoryMax`) would kill a build midway. Shells are never limited. Where no scope can hold
+//! the agents, those started while the limit is on run at a lower priority instead, which
+//! holds no memory.
 
 use crate::event::Event;
 use std::{
@@ -22,8 +25,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The agents' share of the machine's CPU while the limit is on, unless `--agent-cpu` chose
-/// another: half, so that a game keeps the other half.
+/// The agents' share of the machine's CPU and memory while the limit is on, unless
+/// `--agent-cpu` chose another: half, so that a game keeps the other half.
 pub const DEFAULT_PERCENT: u8 = 50;
 
 /// The agents' CPU weight while limited. Other apps have the default 100, so whenever the CPUs
@@ -72,7 +75,7 @@ pub struct Limiter(Arc<Inner>);
 
 struct Inner {
     mechanism: Mechanism,
-    /// The agents' share of the machine's CPU while limited, in percent.
+    /// The agents' share of the machine's CPU and memory while limited, in percent.
     percent: u8,
     /// How many CPUs Crit may use: the share is of these.
     cores: u32,
@@ -88,8 +91,14 @@ struct Inner {
 
 enum Mechanism {
     /// Agents run in this transient scope of the systemd user manager, and their trampolines'
-    /// FIFOs live in `directory`.
-    Scope { unit: String, directory: PathBuf },
+    /// FIFOs live in `directory`. While limited, the scope holds their memory to `memory_high`
+    /// bytes too; `None` where the machine's memory is not known or the user manager cannot
+    /// limit memory, and then the agents get no memory share.
+    Scope {
+        unit: String,
+        directory: PathBuf,
+        memory_high: Option<u64>,
+    },
     /// No scope can hold the agents, for this reason: agents started while the limit is on run
     /// at a lower priority instead.
     Priority(String),
@@ -120,18 +129,33 @@ impl Limiter {
     /// agents is checked once, here, from files alone.
     pub fn new(directory: &Path, percent: u8, limited: bool) -> Self {
         let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get() as u32);
-        Self::with_cores(directory, percent, cores, limited)
+        // Where it cannot be read, the agents get no memory share.
+        let memory = fs::read_to_string("/proc/meminfo")
+            .ok()
+            .as_deref()
+            .and_then(total_memory)
+            .unwrap_or(0);
+        Self::with_cores(directory, percent, cores, memory, limited)
     }
 
-    /// `new`, with the share taken of `cores` CPUs.
-    pub fn with_cores(directory: &Path, percent: u8, cores: u32, limited: bool) -> Self {
+    /// `new`, with the shares taken of `cores` CPUs and of `memory` bytes: 0 is memory that is
+    /// not known, of which the agents get no share.
+    pub fn with_cores(
+        directory: &Path,
+        percent: u8,
+        cores: u32,
+        memory: u64,
+        limited: bool,
+    ) -> Self {
         let mechanism = match probe() {
-            Ok(()) => match directory.file_name().and_then(OsStr::to_str) {
+            Ok(limits_memory) => match directory.file_name().and_then(OsStr::to_str) {
                 // `crit-<pid>-<16 hex>` is unique to this run, so a scope left by an earlier
                 // Crit with the same process ID cannot be mistaken for this one.
                 Some(name) => Mechanism::Scope {
                     unit: format!("{name}.scope"),
                     directory: directory.to_owned(),
+                    // Where the user manager cannot limit memory, systemd would ignore it.
+                    memory_high: memory_high(percent, memory).filter(|_| limits_memory),
                 },
                 None => Mechanism::Priority("Crit's runtime folder name is not UTF-8".into()),
             },
@@ -185,12 +209,20 @@ impl Limiter {
     pub fn describe(&self) -> String {
         let Inner { percent, cores, .. } = *self.0;
         match (&self.0.mechanism, self.limited()) {
-            (Mechanism::Scope { .. }, true) => format!(
-                "Agents limited to {percent}% of the CPU ({} of {cores} core{}).",
-                share(percent, cores),
-                if cores == 1 { "" } else { "s" }
-            ),
-            (Mechanism::Scope { .. }, false) => "Agent CPU limit off.".into(),
+            (Mechanism::Scope { memory_high, .. }, true) => {
+                let memory = memory_high
+                    .map(|bytes| format!(" and memory ({})", amount(bytes)))
+                    .unwrap_or_default();
+                format!(
+                    "Agents limited to {percent}% of the CPU ({} of {cores} core{}){memory}.",
+                    share(percent, cores),
+                    if cores == 1 { "" } else { "s" }
+                )
+            }
+            (Mechanism::Scope { memory_high: None, .. }, false) => "Agent CPU limit off.".into(),
+            (Mechanism::Scope { memory_high: Some(_), .. }, false) => {
+                "Agent CPU and memory limit off.".into()
+            }
             (Mechanism::Priority(reason), true) => format!(
                 "Agents run at a lower CPU priority: {reason}, so they cannot be held to {percent}% of the CPU."
             ),
@@ -215,16 +247,19 @@ impl Limiter {
         quota(self.0.percent, self.0.cores)
     }
 
-    /// Applies the setting to the agents that already run. `systemctl` waits on systemd, so
-    /// only the worker thread calls this. A scope that is not running holds no agent: there is
-    /// nothing to change, and the next agent starts it with the setting as it is then.
+    /// Applies the setting to the agents that already run. The call waits on systemd, so only
+    /// the worker thread makes it. A scope that is not running holds no agent: there is nothing
+    /// to change, and the next agent starts it with the setting as it is then.
     pub fn retune(&self) -> Result<(), String> {
-        let Mechanism::Scope { unit, .. } = &self.0.mechanism else {
+        let Mechanism::Scope {
+            unit, memory_high, ..
+        } = &self.0.mechanism
+        else {
             return Ok(());
         };
         let _calls = self.0.started.lock();
         let quota = self.limited().then(|| self.quota());
-        match run("systemctl", &retune_arguments(unit, quota)) {
+        match run("busctl", &retune_arguments(unit, quota, *memory_high)) {
             // "Unit crit-….scope not found."
             Err(error) if error.contains("not found") || error.contains("not loaded") => Ok(()),
             result => result.map_err(|error| {
@@ -349,12 +384,16 @@ impl Limiter {
     /// Moves `pid` into the scope, starting the scope if no agent holds it now, and waits until
     /// systemd has moved it.
     fn place(&self, pid: u32, alive: &AtomicBool) -> Result<(), String> {
-        let Mechanism::Scope { unit, .. } = &self.0.mechanism else {
+        let Mechanism::Scope {
+            unit, memory_high, ..
+        } = &self.0.mechanism
+        else {
             return Ok(());
         };
         {
             let mut started = self.0.started.lock();
-            let start = start_arguments(unit, pid, self.limited().then(|| self.quota()));
+            let quota = self.limited().then(|| self.quota());
+            let start = start_arguments(unit, pid, quota, *memory_high);
             let attach = attach_arguments(unit, pid);
             // The scope goes once its last agent exits: joining it then fails, and starting it
             // works, while a running scope refuses to start again. So when the call for what
@@ -413,11 +452,20 @@ impl Limiter {
 
 #[cfg(test)]
 impl Limiter {
-    /// A limit held by the scope `unit`, whatever this machine offers.
-    pub fn scope(directory: &Path, unit: &str, percent: u8, cores: u32, limited: bool) -> Self {
+    /// A limit held by the scope `unit`, whatever this machine offers, with the memory share
+    /// taken of `memory` bytes.
+    pub fn scope(
+        directory: &Path,
+        unit: &str,
+        percent: u8,
+        cores: u32,
+        memory: u64,
+        limited: bool,
+    ) -> Self {
         let mechanism = Mechanism::Scope {
             unit: unit.into(),
             directory: directory.to_owned(),
+            memory_high: memory_high(percent, memory),
         };
         Self::build(mechanism, percent, cores, limited)
     }
@@ -437,6 +485,14 @@ impl Limiter {
         match &self.0.mechanism {
             Mechanism::Scope { unit, .. } => Ok(unit),
             Mechanism::Priority(reason) => Err(reason),
+        }
+    }
+
+    /// The agents' memory share while limited, in bytes, if they get one.
+    pub fn memory_high(&self) -> Option<u64> {
+        match &self.0.mechanism {
+            Mechanism::Scope { memory_high, .. } => *memory_high,
+            Mechanism::Priority(_) => None,
         }
     }
 }
@@ -527,14 +583,61 @@ fn share(percent: u8, cores: u32) -> String {
     }
 }
 
-/// `busctl` arguments that start `unit` holding `pid`: with `quota` and the low CPU weight
-/// while the limit is on, and without a quota at the default weight while it is off.
-fn start_arguments(unit: &str, pid: u32, quota: Option<u64>) -> Vec<String> {
+/// The agents' memory share, `percent` of `memory` bytes, in bytes. Memory that is not known
+/// is 0, which gives them none rather than a share that would stop them.
+fn memory_high(percent: u8, memory: u64) -> Option<u64> {
+    // In 128 bits, the product of any amount of memory and percentage fits.
+    let bytes = u128::from(memory) * u128::from(percent) / 100;
+    u64::try_from(bytes).ok().filter(|&bytes| bytes > 0)
+}
+
+/// `bytes` of memory as people read them at a glance, such as `15.6 GiB`, or `640 MiB` below
+/// a GiB.
+fn amount(bytes: u64) -> String {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    if bytes < GIB {
+        format!("{} MiB", bytes / MIB)
+    } else {
+        format!("{:.1} GiB", bytes as f64 / GIB as f64)
+    }
+}
+
+/// The machine's memory in bytes, from the text of `/proc/meminfo`, whose `MemTotal` line
+/// gives it in kiB.
+fn total_memory(meminfo: &str) -> Option<u64> {
+    let mut words = meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:"))?
+        .split_whitespace();
+    let kib: u64 = words.next()?.parse().ok()?;
+    // The kernel's kB are kiB; any other unit is not understood.
+    if words.next() != Some("kB") {
+        return None;
+    }
+    kib.checked_mul(1024)
+}
+
+/// `busctl` arguments that start `unit` holding `pid`: with `quota`, the low CPU weight and the
+/// memory share `memory_high`, if the agents get one, while the limit is on, and at the default
+/// weight with neither while it is off.
+fn start_arguments(
+    unit: &str,
+    pid: u32,
+    quota: Option<u64>,
+    memory_high: Option<u64>,
+) -> Vec<String> {
     let pid = pid.to_string();
     let quota = quota.map(|quota| quota.to_string());
+    let memory_high = memory_high
+        .filter(|_| quota.is_some())
+        .map(|bytes| bytes.to_string());
     let mut properties = vec!["PIDs", "au", "1", &pid];
     if let Some(quota) = &quota {
         properties.extend(["CPUQuotaPerSecUSec", "t", quota.as_str()]);
+    }
+    if let Some(memory_high) = &memory_high {
+        properties.extend(["MemoryHigh", "t", memory_high.as_str()]);
     }
     properties.extend([
         "CPUWeight",
@@ -553,7 +656,9 @@ fn start_arguments(unit: &str, pid: u32, quota: Option<u64>) -> Vec<String> {
         "b",
         "true",
     ]);
-    let count = if quota.is_some() { "5" } else { "4" };
+    // PIDs, CPUWeight, CollectMode and Delegate, and the shares while limited.
+    let count = 4 + usize::from(quota.is_some()) + usize::from(memory_high.is_some());
+    let count = count.to_string();
     MANAGER
         .into_iter()
         .chain([
@@ -561,7 +666,7 @@ fn start_arguments(unit: &str, pid: u32, quota: Option<u64>) -> Vec<String> {
             "ssa(sv)a(sa(sv))",
             unit,
             "fail",
-            count,
+            count.as_str(),
         ])
         .chain(properties)
         // No auxiliary units.
@@ -587,23 +692,41 @@ fn attach_arguments(unit: &str, pid: u32) -> Vec<String> {
         .collect()
 }
 
-/// `systemctl` arguments that apply `quota` and the low weight to the running `unit`, or
-/// lift them: an empty quota is no quota. `CPUQuota` is a share of one CPU.
-fn retune_arguments(unit: &str, quota: Option<u64>) -> Vec<String> {
-    let mut arguments: Vec<String> = ["--user", "set-property", "--runtime", unit]
-        .map(str::to_owned)
-        .into();
-    match quota {
-        Some(quota) => arguments.extend([
-            format!("CPUQuota={}%", quota / 10_000),
-            format!("CPUWeight={LIMITED_WEIGHT}"),
-        ]),
-        None => arguments.extend([
-            "CPUQuota=".to_owned(),
-            format!("CPUWeight={DEFAULT_WEIGHT}"),
-        ]),
+/// `busctl` arguments that apply `quota`, the low weight and the memory share `memory_high`,
+/// if the agents get one, to the running `unit`, or lift them. Lifting sets the quota and the
+/// share to infinity (`u64::MAX`), which is how systemd spells "no limit". The same bus as
+/// `start_arguments`, so that retuning reaches the manager wherever starting a scope did.
+fn retune_arguments(unit: &str, quota: Option<u64>, memory_high: Option<u64>) -> Vec<String> {
+    let infinity = u64::MAX.to_string();
+    let quota_value = quota.map_or_else(|| infinity.clone(), |quota| quota.to_string());
+    let memory_value = memory_high.map(|bytes| {
+        if quota.is_some() {
+            bytes.to_string()
+        } else {
+            infinity.clone()
+        }
+    });
+    let mut properties = vec!["CPUQuotaPerSecUSec", "t", quota_value.as_str()];
+    if let Some(memory_value) = &memory_value {
+        properties.extend(["MemoryHigh", "t", memory_value.as_str()]);
     }
-    arguments
+    properties.extend([
+        "CPUWeight",
+        "t",
+        if quota.is_some() {
+            LIMITED_WEIGHT
+        } else {
+            DEFAULT_WEIGHT
+        },
+    ]);
+    let count = (2 + usize::from(memory_value.is_some())).to_string();
+    MANAGER
+        .into_iter()
+        // Runtime only: the scope is gone with its last agent anyway.
+        .chain(["SetUnitProperties", "sba(sv)", unit, "true", count.as_str()])
+        .chain(properties)
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Runs `program` to its end: what it says on standard error, or its exit status, is the
@@ -650,20 +773,19 @@ fn make_fifo(path: &Path) -> io::Result<Fifo> {
     Ok(Fifo(path.to_owned()))
 }
 
-/// Why no scope can hold the agents here, if none can. Checked from files alone, without
-/// starting a process: cgroup v2, a systemd user session to call, its tools, and a user
-/// manager that runs Crit and may hand out the `cpu` controller.
-fn probe() -> Result<(), String> {
+/// Why no scope can hold the agents here, if none can, or else whether it can hold their
+/// memory as well. Checked from files alone, without starting a process: cgroup v2, a systemd
+/// user session to call, `busctl` to call it with, and a user manager that runs Crit and may
+/// hand out the `cpu` controller, and the `memory` one for the memory share.
+fn probe() -> Result<bool, String> {
     if fs::read_to_string("/sys/fs/cgroup/cgroup.controllers").is_err() {
         return Err("cgroup v2 is not available".into());
     }
     if std::env::var_os("XDG_RUNTIME_DIR").is_none_or(|value| value.is_empty()) {
         return Err("there is no systemd user session (XDG_RUNTIME_DIR is not set)".into());
     }
-    for tool in ["busctl", "systemctl"] {
-        if !runnable(tool, Path::new(".")) {
-            return Err(format!("{tool} is not installed"));
-        }
+    if !runnable("busctl", Path::new(".")) {
+        return Err("busctl is not installed".into());
     }
     let groups = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
     let path = groups
@@ -683,13 +805,15 @@ fn probe() -> Result<(), String> {
     };
     let controllers = fs::read_to_string(format!("/sys/fs/cgroup{manager}/cgroup.subtree_control"))
         .unwrap_or_default();
-    if !controllers
-        .split_whitespace()
-        .any(|controller| controller == "cpu")
-    {
+    let hands_out = |name: &str| {
+        controllers
+            .split_whitespace()
+            .any(|controller| controller == name)
+    };
+    if !hands_out("cpu") {
         return Err("the systemd user manager cannot limit CPU use".into());
     }
-    Ok(())
+    Ok(hands_out("memory"))
 }
 
 /// Whether `program` can be run, found the way a pane's spawn finds it: a path with a slash
@@ -723,10 +847,10 @@ mod tests {
         assert_eq!(quota(25, 16), 4_000_000);
         assert_eq!(quota(1, 1), 10_000);
         assert_eq!(quota(100, 256), 256_000_000);
-        // systemctl's CPUQuota is the same share, in percent of one CPU.
+        // Retuning sends the same share, in the same unit.
         assert_eq!(
-            retune_arguments("u", Some(quota(50, 16)))[4],
-            "CPUQuota=800%"
+            retune_arguments("u", Some(quota(50, 16)), None)[MANAGER.len() + 7],
+            "8000000"
         );
         assert_eq!(share(50, 8), "4");
         assert_eq!(share(25, 6), "1.5");
@@ -735,7 +859,50 @@ mod tests {
     }
 
     #[test]
-    fn scope_calls_carry_the_quota_only_while_limited() {
+    fn the_memory_share_is_the_same_share_of_the_machines_memory_in_bytes() {
+        // Half of 32 GiB is 16 GiB, which the notice after F3 shows as such.
+        assert_eq!(memory_high(50, 32 << 30), Some(17_179_869_184));
+        assert_eq!(amount(17_179_869_184), "16.0 GiB");
+        assert_eq!(memory_high(100, 32 << 30), Some(32 << 30));
+        // Rounded down to whole bytes, and no amount of memory overflows.
+        assert_eq!(memory_high(33, 1001), Some(330));
+        assert_eq!(memory_high(100, u64::MAX), Some(u64::MAX));
+        assert_eq!(memory_high(50, u64::MAX), Some(u64::MAX / 2));
+        // Memory that is not known gives no share, rather than one that would stop the agents.
+        assert_eq!(memory_high(50, 0), None);
+        assert_eq!(memory_high(1, 99), None);
+        assert_eq!(amount(32_779_832 * 1024 / 2), "15.6 GiB");
+        assert_eq!(amount(1 << 30), "1.0 GiB");
+        // Below a GiB in MiB, so that a small share does not read as none.
+        assert_eq!(amount((1 << 30) - 1), "1023 MiB");
+        assert_eq!(amount(41 << 20), "41 MiB");
+    }
+
+    #[test]
+    fn the_machines_memory_is_read_from_proc_meminfo_in_kib() {
+        let meminfo = "MemTotal:       32779832 kB\n\
+                       MemFree:         1607220 kB\n\
+                       MemAvailable:   19432516 kB\n";
+        assert_eq!(total_memory(meminfo), Some(32_779_832 * 1024));
+        assert_eq!(total_memory("MemFree: 1 kB\nMemTotal: 2 kB\n"), Some(2048));
+        // Anything else is memory that is not known.
+        for meminfo in [
+            "",
+            "MemFree:         1607220 kB\n",
+            "MemTotal:       lots kB\n",
+            "MemTotal:       32779832\n",
+            "MemTotal:       32779832 MB\n",
+            "MemTotal:       18446744073709551615 kB\n",
+        ] {
+            assert_eq!(total_memory(meminfo), None, "{meminfo:?}");
+        }
+        // This machine's.
+        let meminfo = fs::read_to_string("/proc/meminfo").unwrap();
+        assert!(total_memory(&meminfo).is_some_and(|bytes| bytes > 0));
+    }
+
+    #[test]
+    fn scope_calls_carry_the_shares_only_while_limited() {
         let manager = MANAGER.map(str::to_owned).to_vec();
         let expected = |tail: &[&str]| {
             let mut expected = manager.clone();
@@ -743,7 +910,38 @@ mod tests {
             expected
         };
         assert_eq!(
-            start_arguments("crit-7-00ff.scope", 42, Some(4_000_000)),
+            start_arguments("crit-7-00ff.scope", 42, Some(4_000_000), Some(16 << 30)),
+            expected(&[
+                "StartTransientUnit",
+                "ssa(sv)a(sa(sv))",
+                "crit-7-00ff.scope",
+                "fail",
+                "6",
+                "PIDs",
+                "au",
+                "1",
+                "42",
+                "CPUQuotaPerSecUSec",
+                "t",
+                "4000000",
+                "MemoryHigh",
+                "t",
+                "17179869184",
+                "CPUWeight",
+                "t",
+                "20",
+                "CollectMode",
+                "s",
+                "inactive-or-failed",
+                "Delegate",
+                "b",
+                "true",
+                "0",
+            ])
+        );
+        // Without a memory share where the machine's memory is not known.
+        assert_eq!(
+            start_arguments("crit-7-00ff.scope", 42, Some(4_000_000), None),
             expected(&[
                 "StartTransientUnit",
                 "ssa(sv)a(sa(sv))",
@@ -769,8 +967,9 @@ mod tests {
                 "0",
             ])
         );
+        // While the limit is off, with neither share.
         assert_eq!(
-            start_arguments("crit-7-00ff.scope", 42, None),
+            start_arguments("crit-7-00ff.scope", 42, None, Some(16 << 30)),
             expected(&[
                 "StartTransientUnit",
                 "ssa(sv)a(sa(sv))",
@@ -804,49 +1003,102 @@ mod tests {
                 "42"
             ])
         );
-        let retune = |quota| retune_arguments("crit-7-00ff.scope", quota);
+        let retune = |quota, memory_high| retune_arguments("crit-7-00ff.scope", quota, memory_high);
         assert_eq!(
-            retune(Some(1_500_000)),
-            [
-                "--user",
-                "set-property",
-                "--runtime",
+            retune(Some(1_500_000), Some(16 << 30)),
+            expected(&[
+                "SetUnitProperties",
+                "sba(sv)",
                 "crit-7-00ff.scope",
-                "CPUQuota=150%",
-                "CPUWeight=20"
-            ]
+                "true",
+                "3",
+                "CPUQuotaPerSecUSec",
+                "t",
+                "1500000",
+                "MemoryHigh",
+                "t",
+                "17179869184",
+                "CPUWeight",
+                "t",
+                "20"
+            ])
+        );
+        // Lifted, both shares go to infinity, which systemd spells as the largest u64.
+        assert_eq!(
+            retune(None, Some(16 << 30)),
+            expected(&[
+                "SetUnitProperties",
+                "sba(sv)",
+                "crit-7-00ff.scope",
+                "true",
+                "3",
+                "CPUQuotaPerSecUSec",
+                "t",
+                "18446744073709551615",
+                "MemoryHigh",
+                "t",
+                "18446744073709551615",
+                "CPUWeight",
+                "t",
+                "100"
+            ])
+        );
+        // Without a memory share, the scope's memory is left alone either way.
+        assert_eq!(
+            retune(Some(1_500_000), None),
+            expected(&[
+                "SetUnitProperties",
+                "sba(sv)",
+                "crit-7-00ff.scope",
+                "true",
+                "2",
+                "CPUQuotaPerSecUSec",
+                "t",
+                "1500000",
+                "CPUWeight",
+                "t",
+                "20"
+            ])
         );
         assert_eq!(
-            retune(None),
-            [
-                "--user",
-                "set-property",
-                "--runtime",
+            retune(None, None),
+            expected(&[
+                "SetUnitProperties",
+                "sba(sv)",
                 "crit-7-00ff.scope",
-                "CPUQuota=",
-                "CPUWeight=100"
-            ]
+                "true",
+                "2",
+                "CPUQuotaPerSecUSec",
+                "t",
+                "18446744073709551615",
+                "CPUWeight",
+                "t",
+                "100"
+            ])
         );
     }
 
     #[test]
     fn the_hint_and_notices_say_what_holds_the_agents() {
         let directory = tempfile::tempdir().unwrap();
-        let scope = Limiter::scope(directory.path(), "crit-1-0.scope", 50, 8, true);
+        let scope = Limiter::scope(directory.path(), "crit-1-0.scope", 50, 16, 32 << 30, true);
         assert_eq!(scope.hint(), "50%");
         assert_eq!(
             scope.describe(),
-            "Agents limited to 50% of the CPU (4 of 8 cores)."
+            "Agents limited to 50% of the CPU (8 of 16 cores) and memory (16.0 GiB)."
         );
         assert_eq!(scope.startup_notice(), None);
         scope.set_limited(false);
         assert_eq!(scope.hint(), "OFF");
-        assert_eq!(scope.describe(), "Agent CPU limit off.");
-        let one = Limiter::scope(directory.path(), "crit-1-0.scope", 25, 1, true);
+        assert_eq!(scope.describe(), "Agent CPU and memory limit off.");
+        // Where the machine's memory is not known, only the CPU is limited.
+        let one = Limiter::scope(directory.path(), "crit-1-0.scope", 25, 1, 0, true);
         assert_eq!(
             one.describe(),
             "Agents limited to 25% of the CPU (0.25 of 1 core)."
         );
+        one.set_limited(false);
+        assert_eq!(one.describe(), "Agent CPU limit off.");
 
         let fallback = Limiter::build(
             Mechanism::Priority("busctl is not installed".into()),
@@ -857,6 +1109,8 @@ mod tests {
         assert_eq!(fallback.hint(), "LOW");
         assert!(!fallback.uses_scope());
         assert!(fallback.describe().contains("busctl is not installed"));
+        // The lower priority cannot hold memory, and says nothing about it.
+        assert!(!fallback.describe().contains("memory"));
         assert!(fallback.startup_notice().is_some_and(|notice| {
             notice.contains("busctl is not installed") && notice.contains("50%")
         }));
@@ -913,7 +1167,7 @@ mod tests {
         );
 
         // A scope, even while off: turning the limit on later must reach this agent too.
-        let scope = Limiter::scope(directory.path(), "crit-1-0.scope", 50, 8, false);
+        let scope = Limiter::scope(directory.path(), "crit-1-0.scope", 50, 8, 32 << 30, false);
         let (spawned, args, gate) = scope.prepare(7, program().0, program().1, directory.path());
         let fifo = directory.path().join("cpu-gate-7");
         assert_eq!(spawned, "/bin/sh");
@@ -947,7 +1201,7 @@ mod tests {
     fn a_pane_that_systemd_refuses_still_starts_and_is_reported() {
         let directory = tempfile::tempdir().unwrap();
         // systemd refuses this unit name, and a machine without busctl fails the same way.
-        let limiter = Limiter::scope(directory.path(), "not a unit", 50, 1, true);
+        let limiter = Limiter::scope(directory.path(), "not a unit", 50, 1, 32 << 30, true);
         let (program, args, gate) = limiter.prepare(
             3,
             "/bin/sh".into(),
@@ -989,7 +1243,7 @@ mod tests {
             .prefix("crit-probe-")
             .tempdir()
             .unwrap();
-        let limiter = Limiter::with_cores(directory.path(), 50, 2, true);
+        let limiter = Limiter::with_cores(directory.path(), 50, 2, 32 << 30, true);
         match limiter.unit() {
             Ok(unit) => assert_eq!(
                 unit,
@@ -998,7 +1252,8 @@ mod tests {
                     directory.path().file_name().unwrap().to_str().unwrap()
                 )
             ),
-            Err(reason) => assert!(!reason.is_empty()),
+            // The lower priority holds no memory.
+            Err(reason) => assert!(!reason.is_empty() && limiter.memory_high().is_none()),
         }
         assert!(["50%", "LOW"].contains(&limiter.hint()));
     }
