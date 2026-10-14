@@ -46,6 +46,8 @@ pub struct Session {
     pub parser: Arc<Mutex<Parser>>,
     pub dirty: Arc<AtomicBool>,
     pub alive: Arc<AtomicBool>,
+    /// Set by the reader thread once text shows on the screen; the pane is blank until then.
+    output: Arc<AtomicBool>,
     master: Box<dyn MasterPty + Send>,
     input: SyncSender<Input>,
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
@@ -137,8 +139,10 @@ impl Session {
         )));
         let dirty = Arc::new(AtomicBool::new(true));
         let alive = Arc::new(AtomicBool::new(true));
+        let output = Arc::new(AtomicBool::new(false));
         let reader_parser = parser.clone();
         let reader_dirty = dirty.clone();
+        let reader_output = output.clone();
         let wait_alive = alive.clone();
         let wait_tx = tx.clone();
         // The child is running; a thread that cannot start must not leave it unreaped.
@@ -154,6 +158,7 @@ impl Session {
             .name(format!("pty-{id}"))
             .spawn(move || {
                 let mut buffer = [0_u8; 8192];
+                let mut painted = false;
                 loop {
                     match reader.read(&mut buffer) {
                         Ok(0) => break,
@@ -163,6 +168,15 @@ impl Session {
                             let copy = {
                                 let mut parser = reader_parser.lock();
                                 parser.process(&buffer[..count]);
+                                // Terminal setup (alternate screen, mouse modes, queries) and
+                                // a screen of blanks show nothing, and an app can send both
+                                // seconds before its first frame: the pane has output once a
+                                // visible character is on its screen. Checked until then, under
+                                // the lock of the bytes, so a frame sees both or neither.
+                                if !painted && shows_text(parser.screen()) {
+                                    painted = true;
+                                    reader_output.store(true, Ordering::Release);
+                                }
                                 parser.callbacks_mut().clipboard.take()
                             };
                             if let Some((ty, data)) = copy {
@@ -214,6 +228,7 @@ impl Session {
             parser,
             dirty,
             alive,
+            output,
             master: pair.master,
             input,
             killer,
@@ -317,6 +332,20 @@ impl Session {
         held(self.sync.load(Ordering::Acquire), clock())
     }
 
+    /// Whether the program in this pane has painted anything yet: a visible character on its
+    /// screen. Until it has, the pane is blank. Terminal setup (alternate screen, mouse modes,
+    /// queries) and blanks paint nothing, and an agent can send them seconds before its first
+    /// frame, for instance while a large saved chat loads.
+    pub fn has_output(&self) -> bool {
+        self.output.load(Ordering::Acquire)
+    }
+
+    /// Marks the pane as painted, for tests that put the program's output in `parser` directly.
+    #[cfg(test)]
+    pub fn mark_output(&self) {
+        self.output.store(true, Ordering::Release);
+    }
+
     /// The agent whose TUI this pane's shell runs in the foreground, if any.
     pub fn foreground_agent(&self) -> Option<&'static str> {
         let group = self.master.process_group_leader()?;
@@ -343,6 +372,11 @@ impl Session {
             Ok(()) | Err(TrySendError::Disconnected(_)) => Ok(()),
         }
     }
+}
+
+/// Whether any cell of the screen holds a character that shows: a blank does not.
+fn shows_text(screen: &vt100::Screen) -> bool {
+    screen.contents().chars().any(|c| !c.is_whitespace())
 }
 
 /// The bytes for one paste: bracketed when the app asked for it, with escape

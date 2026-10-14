@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -565,8 +566,8 @@ fn valid_identity(identity: &str) -> bool {
     !identity.is_empty() && identity.len() <= 4096 && !identity.contains('\0')
 }
 
-/// What a restore needs from OpenCode's database. One `opencode db` call answers all of it:
-/// the CLI takes about 0.6 s to start, so one call per chat would freeze a restore for seconds.
+/// What a restore needs from OpenCode's database. One query answers all of it: the `opencode db`
+/// CLI takes about 0.6 s to start, so one call per chat would freeze a restore for seconds.
 #[derive(Debug, Default)]
 pub struct OpencodeChats {
     /// The saved chat identities that still exist.
@@ -575,13 +576,38 @@ pub struct OpencodeChats {
     pub latest: HashMap<String, String>,
 }
 
+impl OpencodeChats {
+    /// Records one row of the query: saved chats come back without a folder.
+    fn record(&mut self, id: String, folder: Option<String>) {
+        match folder {
+            Some(folder) => {
+                self.latest.insert(folder, id);
+            }
+            None => {
+                self.existing.insert(id);
+            }
+        }
+    }
+}
+
 /// Looks up which saved chats `ids` exist, and the newest chat of each of `folders`, whose
 /// panes remember none. A value that cannot be an identity or folder is never asked about.
+///
+/// The query runs against OpenCode's SQLite file directly: the `opencode db` CLI boots the
+/// whole app (0.6 s warm) to run a query that takes 0.3 ms, and a restore draws nothing until
+/// this returns. The CLI stays as the fallback for whatever the direct read cannot answer: no
+/// database at the expected path, one that is locked, malformed or lacks what the query
+/// names, or one that `OPENCODE_DB` moves.
 pub fn opencode_chats(ids: &[&str], folders: &[&str]) -> Result<OpencodeChats> {
     let mut chats = OpencodeChats::default();
     let Some(query) = opencode_chat_query(ids, folders) else {
         return Ok(chats);
     };
+    if let Some(found) =
+        opencode_database().and_then(|database| opencode_chats_sqlite(&database, &query))
+    {
+        return Ok(found);
+    }
     // OpenCode's missing-session TUI route falls back to Home, so a missing chat must be
     // caught here. The query returns only the IDs that exist.
     let output = std::process::Command::new("opencode")
@@ -600,17 +626,43 @@ pub fn opencode_chats(ids: &[&str], folders: &[&str]) -> Result<OpencodeChats> {
         let Some(id) = row["id"].as_str() else {
             continue;
         };
-        // Saved chats come back without a folder.
-        match row["folder"].as_str() {
-            Some(folder) => {
-                chats.latest.insert(folder.to_owned(), id.to_owned());
-            }
-            None => {
-                chats.existing.insert(id.to_owned());
-            }
-        }
+        chats.record(id.to_owned(), row["folder"].as_str().map(str::to_owned));
     }
     Ok(chats)
+}
+
+/// OpenCode's database: `opencode/opencode.db` under `$XDG_DATA_HOME`, else `~/.local/share`.
+/// `None` when `OPENCODE_DB` moves it or there is no `$HOME`: only the CLI resolves those.
+fn opencode_database() -> Option<PathBuf> {
+    let set = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty());
+    if set("OPENCODE_DB").is_some() {
+        return None;
+    }
+    let data = match set("XDG_DATA_HOME") {
+        Some(data) => PathBuf::from(data),
+        None => PathBuf::from(set("HOME")?).join(".local/share"),
+    };
+    Some(data.join("opencode/opencode.db"))
+}
+
+/// `query` run against the SQLite file `database`, or `None` for any reason it cannot be: no
+/// file, a lock held past 250 ms, not a database, or a table or column the query names missing.
+/// OpenCode keeps the file in WAL mode and writes it while crit restores, so it is opened
+/// read-only but not `immutable`, which would ignore the WAL and miss its newest chats.
+fn opencode_chats_sqlite(database: &Path, query: &str) -> Option<OpencodeChats> {
+    let connection = Connection::open_with_flags(
+        database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    connection.busy_timeout(Duration::from_millis(250)).ok()?;
+    let mut statement = connection.prepare(query).ok()?;
+    let mut rows = statement.query([]).ok()?;
+    let mut chats = OpencodeChats::default();
+    while let Some(row) = rows.next().ok()? {
+        chats.record(row.get(0).ok()?, row.get(1).ok()?);
+    }
+    Some(chats)
 }
 
 /// `None` when nothing qualifies. Saved `ids` come back with a NULL folder, then each folder
@@ -868,6 +920,75 @@ mod tests {
         // Resume validation no longer asks OpenCode; only the identity is checked here.
         assert!(validate_resume("opencode", "ses_a").is_ok());
         assert!(validate_resume("opencode", "").is_err());
+    }
+
+    #[test]
+    fn opencode_chats_sqlite_reads_a_session_table() {
+        let temp = tempfile::tempdir().unwrap();
+        let database = temp.path().join("opencode.db");
+        // OpenCode keeps the file in WAL mode and commits while crit restores. This writer
+        // stays open, so its rows sit in the WAL, which an `immutable` read would not see.
+        let writer = Connection::open(&database).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA journal_mode = WAL; \
+                 CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, parent_id TEXT, \
+                 time_archived INTEGER, time_updated INTEGER); \
+                 INSERT INTO session VALUES \
+                 ('ses_saved', '/w/a', NULL, NULL, 300), \
+                 ('ses_old', '/w/a', NULL, NULL, 100), \
+                 ('ses_new', '/w/a', NULL, NULL, 200), \
+                 ('ses_archived', '/w/a', NULL, 1, 400), \
+                 ('ses_child', '/w/a', 'ses_new', NULL, 500), \
+                 ('ses_elsewhere', '/w/b', NULL, NULL, 600)",
+            )
+            .unwrap();
+        let query = opencode_chat_query(&["ses_saved", "ses_gone"], &["/w/a"]).unwrap();
+        let chats = opencode_chats_sqlite(&database, &query).unwrap();
+        // Only the saved chat that exists is reported. The folder's newest chat is neither
+        // that one (its own pane reopens it) nor an archived, child or other folder's chat.
+        assert_eq!(chats.existing, HashSet::from(["ses_saved".to_owned()]));
+        assert_eq!(
+            chats.latest,
+            HashMap::from([("/w/a".to_owned(), "ses_new".to_owned())])
+        );
+        writer
+            .execute_batch("INSERT INTO session VALUES ('ses_next', '/w/a', NULL, NULL, 700)")
+            .unwrap();
+        let chats = opencode_chats_sqlite(&database, &query).unwrap();
+        assert_eq!(chats.latest["/w/a"], "ses_next");
+        // After a restart OpenCode is not running: no writer, no WAL beside the file.
+        drop(writer);
+        let chats = opencode_chats_sqlite(&database, &query).unwrap();
+        assert_eq!(chats.latest["/w/a"], "ses_next");
+    }
+
+    #[test]
+    fn opencode_chats_falls_back_when_the_database_is_unusable() {
+        let temp = tempfile::tempdir().unwrap();
+        let query = opencode_chat_query(&["ses_a"], &["/w/a"]).unwrap();
+        let read = |name: &str| opencode_chats_sqlite(&temp.path().join(name), &query);
+        assert!(read("missing.db").is_none());
+        // Looking for the file must not create it.
+        assert!(!temp.path().join("missing.db").exists());
+        fs::write(
+            temp.path().join("garbage.db"),
+            "not a database ".repeat(1000),
+        )
+        .unwrap();
+        assert!(read("garbage.db").is_none());
+        // A database that is not OpenCode's, and one whose `session` lacks a column the query
+        // names.
+        Connection::open(temp.path().join("other.db"))
+            .unwrap()
+            .execute_batch("CREATE TABLE project (id TEXT)")
+            .unwrap();
+        assert!(read("other.db").is_none());
+        Connection::open(temp.path().join("old.db"))
+            .unwrap()
+            .execute_batch("CREATE TABLE session (id TEXT, directory TEXT)")
+            .unwrap();
+        assert!(read("old.db").is_none());
     }
 
     #[test]

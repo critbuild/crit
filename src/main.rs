@@ -200,6 +200,9 @@ RESTORE
   An agent with no remembered chat continues its folder's newest one: OMP with
   its own --continue, OpenCode with the newest chat started in that exact folder
   that no other saved pane names (a new chat if there is none).
+  A pane whose agent has not drawn yet says what it is starting; a large saved
+  OMP chat can take seconds to load before OMP draws, and OMP then repaints its
+  last page until the whole chat is in.
   Switching chats inside an agent updates its saved reference. Closing a session
   or tab removes it from the saved workspace, without deleting chat history.
   A shell running an OMP or OpenCode TUI in the foreground at exit reopens as

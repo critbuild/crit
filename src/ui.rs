@@ -614,13 +614,19 @@ fn draw_workspace(
     for (index, session) in workspace.sessions.iter().enumerate() {
         let (_, color) = state_style(session.state);
         let active = index == selected;
+        // An agent that has not drawn yet is starting, not in an unknown state.
+        let name = if session.state == AgentState::Unknown && !session.has_output() {
+            "starting"
+        } else {
+            state_name(session.state)
+        };
         header.push(Span::styled(
             format!(
                 " {}{} {} · {}{} ",
                 if active { "[" } else { "" },
                 session.kind,
                 index + 1,
-                state_name(session.state),
+                name,
                 if active { "]" } else { "" }
             ),
             Style::default().fg(if active { color } else { MUTED }),
@@ -727,6 +733,17 @@ fn draw_workspace(
                 target.set_style(style);
             }
         }
+        // The copy loop blanked the body; until the program paints, say what it is waiting for.
+        if !body.is_empty() && session.alive.load(Ordering::Acquire) && !session.has_output() {
+            put_clipped(
+                frame.buffer_mut(),
+                body.x,
+                body.y,
+                &starting_line(&session.kind, session.resume.is_some()),
+                body.width,
+                Style::default().fg(MUTED),
+            );
+        }
         if focused
             && show_cursor
             && selection.is_none()
@@ -798,6 +815,16 @@ fn state_name(state: AgentState) -> &'static str {
         AgentState::Idle => "idle",
         AgentState::Unknown => "unknown",
         AgentState::Exited => "exited",
+    }
+}
+
+/// What a pane shows until its program paints: the program it started, and for an agent
+/// reopening a saved chat, that the chat has to load before anything is drawn.
+fn starting_line(kind: &str, saved_chat: bool) -> String {
+    match (kind, saved_chat) {
+        ("omp", true) => "Starting omp — loading its saved chat…".into(),
+        ("opencode", true) => "Starting opencode — opening its saved chat…".into(),
+        _ => format!("Starting {kind}…"),
     }
 }
 fn vt_color(color: vt100::Color, default: Color) -> Color {
@@ -1703,6 +1730,10 @@ mod tests {
                 .unwrap(),
             );
         }
+        // The transcripts below stand in for what the programs wrote.
+        for session in &workspace.sessions {
+            session.mark_output();
+        }
         workspace.sessions[0]
             .parser
             .lock()
@@ -1856,6 +1887,7 @@ mod tests {
             .parser
             .lock()
             .process("⚠\u{fe0f}ab".as_bytes());
+        workspace.sessions[0].mark_output();
         let mut terminal = Terminal::new(TestBackend::new(40, 7)).unwrap();
         terminal
             .draw(|frame| {
@@ -1894,6 +1926,122 @@ mod tests {
             .unwrap();
         let cursor = terminal.get_cursor_position().unwrap();
         assert_eq!((cursor.x, cursor.y), (content.x + 9, content.y));
+    }
+
+    #[test]
+    fn fresh_sessions_say_they_are_starting() {
+        use std::time::{Duration, Instant};
+        let directory = tempfile::tempdir().unwrap();
+        let area = Rect::new(0, 1, 100, 6);
+        let content = body(area);
+        let (tx, _rx) = std::sync::mpsc::sync_channel(16);
+        let spawn = |kind: &str, chat: Option<&str>, program: &str, args: &[&str]| {
+            let mut workspace = test_workspace();
+            workspace.tree.path = directory.path().to_owned();
+            workspace.sessions.push(
+                crate::terminal::Session::spawn(
+                    1,
+                    kind,
+                    chat.map(crate::integration::Resume::Chat),
+                    directory.path(),
+                    &directory.path().join("unused.sock"),
+                    tx.clone(),
+                    content.height,
+                    content.width,
+                    Some((program.into(), args.iter().map(|&arg| arg.into()).collect())),
+                )
+                .unwrap(),
+            );
+            workspace
+        };
+        let draw = |workspace: &Workspace, area: Rect| {
+            let mut terminal = Terminal::new(TestBackend::new(100, 7)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw_workspace(frame, workspace, 0, area, body(area), true, true, None);
+                })
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        // Silent programs. An agent whose state is not known yet is "starting"; a shell is
+        // idle from its first moment, and its pane still says what it is waiting for.
+        for (kind, chat, line, state) in [
+            ("shell", None, "Starting shell…", "idle"),
+            ("omp", None, "Starting omp…", "starting"),
+            (
+                "omp",
+                Some("/chats/a.jsonl"),
+                "Starting omp — loading its saved chat…",
+                "starting",
+            ),
+            ("opencode", None, "Starting opencode…", "starting"),
+            (
+                "opencode",
+                Some("ses_a"),
+                "Starting opencode — opening its saved chat…",
+                "starting",
+            ),
+        ] {
+            let workspace = spawn(kind, chat, "/bin/sleep", &["5"]);
+            assert!(!workspace.sessions[0].has_output());
+            let buffer = draw(&workspace, area);
+            // One muted line in the body's top-left corner, and nothing else in the body.
+            assert_eq!(row_text(&buffer, content, content.y).trim_end(), line);
+            assert_eq!(buffer[(content.x, content.y)].fg, MUTED);
+            for row in content.y + 1..content.bottom() {
+                assert!(row_text(&buffer, content, row).trim().is_empty());
+            }
+            let header = row_text(&buffer, area, area.y);
+            assert!(
+                header.contains(&format!("[{kind} 1 · {state}]")),
+                "{header:?}"
+            );
+        }
+        // A body too narrow for the line cuts it with `…` and never draws outside itself.
+        let workspace = spawn("omp", None, "/bin/sleep", &["5"]);
+        let narrow = Rect::new(0, 1, 12, 6);
+        let buffer = draw(&workspace, narrow);
+        assert_eq!(
+            row_text(&buffer, body(narrow), body(narrow).y),
+            "Starting …"
+        );
+        assert_eq!(buffer[(body(narrow).right(), body(narrow).y)].symbol(), " ");
+        // Terminal setup and a screen of blanks show nothing, so an agent that has sent only
+        // those is still starting. Once text shows, its output is drawn as it is.
+        let script = "printf '\\033[?1049h\\033[?1000h%200s' ''; read line; \
+                      printf '\\033[Hpainted'; sleep 5";
+        let workspace = spawn("omp", None, "/bin/sh", &["-c", script]);
+        let session = &workspace.sessions[0];
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.parser.lock().screen().contents().is_empty() {
+            assert!(Instant::now() < deadline, "the blanks never arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!session.has_output());
+        let buffer = draw(&workspace, area);
+        assert_eq!(
+            row_text(&buffer, content, content.y).trim_end(),
+            "Starting omp…"
+        );
+        assert!(row_text(&buffer, area, area.y).contains("[omp 1 · starting]"));
+        // The newline ends the program's `read`; its echo moves the cursor and paints nothing.
+        session.paste("\n").unwrap();
+        while !session.has_output() {
+            assert!(Instant::now() < deadline, "the program never painted");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let buffer = draw(&workspace, area);
+        assert_eq!(row_text(&buffer, content, content.y).trim_end(), "painted");
+        assert!(row_text(&buffer, area, area.y).contains("[omp 1 · unknown]"));
+        // A program that exited without painting is not starting any more.
+        let workspace = spawn("omp", None, "/bin/true", &[]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while workspace.sessions[0].alive.load(Ordering::Acquire) {
+            assert!(Instant::now() < deadline, "the program never exited");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let buffer = draw(&workspace, area);
+        assert!(row_text(&buffer, content, content.y).trim().is_empty());
     }
 
     #[test]
