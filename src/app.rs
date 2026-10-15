@@ -659,6 +659,12 @@ impl Project {
     }
 }
 
+/// Exceptional diagnostics or an explicitly requested result. Never reserves terminal rows.
+pub struct Alert {
+    pub title: &'static str,
+    pub text: String,
+}
+
 pub struct App {
     pub project: Project,
     pub saved_projects: Vec<Project>,
@@ -666,9 +672,7 @@ pub struct App {
     /// The agent CPU limit (F3), saved with the workspace like `native_keys`.
     pub limiter: limits::Limiter,
     pub modal: Option<Modal>,
-    pub notice: Option<String>,
-    /// The notice is a warning that terminal input must not dismiss.
-    notice_sticky: bool,
+    pub alert: Option<Alert>,
     pub panes: Vec<Pane>,
     /// The `(workspace, session)` of each pane the next frame draws, as `ui::resize_sessions`
     /// last sized them. `panes` is only what the last frame drew, and empty after a layout change.
@@ -772,7 +776,7 @@ pub enum EnvironmentOp {
     Up,
     Down,
     Restart,
-    /// Explicit refresh: the outcome is reported in the notice line.
+    /// Explicit refresh: shows the result in a dialog.
     Status,
     /// Background check on open: fills `Workspace::environment` silently.
     Probe,
@@ -792,7 +796,7 @@ pub fn project_slots<'a>(
     })
 }
 
-/// One-line Compose status for the notice row, e.g. `main: + web :8080 · ~ db · - migrate · ! worker`:
+/// Compose status for an explicitly requested result dialog:
 /// `+` running, `~` still starting, `-` finished with exit code 0, `!` failing.
 fn environment_summary(label: &str, environment: &compose::Environment) -> String {
     let mut summary = format!("{label}: ");
@@ -820,9 +824,6 @@ fn environment_summary(label: &str, environment: &compose::Environment) -> Strin
 
 /// Shown when a new worktree's tab exists but the full job queue refused its Docker start.
 const ENVIRONMENT_NOT_STARTED: &str = "Worktree created; its Docker environment was not started (command queue busy). Start it from F1 → F2.";
-
-/// Shown when a tab closes. Closing one never touches its checkout or Docker environment.
-const TAB_CLOSED: &str = "Tab closed; any checkout and Docker environment retained.";
 
 impl App {
     const METADATA_INTERVAL: Duration = Duration::from_secs(1);
@@ -1016,7 +1017,7 @@ impl App {
                     } else {
                         "A bare repository has no files to open."
                     };
-                    self.set_notice(message);
+                    self.show_error(message);
                     return Ok(());
                 }
                 // The same reuse rule as `open_project`: one tab per checkout.
@@ -1039,9 +1040,9 @@ impl App {
                     return Ok(());
                 };
                 if tree.is_main || tree.bare {
-                    self.set_notice("The main checkout cannot be removed.");
+                    self.show_error("The main checkout cannot be removed.");
                 } else if tree.locked {
-                    self.set_notice("This worktree is locked.");
+                    self.show_error("This worktree is locked.");
                 } else {
                     self.modal = Some(Modal::Confirm(Confirm::RemoveWorktree {
                         tree: Some(tree.clone()),
@@ -1234,7 +1235,7 @@ impl App {
             return false;
         }
         if let Err(error) = owner.save(&snapshot) {
-            self.set_warning(format!(
+            self.show_error(format!(
                 "Workspace could not be saved: {error:#}. Saving disabled for this window."
             ));
             *store = None;
@@ -1311,45 +1312,33 @@ impl App {
         }
         self.workspace_changed();
     }
-    fn set_notice(&mut self, message: impl Into<String>) {
-        const NOTICE_TAIL: usize = 16 * 1024;
-        let mut message = message.into();
-        if message.len() > NOTICE_TAIL {
-            // Only the final rows are ever drawn; bound the per-frame wrapping work.
-            let mut start = message.len() - NOTICE_TAIL;
-            while !message.is_char_boundary(start) {
+    fn show_alert(&mut self, title: &'static str, text: impl Into<String>) {
+        self.finish_split_drag();
+        self.scroll_drag = None;
+        self.mouse_capture = None;
+        let text = text.into();
+        if let Some(alert) = &mut self.alert {
+            alert.text.push_str("\n\n");
+            alert.text.push_str(title);
+            alert.text.push_str(": ");
+            alert.text.push_str(&text);
+        } else {
+            self.alert = Some(Alert { title, text });
+        }
+        // Keep a broken child or repeated background failures from growing the dialog forever.
+        let text = &mut self.alert.as_mut().unwrap().text;
+        const MAX_BYTES: usize = 16 * 1024;
+        if text.len() > MAX_BYTES {
+            let mut start = text.len() - MAX_BYTES;
+            while !text.is_char_boundary(start) {
                 start += 1;
             }
-            message.replace_range(..start, "...");
+            text.drain(..start);
         }
-        self.notice = Some(message);
-        self.notice_sticky = false;
     }
 
-    /// A notice that terminal input does not dismiss: saving is off, or saved items were
-    /// left out at startup. Esc or a Crit shortcut dismisses it, and any later notice replaces it.
-    fn set_warning(&mut self, message: impl Into<String>) {
-        self.set_notice(message);
-        self.notice_sticky = true;
-    }
-
-    /// Adds `message` below what the notice row already says, keeping a warning a warning. For
-    /// news that can arrive at any time, such as a failed update: it must not hide a startup
-    /// warning, or an earlier failure, that the user has yet to read.
-    fn append_notice(&mut self, message: &str) {
-        let Some(shown) = self.notice.take() else {
-            self.set_notice(message);
-            return;
-        };
-        let sticky = self.notice_sticky;
-        self.set_notice(format!("{shown}\n{message}"));
-        self.notice_sticky = sticky;
-    }
-
-    /// Typing, pasting or clicking acknowledges an ordinary notice; a warning needs Esc.
-    /// Returns whether a notice was cleared.
-    fn clear_notice_on_input(&mut self, escape: bool) -> bool {
-        (escape || !self.notice_sticky) && self.notice.take().is_some()
+    fn show_error(&mut self, text: impl Into<String>) {
+        self.show_alert("Error", text);
     }
 
     fn git_repository(&self) -> Result<&worktree::Repository> {
@@ -1410,7 +1399,6 @@ impl App {
     fn switch_project(&mut self, index: usize, workspace: Option<usize>) -> Result<()> {
         self.swap_project(index);
         self.modal = None;
-        self.notice = None;
         let workspace = workspace.unwrap_or_else(|| self.focused_index());
         self.select_workspace(workspace, None)
     }
@@ -1450,7 +1438,6 @@ impl App {
                 self.saved_projects
                     .sort_unstable_by_key(|project| project.order);
                 self.modal = None;
-                self.notice = None;
                 return self.select_workspace(self.focused_index(), agent);
             }
         }
@@ -1470,7 +1457,6 @@ impl App {
         };
         self.full_width();
         self.modal = None;
-        self.notice = None;
         if fresh_tab && reused.is_some() {
             let kind = self.default_agent.clone();
             self.spawn(index, &kind, None)?;
@@ -1572,7 +1558,7 @@ impl App {
     fn env(&mut self, index: usize, operation: EnvironmentOp) -> Result<()> {
         self.git_repository()?;
         if self.project.workspaces[index].pending {
-            self.set_notice("An environment operation is already running for this worktree.");
+            self.show_error("An environment operation is already running for this worktree.");
             return Ok(());
         }
         let tree = self.project.workspaces[index].tree.clone();
@@ -1666,9 +1652,6 @@ impl App {
     /// Closes the focused tab, keeping its checkout and Docker environment.
     fn close_workspace(&mut self) {
         self.close_tab(None, self.focused_index());
-        if !self.should_quit {
-            self.set_notice(TAB_CLOSED);
-        }
     }
 
     /// Closes tab `index` of the project in `slot` (as `project_mut` takes it), keeping its
@@ -1719,8 +1702,6 @@ impl App {
             if self.should_quit {
                 return Ok(());
             }
-            // Below what the notice row says: a program can end while it shows a warning.
-            self.append_notice(TAB_CLOSED);
         }
         // A confirmation for what had the focus must not go on to act on what has it now.
         let stale = match &self.modal {
@@ -1784,10 +1765,11 @@ impl App {
         }) = self.modal.take()
         {
             Arc::make_mut(&mut dialog.conversation).pop();
-            dialog.error = Some(error.clone());
+            dialog.error = Some(error);
             self.modal = Some(Modal::Intent(dialog));
+        } else {
+            self.show_error(error);
         }
-        self.set_notice(error);
     }
 
     fn open_intent(&mut self) -> Result<()> {
@@ -1925,7 +1907,6 @@ impl App {
                 agent,
             } => {
                 let repository = self.focused_repository()?;
-                let notice = format!("Creating {branch} in a separate worktree...");
                 self.jobs
                     .try_send(Job::Create {
                         repository,
@@ -1935,7 +1916,6 @@ impl App {
                         split: None,
                     })
                     .context("command queue is busy")?;
-                self.set_notice(notice);
             }
             Plan::Open { target, agent } => {
                 let target = targets
@@ -1992,7 +1972,7 @@ impl App {
             }
             SwitchProject => {
                 if self.saved_projects.is_empty() {
-                    self.set_notice("No other project open. F1 → ask to open a project.");
+                    self.show_error("No other project open. F1 → ask to open a project.");
                 } else {
                     self.modal = Some(Modal::SwitchProject { selected: 0 });
                 }
@@ -2044,7 +2024,7 @@ impl App {
                     })
                     .unwrap_or_default();
                 if urls.is_empty() {
-                    self.set_notice(
+                    self.show_error(
                         "No published endpoints. Start or refresh this environment first.",
                     );
                 } else {
@@ -2062,8 +2042,7 @@ impl App {
         Ok(())
     }
 
-    /// F3: turns the agent CPU limit off or on, for running agents as far as it can, and says
-    /// what it does now.
+    /// F3: turns the agent CPU limit off or on; the top-bar hint reflects the setting.
     fn toggle_agent_cpu(&mut self) -> Result<()> {
         let limited = !self.limiter.limited();
         self.limiter.set_limited(limited);
@@ -2094,7 +2073,6 @@ impl App {
             }
         }
         self.state_dirty = true;
-        self.set_notice(self.limiter.describe());
         Ok(())
     }
 
@@ -2178,37 +2156,11 @@ impl App {
         Ok(())
     }
 
-    /// Esc on a progress dialog only hides it: the job keeps running and its result
-    /// arrives as a notice.
-    fn note_hidden_progress(&mut self, modal: &Modal) {
-        match modal {
-            Modal::Removal {
-                tree, error: None, ..
-            } => {
-                let label = self
-                    .all_workspaces_mut()
-                    .find(|workspace| workspace.tree.id == *tree)
-                    .map_or_else(
-                        || "the checkout".to_owned(),
-                        |workspace| workspace.label().to_owned(),
-                    );
-                self.set_notice(format!(
-                    "Still removing {label}; the result will appear here."
-                ));
-            }
-            Modal::OpeningSplit { .. } => {
-                self.set_notice("Still opening the split; the checkout will open as a tab.");
-            }
-            _ => {}
-        }
-    }
-
     fn modal_key(&mut self, key: KeyEvent) -> Result<()> {
         let Some(mut modal) = self.modal.take() else {
             return Ok(());
         };
         if key.code == KeyCode::Esc {
-            self.note_hidden_progress(&modal);
             if let Modal::ExistingSplit { layout, .. } = modal {
                 self.modal = Some(Modal::Split {
                     layout,
@@ -2275,7 +2227,7 @@ impl App {
                 }
                 Modal::OpenProject(picker) => {
                     if let Err(error) = picker.key(key, &self.jobs) {
-                        self.set_notice(format!("{error:#}"));
+                        self.show_error(format!("{error:#}"));
                     }
                 }
                 Modal::SwitchProject { selected } => {
@@ -2298,7 +2250,6 @@ impl App {
                                 repository: self.focused_repository()?,
                             })
                             .context("command queue is busy")?;
-                        self.set_notice(format!("Creating {}...", input.trim()));
                         retain = false;
                     }
                     _ => edit_input(key, input, 256),
@@ -2489,7 +2440,6 @@ impl App {
                                     // Docker must not start on this checkout while Git removes it.
                                     self.project.workspaces[open].pending = true;
                                 }
-                                self.notice = None;
                                 self.modal = Some(Modal::Removal {
                                     tree,
                                     confirm: confirm.clone(),
@@ -2529,6 +2479,23 @@ impl App {
         if self.should_quit {
             return Ok(false);
         }
+        if self.alert.is_some() {
+            match &event {
+                Event::Input(crossterm::event::Event::Key(key))
+                    if keys::action(*key) == Some(Action::ToggleNative) => {}
+                Event::Input(crossterm::event::Event::Key(key))
+                    if (key.code == KeyCode::Esc
+                        || (self.interaction_visible && key.code == KeyCode::Enter))
+                        && key.kind != KeyEventKind::Release =>
+                {
+                    self.alert = None;
+                    return Ok(true);
+                }
+                Event::Input(crossterm::event::Event::Resize(..)) => {}
+                Event::Input(_) => return Ok(false),
+                _ => {}
+            }
+        }
         if !self.interaction_visible {
             match &event {
                 Event::Input(crossterm::event::Event::Key(key))
@@ -2536,9 +2503,7 @@ impl App {
                 Event::Input(crossterm::event::Event::Key(key))
                     if key.code == KeyCode::Esc && key.kind != KeyEventKind::Release =>
                 {
-                    if let Some(modal) = self.modal.take() {
-                        self.note_hidden_progress(&modal);
-                    }
+                    self.modal = None;
                     return Ok(true);
                 }
                 Event::Input(crossterm::event::Event::Resize(_, _)) => {}
@@ -2548,8 +2513,7 @@ impl App {
         }
         match event {
             Event::Input(crossterm::event::Event::Key(key)) => {
-                // A key ends any drag. With a selection, a scrolled-back view and the notice it
-                // clears, that is all crit itself shows of a key that only goes to a pane.
+                // A key ends any drag; a selection or scrolled-back view may also change.
                 let scroll_drag = self.scroll_drag.take().is_some();
                 let split_drag = self.finish_split_drag();
                 if key.kind == KeyEventKind::Release {
@@ -2594,12 +2558,10 @@ impl App {
                         Some(session) => session.key(key)?,
                         None => false,
                     };
-                    let cleared = self.clear_notice_on_input(key.code == KeyCode::Esc);
-                    return Ok(scroll_drag || split_drag || selected || scrolled || cleared);
+                    return Ok(scroll_drag || split_drag || selected || scrolled);
                 } else if self.modal.is_some() {
                     self.modal_key(key)?;
                 } else if let Some(action) = action {
-                    self.notice = None;
                     self.action(action)?;
                 } else {
                     // Every other key is the pane's, Ctrl+D too: an agent quits on it and a shell
@@ -2613,8 +2575,7 @@ impl App {
                         Some(session) => session.key(key)?,
                         None => false,
                     };
-                    let cleared = self.clear_notice_on_input(key.code == KeyCode::Esc);
-                    return Ok(scroll_drag || split_drag || selected || scrolled || cleared);
+                    return Ok(scroll_drag || split_drag || selected || scrolled);
                 }
             }
             Event::Input(crossterm::event::Event::Paste(text)) => {
@@ -2625,8 +2586,7 @@ impl App {
                 if self.native_keys || self.modal.is_none() {
                     if let Some(session) = self.focused_session() {
                         let scrolled = session.paste(&text)?;
-                        let cleared = self.clear_notice_on_input(false);
-                        return Ok(selected || split_drag || scrolled || cleared);
+                        return Ok(selected || split_drag || scrolled);
                     }
                 } else {
                     match &mut self.modal {
@@ -2737,9 +2697,6 @@ impl App {
                         self.scroll_drag = None;
                     }
                     return Ok(true);
-                }
-                if matches!(mouse.kind, MouseEventKind::Down(_)) {
-                    self.clear_notice_on_input(false);
                 }
                 if matches!(mouse.kind, MouseEventKind::Drag(_) | MouseEventKind::Up(_)) {
                     // A press that reached a program owns its drag and release wherever
@@ -2891,7 +2848,7 @@ impl App {
                 return Ok(false);
             }
             Event::ClipboardText { target, result } => match result {
-                Err(error) => self.set_notice(error),
+                Err(error) => self.show_error(error),
                 Ok(text) => {
                     // The read took a while: paste only where it was asked for.
                     let terminal_has_input = self.native_keys || self.modal.is_none();
@@ -2907,7 +2864,7 @@ impl App {
                     if still_there {
                         return self.handle(Event::Input(crossterm::event::Event::Paste(text)));
                     }
-                    self.set_notice(
+                    self.show_error(
                         "Clipboard paste dropped: focus changed before the clipboard answered.",
                     );
                 }
@@ -3058,7 +3015,7 @@ impl App {
                     Err(error) => {
                         if let Some(Modal::OpenProject(picker)) = &mut self.modal {
                             picker.pending = false;
-                            self.set_notice(error);
+                            self.show_error(error);
                         } else {
                             self.navigation_error(error);
                         }
@@ -3108,9 +3065,9 @@ impl App {
                                 saved.workspaces.push(workspace);
                             }
                             if let Some(error) = preparation_error {
-                                self.set_notice(format!("Worktree created; local environment preparation failed: {error}"));
+                                self.show_error(format!("Worktree created; local environment preparation failed: {error}"));
                             } else if not_started {
-                                self.set_notice(ENVIRONMENT_NOT_STARTED);
+                                self.show_error(ENVIRONMENT_NOT_STARTED);
                             }
                             return Ok(true);
                         }
@@ -3145,18 +3102,13 @@ impl App {
                             self.spawn(index, agent.as_str(), None)?;
                         }
                         if let Some(error) = preparation_error {
-                            self.set_notice(format!("Worktree created; local environment preparation failed: {error}. Fix the files, then start its environment again."));
+                            self.show_error(format!("Worktree created; local environment preparation failed: {error}. Fix the files, then start its environment again."));
                         } else if not_started {
-                            self.set_notice(ENVIRONMENT_NOT_STARTED);
-                        } else {
-                            self.set_notice(if has_compose {
-                                "Worktree created; starting its isolated Docker environment."
-                            } else {
-                                "Worktree created. No Compose config found; terminal is ready."
-                            });
+                            self.show_error(ENVIRONMENT_NOT_STARTED);
                         }
                     }
                     Err(error) => {
+                        let mut error = Some(error);
                         // A restored dialog could not be answered while the terminal owns the keys.
                         if !self.native_keys
                             && self.modal.is_none()
@@ -3166,11 +3118,13 @@ impl App {
                         {
                             if let Modal::Intent(dialog) = &mut modal {
                                 Arc::make_mut(&mut dialog.conversation).pop();
-                                dialog.error = Some(error.clone());
+                                dialog.error = error.take();
                             }
                             self.modal = Some(modal);
                         }
-                        self.set_notice(error);
+                        if let Some(error) = error {
+                            self.show_error(error);
+                        }
                     }
                 }
             }
@@ -3188,16 +3142,15 @@ impl App {
                 let source_changed = prepared && workspace.source.take().is_some();
                 match result {
                     Ok(environment) => {
-                        let summary = (!matches!(operation, EnvironmentOp::Probe))
+                        let summary = matches!(operation, EnvironmentOp::Status)
                             .then(|| environment_summary(workspace.label(), &environment));
                         workspace.environment = Some(environment);
-                        // A background probe never touches the notice.
                         if active && let Some(summary) = summary {
-                            self.set_notice(summary);
+                            self.show_alert("Environment", summary);
                         }
                     }
                     Err(error) if !matches!(operation, EnvironmentOp::Probe) => {
-                        self.set_notice(error)
+                        self.show_error(error)
                     }
                     Err(_) => {}
                 }
@@ -3240,7 +3193,7 @@ impl App {
                                 layout,
                                 selected: 2,
                             });
-                            self.set_notice(error);
+                            self.show_error(error);
                         }
                     }
                 }
@@ -3261,16 +3214,12 @@ impl App {
                     self.note_tree(&project, tree);
                 }
                 if self.project.common_dir() != Some(project.as_path()) {
-                    // The project was left while the checkout opened: only report it.
+                    // A success is already reflected in the project's listing; only failures interrupt.
                     if waiting {
                         self.modal = None;
                     }
-                    match result {
-                        Ok((tree, _)) => self.set_notice(format!(
-                            "{} is ready in the project you left; open it there from Open existing worktree.",
-                            tree.label()
-                        )),
-                        Err(error) => self.set_notice(error),
+                    if let Err(error) = result {
+                        self.show_error(error);
                     }
                     return Ok(true);
                 }
@@ -3307,12 +3256,9 @@ impl App {
                             self.workspace_changed();
                         }
                         if let Some(error) = preparation_error {
-                            self.set_notice(format!("Worktree created; local environment preparation failed: {error}. Fix the files, then start its environment again."));
+                            self.show_error(format!("Worktree created; local environment preparation failed: {error}. Fix the files, then start its environment again."));
                         } else if not_started {
-                            self.set_notice(ENVIRONMENT_NOT_STARTED);
-                        } else if !waiting {
-                            let label = self.project.workspaces[index].label().to_owned();
-                            self.set_notice(format!("{label} is ready as a tab."));
+                            self.show_error(ENVIRONMENT_NOT_STARTED);
                         }
                     }
                     result => {
@@ -3335,7 +3281,7 @@ impl App {
                             if waiting {
                                 self.modal = None;
                             }
-                            self.set_notice(error);
+                            self.show_error(error);
                         }
                     }
                 }
@@ -3386,16 +3332,13 @@ impl App {
                     {
                         self.close_tab(Some(project), index);
                     }
-                    self.set_notice(match warning {
-                        Some(warning) => format!(
+                    if let Some(warning) = warning {
+                        self.show_error(format!(
                             "Checkout removed; Git branch retained. Docker could not be checked ({warning}); if this worktree's stack still exists, run: docker compose -p crit-{tree} down"
-                        ),
-                        None => {
-                            "Checkout removed; Git branch and Docker volumes retained.".to_owned()
-                        }
-                    });
+                        ));
+                    }
                     if let Some(error) = scratch {
-                        self.append_notice(&format!("Its scratch stays in the sandbox: {error}"));
+                        self.show_error(format!("Its scratch stays in the sandbox: {error}"));
                     }
                 }
                 Err(error) => {
@@ -3411,21 +3354,20 @@ impl App {
                     {
                         *failure = Some(error);
                     } else {
-                        self.set_notice(error);
+                        self.show_error(error);
                     }
                 }
             },
-            Event::CpuLimit(message) => self.append_notice(&message),
+            Event::CpuLimit(message) => self.show_error(message),
             Event::SandboxCleaned(result) => {
                 self.sandbox_cleaning = false;
-                // Only what a pass freed, or a sandbox it could not read, is news.
-                match result.map(|report| report.summary()) {
-                    Ok(Some(summary)) => self.append_notice(&summary),
-                    Ok(None) => return Ok(false),
-                    Err(error) => self.append_notice(&error),
+                if let Err(error) = result {
+                    self.show_error(error);
+                } else {
+                    return Ok(false);
                 }
             }
-            Event::Error(error) => self.set_notice(error),
+            Event::Error(error) => self.show_error(error),
             Event::Shutdown => self.should_quit = true,
         }
         Ok(true)
@@ -3742,7 +3684,7 @@ fn start_worker(tx: SyncSender<Event>, sandbox: Option<Sandbox>) -> Result<SyncS
                         let mut listings = Vec::new();
                         for repository in repositories {
                             // Checkout can temporarily make Git metadata unreadable.
-                            // Keep the previous labels and retry without notice spam.
+                            // Keep the previous labels and retry silently.
                             // An unchanged repository is left out: its labels stand.
                             if let Ok(Some(found)) = listing_cache.refresh(&repository) {
                                 listings.push((repository.common_dir, found));
@@ -3756,7 +3698,7 @@ fn start_worker(tx: SyncSender<Event>, sandbox: Option<Sandbox>) -> Result<SyncS
                             // Only an environment Crit started can hold containers, so a tree
                             // without one is removable even where Docker cannot run. Docker
                             // that cannot answer is no reason to refuse either: the removal
-                            // goes ahead and the notice names the stack to clean up.
+                            // goes ahead and an error dialog names the stack to clean up.
                             let warning = match compose::existing_status(&tree) {
                                 Ok(Some(environment)) if !environment.services.is_empty() => {
                                     anyhow::bail!(
@@ -3810,7 +3752,7 @@ fn start_worker(tx: SyncSender<Event>, sandbox: Option<Sandbox>) -> Result<SyncS
                             },
                         }
                     }
-                    // A retune that worked has nothing to say: F3's notice already did.
+                    // Successful retuning is already reflected by the top-bar hint.
                     Job::RetuneAgentCpu(limiter) => match limiter.retune() {
                         Ok(()) => continue,
                         Err(error) => Event::CpuLimit(error),
@@ -3996,7 +3938,7 @@ fn choose_project(
     rx: &mpsc::Receiver<Event>,
     jobs: &SyncSender<Job>,
     path: &Path,
-    notice: Option<&str>,
+    startup_error: Option<&str>,
     use_kitty: bool,
 ) -> Result<Option<(Project, bool, bool)>> {
     let launch_path = std::env::current_dir().context("the current folder no longer exists")?;
@@ -4005,9 +3947,7 @@ fn choose_project(
     } else {
         launch_path.clone()
     };
-    let mut notice = notice
-        .unwrap_or("Choose New terminal for a shell here, or open a project or any folder.")
-        .to_owned();
+    let mut error = startup_error.map(str::to_owned);
     let mut picker = ProjectPicker::new(base, jobs, 0)?;
     picker.terminal_path = Some(launch_path.clone());
     let mut native_keys = false;
@@ -4020,7 +3960,7 @@ fn choose_project(
             draw_frame(terminal, output, window_size()?, |frame| {
                 let bounds = frame.area();
                 interaction_visible = bounds.width >= 30 && bounds.height >= 10;
-                ui::draw_project_chooser(frame, &picker, &notice, native_keys);
+                ui::draw_project_chooser(frame, &picker, error.as_deref(), native_keys);
             })?;
         }
         redraw = true;
@@ -4028,6 +3968,14 @@ fn choose_project(
             Event::Input(crossterm::event::Event::Key(key))
                 if key.kind != KeyEventKind::Release =>
             {
+                if error.is_some() && !matches!(key.code, KeyCode::F(10) | KeyCode::F(12)) {
+                    if key.code == KeyCode::Esc
+                        || (interaction_visible && key.code == KeyCode::Enter)
+                    {
+                        error = None;
+                    }
+                    continue;
+                }
                 match key.code {
                     KeyCode::Esc | KeyCode::F(10) => return Ok(None),
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -4047,11 +3995,13 @@ fn choose_project(
                             return Ok(Some((Project::terminal(&launch_path)?, native_keys, true)));
                         }
                         Ok(false) => {}
-                        Err(error) => notice = format!("{error:#}"),
+                        Err(failure) => error = Some(format!("{failure:#}")),
                     },
                 }
             }
-            Event::Input(crossterm::event::Event::Paste(text)) if interaction_visible => {
+            Event::Input(crossterm::event::Event::Paste(text))
+                if interaction_visible && error.is_none() =>
+            {
                 picker.paste(&text);
             }
             Event::Input(crossterm::event::Event::Resize(..)) => {}
@@ -4062,12 +4012,12 @@ fn choose_project(
                 request, result, ..
             } if picker.request == request => match result {
                 Ok(project) => return Ok(Some((project, native_keys, false))),
-                Err(error) => {
+                Err(failure) => {
                     picker.pending = false;
-                    notice = error;
+                    error = Some(failure);
                 }
             },
-            Event::Error(error) => notice = error,
+            Event::Error(failure) => error = Some(failure),
             Event::Shutdown => return Ok(None),
             _ => redraw = false,
         }
@@ -4290,11 +4240,9 @@ pub fn run(
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         anyhow::bail!("Crit needs an interactive terminal; use --help for noninteractive commands");
     }
-    // Everything startup has to say, shown together. `sticky` keeps it past terminal input:
-    // it reports that saving is off or that saved items were left out.
-    let mut notices: Vec<String> = Vec::new();
-    let mut sticky = false;
-    let sandbox = Sandbox::open(&mut notices);
+    // Startup failures remain actionable, but routine status never interrupts the terminal.
+    let mut warnings: Vec<String> = Vec::new();
+    let sandbox = Sandbox::open(&mut warnings);
     if let Some(sandbox) = &sandbox {
         for name in ["TMPDIR", "TMP", "TEMP"] {
             // SAFETY: no other thread exists yet, as `start_worker` below starts the first, so
@@ -4349,10 +4297,9 @@ pub fn run(
     let mut store = match restore::Store::open() {
         Ok(store) => Some(store),
         Err(error) => {
-            notices.push(format!(
+            warnings.push(format!(
                 "Workspace restoration/saving unavailable: {error:#}. This window will not replace the saved workspace."
             ));
-            sticky = true;
             None
         }
     };
@@ -4364,10 +4311,9 @@ pub fn run(
         match store.as_ref().map(restore::Store::load).transpose() {
             Ok(snapshot) => snapshot.flatten(),
             Err(error) => {
-                notices.push(format!(
+                warnings.push(format!(
                     "Saved workspace could not be loaded: {error:#}. Original state retained; saving disabled. Use --fresh to replace it."
                 ));
-                sticky = true;
                 store = None;
                 None
             }
@@ -4383,7 +4329,6 @@ pub fn run(
     let snapshot = snapshot.filter(|snapshot| !snapshot.projects.is_empty());
     let server = integration::start(tx.clone())?;
     let limiter = limits::Limiter::new(server.directory(), cpu_percent, cpu_limited);
-    notices.extend(limiter.startup_notice());
     let mut next_session = 1;
     let (restored, skipped) = match &snapshot {
         Some(snapshot) => restore_projects(
@@ -4425,8 +4370,7 @@ pub fn run(
                 )
             }
         };
-        notices.push(format!("{}\n{summary}", skipped.join("\n")));
-        sticky = true;
+        warnings.push(format!("{}\n{summary}", skipped.join("\n")));
     }
     let was_restored = restored.is_some();
     let (project, saved_projects, native_keys, start_shell) =
@@ -4441,13 +4385,13 @@ pub fn run(
             let selection = match direct_start.then(|| Project::open(path)) {
                 Some(Ok(project)) => Ok(Some((project, false, false))),
                 result => {
-                    notices.extend(
+                    warnings.extend(
                         result
                             .and_then(Result::err)
                             .map(|error| format!("{error:#}")),
                     );
-                    let shown = notices.join("\n");
-                    choose_project(
+                    let shown = warnings.join("\n");
+                    let selected = choose_project(
                         &mut terminal,
                         &output,
                         &rx,
@@ -4455,7 +4399,9 @@ pub fn run(
                         path,
                         (!shown.is_empty()).then_some(shown.as_str()),
                         use_kitty,
-                    )
+                    );
+                    warnings.clear();
+                    selected
                 }
             };
             match selection {
@@ -4480,8 +4426,7 @@ pub fn run(
         native_keys,
         limiter: limiter.clone(),
         modal: None,
-        notice: None,
-        notice_sticky: false,
+        alert: None,
         panes: Vec::with_capacity(2),
         next_panes: Vec::with_capacity(2),
         scroll_drag: None,
@@ -4516,7 +4461,7 @@ pub fn run(
             app.ensure_session(active)
         };
         if let Err(error) = launched {
-            notices.push(format!(
+            warnings.push(format!(
                 "{error:#}. F1 → ask to start another agent or shell."
             ));
         }
@@ -4531,15 +4476,18 @@ pub fn run(
         && let Err(error) =
             Project::open(path).and_then(|project| app.open_project(project, None, false))
     {
-        notices.push(format!("Could not open {}: {error:#}", path.display()));
+        warnings.push(format!("Could not open {}: {error:#}", path.display()));
     }
-    if !notices.is_empty() {
-        let notice = notices.join("\n");
-        if sticky {
-            app.set_warning(notice);
-        } else {
-            app.set_notice(notice);
-        }
+    if app.all_workspaces_mut().any(|workspace| {
+        workspace
+            .sessions
+            .iter()
+            .any(|session| matches!(session.kind.as_str(), "omp" | "opencode"))
+    }) {
+        warnings.extend(limiter.startup_warning());
+    }
+    if !warnings.is_empty() {
+        app.show_alert("Startup", warnings.join("\n"));
     }
     // Frames go out at least 16 ms apart, so that what is typed shows at once. While app output
     // keeps them coming, each within 100 ms of the one before, they go out at least 33 ms
@@ -4576,7 +4524,7 @@ pub fn run(
         app.clean_sandbox();
         let failures = checks.poll();
         if !failures.is_empty() {
-            app.append_notice(&failures.join("\n"));
+            app.show_error(failures.join("\n"));
             redraw = true;
         }
         if tick.is_some_and(|tick| last_draw.elapsed() >= tick) {
@@ -4640,7 +4588,7 @@ pub fn run(
                 match app.handle(event) {
                     Ok(changed) => redraw |= changed,
                     Err(error) => {
-                        app.set_notice(format!("{error:#}"));
+                        app.show_error(format!("{error:#}"));
                         redraw = true;
                     }
                 }
@@ -4843,26 +4791,6 @@ mod tests {
     }
 
     #[test]
-    fn late_update_failures_join_the_notice_row_instead_of_replacing_it() {
-        let (mut app, _queued, _events) = interaction_app();
-        let omp = "OMP update failed: boom. Continuing with the installed version.";
-        app.append_notice(omp);
-        assert_eq!(app.notice.as_deref(), Some(omp));
-        assert!(!app.notice_sticky);
-        // A startup warning stays on screen, and stays a warning, with the failure beneath it.
-        app.set_warning("Saved workspace could not be loaded.");
-        let opencode = "OpenCode update failed: refused. Continuing with the installed version.";
-        app.append_notice(opencode);
-        assert_eq!(
-            app.notice,
-            Some(format!("Saved workspace could not be loaded.\n{opencode}"))
-        );
-        assert!(app.notice_sticky);
-        app.clear_notice_on_input(false);
-        assert!(app.notice.is_some());
-    }
-
-    #[test]
     fn shared_snapshot_remaps_sessions_and_never_restores_duplicate_terminals() {
         let (mut app, _queued, _events) = interaction_app();
         let directory = tempfile::tempdir().unwrap();
@@ -5042,14 +4970,11 @@ mod tests {
             assert!(matches!(queued.recv().unwrap(), Job::Remove { .. }));
         };
 
-        // A refusal that arrives after Esc has no dialog left to show it: it is a notice.
+        // A refusal after Esc is still actionable without reopening the progress dialog.
         delete(&mut app);
         app.handle(escape()).unwrap();
         assert!(app.modal.is_none());
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("Still removing other; the result will appear here.")
-        );
+
         app.handle(Event::Removed {
             tree: "other".into(),
             result: Err("local changes".into()),
@@ -5057,7 +4982,9 @@ mod tests {
         })
         .unwrap();
         assert!(app.modal.is_none());
-        assert_eq!(app.notice.as_deref(), Some("local changes"));
+        assert!(app.alert.is_some());
+        app.handle(escape()).unwrap();
+
         assert_eq!(app.project.workspaces.len(), 2);
 
         // Success still closes the tab, whichever Esc path hid the dialog.
@@ -5066,7 +4993,6 @@ mod tests {
         app.handle(escape()).unwrap();
         app.interaction_visible = true;
         assert!(app.modal.is_none());
-        assert!(app.notice.as_deref().unwrap().starts_with("Still removing"));
         app.handle(Event::Removed {
             tree: "other".into(),
             result: Ok(None),
@@ -5075,10 +5001,6 @@ mod tests {
         .unwrap();
         assert_eq!(app.project.workspaces.len(), 1);
         assert_eq!(app.focused().tree.id, "main");
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("Checkout removed; Git branch and Docker volumes retained.")
-        );
 
         // A split checkout that finishes after Esc lands as a tab and leaves the layout alone.
         let mut third = app.project.workspaces[0].tree.clone();
@@ -5097,10 +5019,7 @@ mod tests {
         app.modal = Some(Modal::OpeningSplit { request: 9 });
         app.handle(escape()).unwrap();
         assert!(app.modal.is_none());
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("Still opening the split; the checkout will open as a tab.")
-        );
+
         // A dialog opened meanwhile is not the result's to answer.
         app.modal = Some(Modal::Confirm(Confirm::Quit));
         let event = opened(&app, 9, Ok((third, true)));
@@ -5112,14 +5031,12 @@ mod tests {
         assert!(app.project.layout == LayoutMode::Full);
         assert!(app.project.secondary.is_none());
         assert_eq!(app.focused().tree.id, "main");
-        assert_eq!(app.notice.as_deref(), Some("third is ready as a tab."));
 
         app.modal = Some(Modal::OpeningSplit { request: 10 });
         app.handle(escape()).unwrap();
         let event = opened(&app, 10, Err("branch no longer exists".into()));
         app.handle(event).unwrap();
         assert!(app.modal.is_none());
-        assert_eq!(app.notice.as_deref(), Some("branch no longer exists"));
     }
 
     #[test]
@@ -5162,7 +5079,7 @@ mod tests {
         app.project.secondary = Some(1);
         app.project.focus_secondary = true;
         app.project.split_ratio = 6_500;
-        app.notice = Some("preserve existing notice".into());
+
         let mut switched = app.project.workspaces[0].tree.clone();
         switched.branch = "switched".into();
         let mut detached = app.project.workspaces[1].tree.clone();
@@ -5184,7 +5101,7 @@ mod tests {
         assert!(app.project.layout == LayoutMode::Vertical);
         assert_eq!(app.project.split_ratio, 6_500);
         assert_eq!(app.saved_projects[0].workspaces[0].label(), "renamed");
-        assert_eq!(app.notice.as_deref(), Some("preserve existing notice"));
+
         assert_eq!(app.project.workspaces[0].sessions.len(), 1);
         assert_eq!(app.project.workspaces[0].selected, 0);
         assert_eq!(app.project.workspaces[0].sessions[0].id, 1);
@@ -5496,22 +5413,6 @@ mod tests {
         assert!(parser.screen().contents().contains("row-59"));
         drop(parser);
         assert!(app.scroll_drag.is_none());
-        app.notice = Some("Environment ready".into());
-        ui::resize_sessions(&mut app, ratatui::layout::Size::new(40, 14)).unwrap();
-        terminal
-            .draw(|frame| {
-                ui::draw(frame, &mut app);
-            })
-            .unwrap();
-        assert_eq!(app.panes[0].body.bottom(), 13);
-        app.notice = None;
-        ui::resize_sessions(&mut app, ratatui::layout::Size::new(40, 14)).unwrap();
-        terminal
-            .draw(|frame| {
-                ui::draw(frame, &mut app);
-            })
-            .unwrap();
-        assert_eq!(app.panes[0].body.bottom(), 14);
     }
 
     #[test]
@@ -5625,7 +5526,6 @@ mod tests {
             assert_eq!(app.focused().sessions.len(), 1);
             assert_eq!(app.focused_session().unwrap().id, survivor);
             // A session closing inside a tab has nothing to say.
-            assert!(app.notice.is_none());
         }
 
         // Two workspaces side by side: the focused one's only session ends, and its tab closes.
@@ -5643,7 +5543,7 @@ mod tests {
         assert_eq!(app.project.workspaces.len(), 1);
         assert_eq!(app.focused().tree.id, "main");
         assert_eq!(app.focused_session().unwrap().id, 1);
-        assert_eq!(app.notice.as_deref(), Some(TAB_CLOSED));
+
         assert!(!app.should_quit);
     }
 
@@ -5670,7 +5570,7 @@ mod tests {
         app.handle(exited(4, true)).unwrap();
         assert_eq!(ids(&app), [3]);
         assert_eq!(app.focused_session().unwrap().id, 3);
-        assert!(app.notice.is_none());
+
         assert!(app.state_dirty);
     }
 
@@ -5690,7 +5590,6 @@ mod tests {
         app.handle(exited(2, true)).unwrap();
         assert_eq!(app.project.workspaces.len(), 1);
         assert_eq!(app.focused_session().unwrap().id, 1);
-        assert_eq!(app.notice.as_deref(), Some(TAB_CLOSED));
 
         let (mut app, _queued, _events) = start();
         // An agent that quits closes like a shell that ends.
@@ -5699,7 +5598,7 @@ mod tests {
         assert_eq!(app.project.workspaces.len(), 1);
         assert_eq!(app.focused().tree.id, "other");
         assert_eq!(app.focused_session().unwrap().id, 2);
-        assert_eq!(app.notice.as_deref(), Some(TAB_CLOSED));
+
         assert!(!app.should_quit);
         app.handle(exited(2, true)).unwrap();
         assert!(app.should_quit);
@@ -5720,7 +5619,7 @@ mod tests {
         assert_eq!(session.state, AgentState::Exited);
         assert_eq!(session.message.as_deref(), Some("Exited with code 1"));
         assert_eq!(app.project.workspaces.len(), 2);
-        assert!(app.notice.is_none());
+
         assert!(!app.should_quit);
     }
 
@@ -5774,18 +5673,18 @@ mod tests {
         assert_eq!(saved.sessions.len(), 1);
         assert_eq!(saved.sessions[0].id, 3);
         assert_eq!(saved.selected, 0);
-        assert!(app.notice.is_none());
+
         // A background tab left without sessions closes, and the current project stays put.
         app.handle(exited(4, true)).unwrap();
         assert_eq!(app.saved_projects[0].workspaces.len(), 1);
-        assert_eq!(app.notice.as_deref(), Some(TAB_CLOSED));
+
         assert_eq!(app.project.workspaces.len(), 2);
         assert_eq!(app.focused_session().unwrap().id, 1);
         // So does a background project left without tabs.
-        app.notice = None;
+        app.alert = None;
         app.handle(exited(3, true)).unwrap();
         assert!(app.saved_projects.is_empty());
-        assert_eq!(app.notice.as_deref(), Some(TAB_CLOSED));
+
         assert_eq!(app.focused_session().unwrap().id, 1);
 
         // The current project, left without tabs, gives way to the other one.
@@ -5804,7 +5703,6 @@ mod tests {
         assert_eq!(app.project.name, "background");
         assert!(app.saved_projects.is_empty());
         assert_eq!(app.focused_session().unwrap().id, 2);
-        assert_eq!(app.notice.as_deref(), Some(TAB_CLOSED));
     }
 
     #[test]
@@ -5853,7 +5751,7 @@ mod tests {
         assert!(app.modal.is_none());
         assert_eq!(app.project.workspaces.len(), 1);
         assert_eq!(app.focused_session().unwrap().id, 2);
-        assert_eq!(app.notice.as_deref(), Some(TAB_CLOSED));
+
         app.action(Action::CloseSession).unwrap();
         app.modal_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
             .unwrap();
@@ -5884,35 +5782,6 @@ mod tests {
     }
 
     #[test]
-    fn input_reaching_the_terminal_clears_the_notice() {
-        let directory = tempfile::tempdir().unwrap();
-        let (mut app, _queued, _events) = interaction_app();
-        let session = sleeping_session(&app, directory.path(), 1);
-        app.project.workspaces[0].sessions.push(session);
-        for native_keys in [false, true] {
-            app.native_keys = native_keys;
-            // Pointer motion is not an acknowledgement.
-            app.notice = Some("Tab closed".into());
-            app.handle(mouse_event(MouseEventKind::Moved, 0, 0))
-                .unwrap();
-            assert!(app.notice.is_some());
-            for event in [
-                Event::Input(crossterm::event::Event::Key(KeyEvent::new(
-                    KeyCode::Char('a'),
-                    KeyModifiers::NONE,
-                ))),
-                Event::Input(crossterm::event::Event::Paste("a".into())),
-                mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
-            ] {
-                app.notice = Some("Tab closed".into());
-                // The notice row must disappear on the next frame.
-                assert!(app.handle(event).unwrap());
-                assert!(app.notice.is_none());
-            }
-        }
-    }
-
-    #[test]
     fn input_forwarded_to_a_pane_draws_no_frame_of_its_own() {
         // The program draws its answer, if any, through its own output.
         let directory = tempfile::tempdir().unwrap();
@@ -5927,6 +5796,100 @@ mod tests {
                     .unwrap()
             );
         }
+    }
+
+    #[test]
+    fn errors_do_not_resize_panes_or_steal_async_dialog_results() {
+        let directory = tempfile::tempdir().unwrap();
+        for native in [false, true] {
+            let (mut app, _queued, _events) = interaction_app();
+            let output = directory.path().join(format!("received-{native}"));
+            let session = recording_session(1, directory.path(), app.tx.clone(), &output);
+            let parser = session.parser.clone();
+            app.project.workspaces[0].sessions.push(session);
+            let size = ratatui::layout::Size::new(80, 24);
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            ui::resize_sessions(&mut app, size).unwrap();
+            let before = parser.lock().screen().contents();
+            app.native_keys = native;
+            app.modal = Some(Modal::Loading {
+                request: 42,
+                message: "Reading worktrees...",
+                retry: None,
+            });
+            app.handle(Event::Error("a background operation failed".into()))
+                .unwrap();
+            for event in [
+                key_event(KeyCode::Char('x')),
+                Event::Input(crossterm::event::Event::Paste("blocked".into())),
+                mouse_event(MouseEventKind::Down(MouseButton::Left), 2, 4),
+            ] {
+                assert!(!app.handle(event).unwrap());
+            }
+            let tree = app.project.workspaces[1].tree.clone();
+            app.handle(Event::Worktrees {
+                request: 42,
+                project: PathBuf::from("/interaction-fixture/.git"),
+                result: Ok(vec![tree]),
+            })
+            .unwrap();
+            assert!(app.alert.is_some());
+            assert!(matches!(
+                &app.modal,
+                Some(Modal::OpenWorktree { selected: 0, .. })
+            ));
+            ui::resize_sessions(&mut app, size).unwrap();
+            terminal
+                .draw(|frame| {
+                    ui::draw(frame, &mut app);
+                })
+                .unwrap();
+            assert_eq!(parser.lock().screen().size(), (21, 78));
+            assert_eq!(parser.lock().screen().contents(), before);
+            assert_eq!(app.panes[0].body.bottom(), 24);
+            app.handle(key_event(KeyCode::Enter)).unwrap();
+            assert!(app.alert.is_none());
+            // Enter acknowledges the error only; it must not select a worktree behind it.
+            assert!(matches!(
+                &app.modal,
+                Some(Modal::OpenWorktree { selected: 0, .. })
+            ));
+            assert_eq!(app.focused().tree.id, "main");
+            app.modal = None;
+            app.handle(Event::Input(crossterm::event::Event::Paste(
+                "resumed".into(),
+            )))
+            .unwrap();
+            wait_for_file(&output, b"resumed");
+        }
+    }
+
+    #[test]
+    fn invisible_errors_require_escape_not_an_unseen_confirmation() {
+        let (mut app, _queued, _events) = interaction_app();
+        app.interaction_visible = false;
+        app.show_error("could not save the workspace");
+        assert!(!app.handle(key_event(KeyCode::Enter)).unwrap());
+        assert!(app.alert.is_some());
+        app.handle(key_event(KeyCode::Esc)).unwrap();
+        assert!(app.alert.is_none());
+    }
+
+    #[test]
+    fn failed_checkpoint_disables_saving_and_reports_the_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state");
+        let mut store = Some(restore::Store::open_in(&path).unwrap());
+        let (mut app, _queued, _events) = interaction_app();
+        std::fs::remove_dir_all(&path).unwrap();
+        app.state_dirty = true;
+        assert!(app.checkpoint(&mut store));
+        assert!(store.is_none());
+        assert!(app.alert.is_some());
+        app.handle(key_event(KeyCode::Enter)).unwrap();
+        app.state_dirty = true;
+        assert!(!app.checkpoint(&mut store));
+        assert!(!path.exists());
     }
 
     #[test]
@@ -5984,59 +5947,6 @@ mod tests {
                 assert!(app.selection.is_none());
             }
         }
-    }
-
-    #[test]
-    fn sticky_warnings_survive_terminal_input_until_escape() {
-        let directory = tempfile::tempdir().unwrap();
-        let (mut app, _queued, _events) = interaction_app();
-        let session = sleeping_session(&app, directory.path(), 1);
-        app.project.workspaces[0].sessions.push(session);
-        let key = |code| {
-            Event::Input(crossterm::event::Event::Key(KeyEvent::new(
-                code,
-                KeyModifiers::NONE,
-            )))
-        };
-        for native_keys in [false, true] {
-            app.native_keys = native_keys;
-            for event in [
-                key(KeyCode::Char('a')),
-                Event::Input(crossterm::event::Event::Paste("a".into())),
-                mouse_event(MouseEventKind::Down(MouseButton::Left), 0, 0),
-            ] {
-                app.set_warning("Saving disabled");
-                app.handle(event).unwrap();
-                assert_eq!(app.notice.as_deref(), Some("Saving disabled"));
-            }
-            // Esc dismisses it over a pane with a session and over one without.
-            for active in [0, 1] {
-                app.project.active = active;
-                app.set_warning("Saving disabled");
-                assert!(app.handle(key(KeyCode::Esc)).unwrap());
-                assert!(app.notice.is_none());
-            }
-            app.project.active = 0;
-            // An ordinary notice replaces a warning, and clears on the next key again.
-            app.set_warning("Saving disabled");
-            app.set_notice("Tab closed");
-            app.handle(key(KeyCode::Char('a'))).unwrap();
-            assert!(app.notice.is_none());
-        }
-        // A failed save raises exactly such a warning.
-        let state = directory.path().join("crit");
-        let mut store = Some(restore::Store::open_in(&state).unwrap());
-        std::fs::remove_dir_all(&state).unwrap();
-        app.set_notice("Tab closed");
-        app.state_dirty = true;
-        assert!(app.checkpoint(&mut store));
-        assert!(store.is_none());
-        assert!(app.notice_sticky);
-        assert!(
-            app.notice
-                .as_deref()
-                .is_some_and(|notice| notice.contains("Saving disabled for this window"))
-        );
     }
 
     #[test]
@@ -6285,55 +6195,6 @@ mod tests {
     }
 
     #[test]
-    fn notice_dismissing_press_keeps_its_selection() {
-        use ratatui::layout::Size;
-        let directory = tempfile::tempdir().unwrap();
-        let (mut app, _queued, _events) = interaction_app();
-        let session = sleeping_session(&app, directory.path(), 1);
-        session.parser.lock().process(b"hello");
-        app.project.workspaces[0].sessions.push(session);
-        let size = Size::new(40, 14);
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 14)).unwrap();
-        app.notice = Some("Environment ready".into());
-        ui::resize_sessions(&mut app, size).unwrap();
-        terminal
-            .draw(|frame| {
-                ui::draw(frame, &mut app);
-            })
-            .unwrap();
-        let reduced = app.panes[0].body;
-        app.handle(mouse_event(
-            MouseEventKind::Down(MouseButton::Left),
-            reduced.x,
-            reduced.y,
-        ))
-        .unwrap();
-        assert!(app.notice.is_none());
-        // The press removed the notice, so the next frame's body is one row taller.
-        ui::resize_sessions(&mut app, size).unwrap();
-        terminal
-            .draw(|frame| {
-                ui::draw(frame, &mut app);
-            })
-            .unwrap();
-        let full = app.panes[0].body;
-        assert_eq!(full.height, reduced.height + 1);
-        app.handle(mouse_event(
-            MouseEventKind::Drag(MouseButton::Left),
-            reduced.x + 4,
-            reduced.y,
-        ))
-        .unwrap();
-        let selection = app.selection.as_ref().expect("the press began a selection");
-        assert_eq!(selection.body, full);
-        assert!(selection.moved);
-        assert_eq!(selection.text(), "hello");
-        // A change to the left edge, top edge or width still invalidates the frozen rows.
-        ui::resize_sessions(&mut app, Size::new(50, 14)).unwrap();
-        assert!(app.selection.is_none());
-    }
-
-    #[test]
     fn worktree_dialogs_name_detached_checkouts() {
         let (mut app, _queued, _events) = interaction_app();
         let mut detached = app.project.workspaces[0].tree.clone();
@@ -6392,103 +6253,6 @@ mod tests {
                 "{expected:?} missing from {rows:#?}"
             );
         }
-    }
-
-    #[test]
-    fn long_notices_keep_their_tail() {
-        let (mut app, _queued, _events) = interaction_app();
-        app.set_notice("x".repeat(300_000) + "\nfinal cause");
-        let notice = app.notice.as_deref().unwrap();
-        assert!(notice.len() <= 16 * 1024 + 3);
-        assert!(notice.starts_with("..."));
-        assert!(notice.ends_with("final cause"));
-        // A cut inside a multi-byte character moves on to the next boundary.
-        app.set_notice("界".repeat(20_000));
-        let notice = app.notice.as_deref().unwrap();
-        assert!(notice.len() <= 16 * 1024 + 3);
-        assert!(notice.starts_with("...界"));
-        app.set_notice("short");
-        assert_eq!(app.notice.as_deref(), Some("short"));
-        // Paragraph scrolls by a u16, so an unbounded notice showed a middle slice.
-        app.set_notice(
-            (0..70_000)
-                .map(|row| format!("line{row}\n"))
-                .collect::<String>(),
-        );
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(40, 14)).unwrap();
-        terminal
-            .draw(|frame| {
-                ui::draw(frame, &mut app);
-            })
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let last: String = (0..40)
-            .map(|column| buffer[(column, 13)].symbol())
-            .collect();
-        assert!(last.contains("line69999"), "{last:?}");
-    }
-
-    #[test]
-    fn notices_keep_split_panes() {
-        let (mut app, _queued, _events) = interaction_app();
-        app.project.secondary = Some(1);
-        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 18)).unwrap();
-        for layout in [LayoutMode::Horizontal, LayoutMode::Vertical] {
-            app.project.layout = layout;
-            // The window is tall enough for both panes; the rows a notice takes are not.
-            for notice in [None, Some("one\ntwo\nthree")] {
-                app.notice = notice.map(Into::into);
-                terminal
-                    .draw(|frame| {
-                        ui::draw(frame, &mut app);
-                    })
-                    .unwrap();
-                assert_eq!(app.panes.len(), 2);
-            }
-        }
-    }
-
-    #[test]
-    fn notice_rows_keep_newest_output() {
-        use ratatui::layout::Size;
-        let directory = tempfile::tempdir().unwrap();
-        let (mut app, _queued, _events) = interaction_app();
-        let session = sleeping_session(&app, directory.path(), 1);
-        let parser = session.parser.clone();
-        app.project.workspaces[0].sessions.push(session);
-        let size = Size::new(80, 24);
-        ui::resize_sessions(&mut app, size).unwrap();
-        {
-            let mut parser = parser.lock();
-            for row in 1..=30 {
-                parser.process(format!("line{row}\r\n").as_bytes());
-            }
-            parser.process(b"ERROR\r\nprompt$ ");
-        }
-        let assert_newest_output_visible = || {
-            let parser = parser.lock();
-            let screen = parser.screen();
-            let visible: Vec<String> = screen.rows(0, 78).collect();
-            let cursor = usize::from(screen.cursor_position().0);
-            assert!(visible[cursor].starts_with("prompt$"), "{visible:?}");
-            assert_eq!(visible[cursor - 1], "ERROR");
-            assert_eq!(visible[cursor - 2], "line30");
-        };
-        app.notice = Some("Environment ready".into());
-        ui::resize_sessions(&mut app, size).unwrap();
-        assert_newest_output_visible();
-        {
-            // The row the notice took left through the top into history, not the bin.
-            let mut parser = parser.lock();
-            assert_eq!(parser.screen().size(), (20, 78));
-            parser.screen_mut().set_scrollback(usize::MAX);
-            assert_eq!(parser.screen().scrollback(), 12);
-            assert_eq!(parser.screen().rows(0, 78).next().as_deref(), Some("line1"));
-            parser.screen_mut().set_scrollback(0);
-        }
-        app.notice = None;
-        ui::resize_sessions(&mut app, size).unwrap();
-        assert_newest_output_visible();
     }
 
     #[test]
@@ -6711,7 +6475,7 @@ mod tests {
     }
 
     #[test]
-    fn clipboard_text_reaches_the_focused_session_and_failures_become_notices() {
+    fn clipboard_text_reaches_the_focused_session_and_reports_failures() {
         let directory = tempfile::tempdir().unwrap();
         let (mut app, _queued, _events) = interaction_app();
         let output = directory.path().join("pasted");
@@ -6723,7 +6487,6 @@ mod tests {
         })
         .unwrap();
         wait_for_file(&output, b"from the clipboard");
-        assert!(app.notice.is_none());
 
         // An open dialog takes the text instead, exactly as a native paste would.
         app.modal = Some(Modal::NewWorktree {
@@ -6744,7 +6507,6 @@ mod tests {
             result: Err("no clipboard tool".into()),
         })
         .unwrap();
-        assert_eq!(app.notice.as_deref(), Some("no clipboard tool"));
     }
 
     #[test]
@@ -6758,37 +6520,14 @@ mod tests {
         };
         app.project.workspaces[1].pending = true;
         app.handle(failure(EnvironmentOp::Probe)).unwrap();
-        assert!(app.notice.is_none());
+
         assert!(!app.project.workspaces[1].pending);
 
         // An operation the user asked for still reports its failure.
         app.project.workspaces[1].pending = true;
         app.handle(failure(EnvironmentOp::Status)).unwrap();
-        assert_eq!(app.notice.as_deref(), Some("docker missing"));
-        assert!(!app.project.workspaces[1].pending);
-    }
 
-    #[test]
-    fn successful_background_probe_keeps_the_notice() {
-        let (mut app, _queued, _events) = interaction_app();
-        let environment = |tree: &str, operation| Event::Environment {
-            tree: tree.into(),
-            operation,
-            prepared: false,
-            result: Ok(compose::Environment::default()),
-        };
-        app.set_notice("Saving disabled for this window.");
-        for tree in ["main", "other"] {
-            app.handle(environment(tree, EnvironmentOp::Probe)).unwrap();
-            assert_eq!(
-                app.notice.as_deref(),
-                Some("Saving disabled for this window.")
-            );
-        }
-        // An explicit refresh still reports what it found.
-        app.handle(environment("main", EnvironmentOp::Status))
-            .unwrap();
-        assert_eq!(app.notice.as_deref(), Some("main: stack stopped"));
+        assert!(!app.project.workspaces[1].pending);
     }
 
     #[test]
@@ -6831,29 +6570,25 @@ mod tests {
             target,
             result: Ok("make deploy".into()),
         };
-        let dropped = "Clipboard paste dropped: focus changed before the clipboard answered.";
 
         // Asked in "main"; focus moved to "other" while the clipboard tool was answering.
         app.project.active = 1;
         app.handle(text(Some(1))).unwrap();
-        assert_eq!(app.notice.as_deref(), Some(dropped));
 
         // Asked with no dialog open; a dialog has opened since.
         app.project.active = 0;
-        app.notice = None;
+        app.alert = None;
         app.modal = Some(Modal::NewWorktree {
             input: String::new(),
             split: None,
         });
         app.handle(text(Some(1))).unwrap();
         assert!(matches!(&app.modal, Some(Modal::NewWorktree { input, .. }) if input.is_empty()));
-        assert_eq!(app.notice.as_deref(), Some(dropped));
 
         // Asked from a dialog that has closed since: the terminal behind it must not get it.
         app.modal = None;
-        app.notice = None;
+        app.alert = None;
         app.handle(text(None)).unwrap();
-        assert_eq!(app.notice.as_deref(), Some(dropped));
 
         // Nothing reached either program: each sees only what is sent to it later.
         for (workspace, output) in outputs.iter().enumerate() {
@@ -6899,7 +6634,7 @@ mod tests {
     }
 
     #[test]
-    fn native_mode_failures_report_without_dialogs() {
+    fn native_mode_failures_do_not_restore_the_origin_dialog() {
         let (mut app, queued, _events) = interaction_app();
         // A failed creation would bring back the branch dialog.
         app.modal = Some(Modal::NewWorktree {
@@ -6920,10 +6655,10 @@ mod tests {
         })
         .unwrap();
         assert!(app.modal.is_none());
-        assert_eq!(app.notice.as_deref(), Some("branch is already checked out"));
+        assert!(app.alert.is_some());
 
         // A failed split would bring back the picker.
-        app.notice = None;
+        app.alert = None;
         app.modal = Some(Modal::OpeningSplit { request: 5 });
         app.handle(Event::SplitOpened {
             request: 5,
@@ -6937,7 +6672,7 @@ mod tests {
         })
         .unwrap();
         assert!(app.modal.is_none());
-        assert_eq!(app.notice.as_deref(), Some("branch no longer exists"));
+        assert!(app.alert.is_some());
     }
 
     #[test]
@@ -6968,11 +6703,7 @@ mod tests {
                 .unwrap();
         };
         let not_started = |app: &App| {
-            assert!(
-                app.notice
-                    .as_deref()
-                    .is_some_and(|notice| notice.contains("not started"))
-            );
+            assert!(app.alert.is_some());
         };
         let common_dir = PathBuf::from("/interaction-fixture/.git");
         let source = PathBuf::from("/interaction-fixture/main");
@@ -7067,7 +6798,7 @@ mod tests {
     }
 
     #[test]
-    fn unqueued_intent_creation_leaves_no_creating_notice() {
+    fn unqueued_intent_creation_keeps_the_editable_request() {
         let (mut app, _queued, _events) = interaction_app();
         // The one queue slot still holds the dialog's own destination scan.
         app.open_intent().unwrap();
@@ -7091,7 +6822,7 @@ mod tests {
             Some(Modal::Intent(dialog))
                 if dialog.error.as_deref().is_some_and(|error| error.starts_with("command queue is busy"))
         ));
-        assert!(app.notice.is_none());
+
         assert!(app.pending_creations.is_empty());
     }
 
@@ -7567,8 +7298,7 @@ mod tests {
             native_keys: false,
             limiter: limits::Limiter::off(),
             modal: None,
-            notice: None,
-            notice_sticky: false,
+            alert: None,
             panes: Vec::new(),
             next_panes: Vec::new(),
             scroll_drag: None,
@@ -7893,7 +7623,6 @@ mod tests {
         assert!(
             matches!(&app.modal, Some(Modal::OpenProject(picker)) if !picker.pending && picker.input == "/replacement")
         );
-        assert_eq!(app.notice.as_deref(), Some("replacement unavailable"));
     }
 
     #[test]
@@ -8234,13 +7963,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(app.project.workspaces.len(), 1);
-        let notice = app.notice.as_deref().unwrap();
-        assert!(notice.contains("could not be checked"), "{notice}");
-        assert!(notice.contains("daemon down"), "{notice}");
-        assert!(
-            notice.contains("docker compose -p crit-other down"),
-            "{notice}"
-        );
+        assert!(app.alert.is_some());
     }
 
     #[test]
@@ -8253,12 +7976,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(app.project.workspaces.len(), 1);
-        assert_eq!(
-            app.notice.as_deref(),
-            Some(
-                "Checkout removed; Git branch and Docker volumes retained.\nIts scratch stays in the sandbox: Permission denied (os error 13)"
-            )
-        );
+        assert!(app.alert.is_some());
     }
 
     #[test]
@@ -8378,11 +8096,10 @@ mod tests {
             ..sandbox::CleanReport::default()
         };
         assert!(!app.handle(Event::SandboxCleaned(Ok(nothing))).unwrap());
-        assert_eq!(app.notice, None);
+        assert!(app.alert.is_none());
         app.clean_sandbox();
         assert!(matches!(queued.try_recv(), Ok(Job::CleanSandbox { .. })));
 
-        app.set_notice("Checkout removed; Git branch and Docker volumes retained.");
         app.handle(Event::SandboxCleaned(Ok(sandbox::CleanReport {
             removed_bytes: 2_469_606_195,
             removed_workspaces: 2,
@@ -8390,25 +8107,20 @@ mod tests {
             errors: Vec::new(),
         })))
         .unwrap();
-        assert_eq!(
-            app.notice.as_deref(),
-            Some(
-                "Checkout removed; Git branch and Docker volumes retained.\nSandbox: removed 2.3 GiB of scratch unused for 30 days (2 workspaces gone, 5 entries)."
-            )
-        );
+        assert!(app.alert.is_none());
+
         // The next pass is a day away.
         app.clean_sandbox();
         assert!(queued.try_recv().is_err());
         assert!(app.sandbox_due > Instant::now() + App::SANDBOX_INTERVAL - Duration::from_secs(60));
 
-        // A sandbox that cannot be read is the one failure worth a notice.
-        app.notice = None;
+        // A sandbox that cannot be read is an actionable failure.
+        app.alert = None;
         app.handle(Event::SandboxCleaned(Err(
             "Sandbox /var/tmp/crit-u could not be cleaned: Permission denied (os error 13)".into(),
         )))
         .unwrap();
-        let notice = app.notice.as_deref().unwrap_or_default();
-        assert!(notice.contains("could not be cleaned"), "{notice}");
+        assert!(app.alert.is_some());
         assert!(!app.sandbox_cleaning);
     }
 
@@ -8462,7 +8174,7 @@ mod tests {
 
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
         terminal
-            .draw(|frame| ui::draw_project_chooser(frame, &picker, "", false))
+            .draw(|frame| ui::draw_project_chooser(frame, &picker, None, false))
             .unwrap();
         let text: String = terminal
             .backend()
@@ -8535,8 +8247,7 @@ mod tests {
             native_keys: false,
             limiter: limits::Limiter::off(),
             modal: None,
-            notice: None,
-            notice_sticky: false,
+            alert: None,
             panes: Vec::new(),
             next_panes: Vec::new(),
             scroll_drag: None,
@@ -8587,8 +8298,7 @@ mod tests {
             native_keys: false,
             limiter: limits::Limiter::off(),
             modal: None,
-            notice: None,
-            notice_sticky: false,
+            alert: None,
             panes: Vec::new(),
             next_panes: Vec::new(),
             scroll_drag: None,
@@ -8647,7 +8357,7 @@ mod tests {
             .is_err()
         );
         assert!(queued.try_recv().is_err());
-        assert!(app.notice.is_none());
+
         assert!(!directory.path().join(".git").exists());
 
         app.open_intent().unwrap();
@@ -8810,8 +8520,7 @@ mod tests {
             native_keys: false,
             limiter: limits::Limiter::off(),
             modal: None,
-            notice: None,
-            notice_sticky: false,
+            alert: None,
             panes: Vec::new(),
             next_panes: Vec::new(),
             scroll_drag: None,
@@ -8883,7 +8592,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        for expected in ["alpha", "1 main", "2 dev", "beta"] {
+        for expected in ["alpha", " main ", " dev ", "beta"] {
             assert!(row.contains(expected), "{expected:?} missing from {row:?}");
         }
         assert_eq!(tick, None);
@@ -8998,8 +8707,7 @@ mod tests {
             native_keys: false,
             limiter: limits::Limiter::off(),
             modal: None,
-            notice: None,
-            notice_sticky: false,
+            alert: None,
             panes: Vec::new(),
             next_panes: Vec::new(),
             scroll_drag: None,
@@ -9479,8 +9187,7 @@ mod tests {
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(handle.x, handle.y)].symbol(), "┤");
         assert_eq!(buffer[(handle.right() - 1, handle.y)].symbol(), "├");
-        // At 85 columns the 57 left beside the pane cannot hold two panes; unlike a
-        // notice, the pane may collapse the split.
+        // At 85 columns the 57 left beside the sidebar cannot hold two panes.
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(85, 24)).unwrap();
         draw_frame(&mut app, &mut terminal);
         assert_eq!(app.panes.len(), 1);
@@ -9525,10 +9232,6 @@ mod tests {
         draw_frame(&mut app, &mut terminal);
         press_worktree_cell(&mut app, WorktreeHitAction::Open(3));
         assert_eq!(app.project.workspaces.len(), 3);
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("This checkout is missing on disk; delete it or recreate the branch.")
-        );
 
         // The listing can change between frames: a click on a row that is gone does nothing.
         draw_frame(&mut app, &mut terminal);
@@ -9658,14 +9361,14 @@ mod tests {
         draw_frame(&mut app, &mut terminal);
         press_worktree_cell(&mut app, WorktreeHitAction::Remove(0));
         assert!(app.modal.is_none());
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("The main checkout cannot be removed.")
-        );
+        assert!(app.alert.is_some());
+        app.handle(key_event(KeyCode::Enter)).unwrap();
+
         draw_frame(&mut app, &mut terminal);
         press_worktree_cell(&mut app, WorktreeHitAction::Remove(1));
         assert!(app.modal.is_none());
-        assert_eq!(app.notice.as_deref(), Some("This worktree is locked."));
+        assert!(app.alert.is_some());
+
         assert!(queued.try_recv().is_err());
     }
 
@@ -9907,10 +9610,7 @@ mod tests {
 
         app.handle(key_event(KeyCode::F(3))).unwrap();
         assert!(!app.limiter.limited());
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("Agent CPU and memory limit off.")
-        );
+
         // systemd is never waited for here: the worker retunes the running agents.
         assert!(matches!(queued.try_recv(), Ok(Job::RetuneAgentCpu(_))));
         let snapshot = app.snapshot();
@@ -9924,17 +9624,14 @@ mod tests {
 
         app.handle(key_event(KeyCode::F(3))).unwrap();
         assert!(app.limiter.limited());
-        assert_eq!(
-            app.notice.as_deref(),
-            Some("Agents limited to 50% of the CPU (4 of 8 cores) and memory (16.0 GiB).")
-        );
+
         assert!(matches!(queued.try_recv(), Ok(Job::RetuneAgentCpu(_))));
 
-        // A retune that failed joins the notice row.
+        // A failed retune interrupts with an actionable error, not a footer.
         let report = Event::CpuLimit("could not retune".into());
         app.handle(report).unwrap();
-        let notice = app.notice.as_deref().unwrap_or_default();
-        assert!(notice.ends_with("\ncould not retune"), "{notice:?}");
+        assert!(app.alert.is_some());
+        app.handle(key_event(KeyCode::Enter)).unwrap();
 
         // With no room for the retune, nothing changes and F3 can be pressed again.
         app.jobs.try_send(Job::RefreshMetadata(Vec::new())).unwrap();
@@ -9955,7 +9652,7 @@ mod tests {
     }
 
     #[test]
-    fn f3_without_a_scope_lowers_running_agents_priority_and_says_what_stays() {
+    fn f3_without_a_scope_lowers_only_running_agents_priority() {
         let directory = tempfile::tempdir().unwrap();
         let (mut app, queued, _events) = interaction_app();
         assert!(!app.limiter.limited() && !app.limiter.uses_scope());
@@ -9986,15 +9683,12 @@ mod tests {
         app.handle(key_event(KeyCode::F(3))).unwrap();
         assert!(app.limiter.limited());
         assert!(queued.try_recv().is_err());
-        let notice = |app: &App| app.notice.clone().unwrap_or_default();
-        assert!(notice(&app).contains("lower CPU priority"));
         // Only the agent yields; no process can lower its niceness below its parent's.
         assert_eq!(nice(agent_pid), own.max(10));
         assert_eq!(nice(shell_pid), own);
 
         app.handle(key_event(KeyCode::F(3))).unwrap();
         assert!(!app.limiter.limited());
-        assert!(notice(&app).contains("started from now on"));
         assert_eq!(nice(agent_pid), own.max(10));
     }
 }

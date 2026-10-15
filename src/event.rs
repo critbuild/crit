@@ -98,8 +98,7 @@ pub enum Event {
         prepared: bool,
         result: Result<Environment, String>,
     },
-    /// The agent CPU limit could not be applied: what happened. It joins the notice row rather
-    /// than replacing it, as it can arrive at any time.
+    /// The agent CPU limit could not be applied: an asynchronous error for a dialog.
     CpuLimit(String),
     /// A pass over the sandbox ended: what it removed, or why the sandbox could not be read.
     SandboxCleaned(Result<CleanReport, String>),

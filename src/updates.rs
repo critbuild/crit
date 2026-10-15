@@ -93,7 +93,7 @@ impl UpdateProcess {
 /// this leaves the ones still running alone: an interrupted install is worse than an orphan.
 #[derive(Default)]
 pub struct Checks {
-    /// In tool order, by the name their notice carries. An updater that could not start keeps
+    /// In tool order, by the name their diagnostic carries. An updater that could not start keeps
     /// its error here for the first `poll`.
     updaters: Vec<(String, Result<UpdateProcess, String>)>,
 }
@@ -140,9 +140,9 @@ impl Checks {
         Self { updaters }
     }
 
-    /// Notices for the updaters that failed since the last call. Successful updates are silent.
+    /// Errors for the updaters that failed since the last call. Successful updates are silent.
     pub fn poll(&mut self) -> Vec<String> {
-        let mut notices = Vec::new();
+        let mut errors = Vec::new();
         self.updaters.retain_mut(|(name, process)| {
             let outcome = match process {
                 Ok(process) => match process.poll() {
@@ -152,13 +152,13 @@ impl Checks {
                 Err(error) => Err(std::mem::take(error)),
             };
             if let Err(failure) = outcome {
-                notices.push(format!(
+                errors.push(format!(
                     "{name} update failed: {failure}. Continuing with the installed version."
                 ));
             }
             false
         });
-        notices
+        errors
     }
 }
 
@@ -206,16 +206,16 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
-    /// Polls until every updater has finished; the notices, in the order they came.
+    /// Polls until every updater has finished; the errors, in the order they came.
     fn finish(checks: &mut Checks) -> Vec<String> {
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut notices = Vec::new();
+        let mut errors = Vec::new();
         while !checks.updaters.is_empty() {
             assert!(Instant::now() < deadline, "an updater never finished");
-            notices.extend(checks.poll());
+            errors.extend(checks.poll());
             std::thread::sleep(Duration::from_millis(5));
         }
-        notices
+        errors
     }
 
     fn wait_for(path: &Path) {
@@ -255,10 +255,10 @@ mod tests {
             ("Locked", locked.to_str().unwrap(), "update"),
         ];
         let mut checks = Checks::spawn(&tools);
-        let mut notices = finish(&mut checks);
-        notices.sort();
+        let mut errors = finish(&mut checks);
+        errors.sort();
         assert_eq!(
-            notices,
+            errors,
             [
                 "Failing update failed: exit status: 1: refused. Continuing with the installed version.".to_owned(),
                 format!(
@@ -291,10 +291,10 @@ echo "peer never started" >&2; exit 9"#;
             ("First", "/bin/sh", first.as_str()),
             ("Second", "/bin/sh", second.as_str()),
         ];
-        let mut notices = finish(&mut Checks::spawn(&tools));
-        notices.sort();
+        let mut errors = finish(&mut Checks::spawn(&tools));
+        errors.sort();
         assert_eq!(
-            notices,
+            errors,
             [
                 "First update failed: exit status: 1: failed: first.sh. Continuing with the \
                  installed version.",

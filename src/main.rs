@@ -80,15 +80,15 @@ APPEARANCE
   A muted, low-contrast divider spans the full terminal width below workspace/
   session headers. Stroke thickness is terminal-rendered; its row is excluded
   from the embedded terminal's size.
-  No bottom row is reserved when there is no notice.
+  The bottom row always belongs to the embedded terminal.
   Window shape, rounded corners, borders, shadows, and desktop gaps stay under
   your normal compositor configuration; Crit installs no desktop overrides.
   The minimum interactive size is 30x10. Below it, typing, paste, mouse input,
   and confirmations pause; Esc and F12 remain available. Enlarge to resume.
-  Notices occupy reserved rows, never terminal output. Long notices show
-  their final lines with an overflow marker. Notices clear on the next
-  keystroke, paste, or click. Warnings that saving is off, or that saved
-  items were left out at startup, stay until Esc or a Crit shortcut.
+  Real errors and startup recovery warnings appear in centered dialogs.
+  Enter or Esc dismisses them; ordinary input is blocked until then, while
+  F12 remains available. Dialogs never resize the embedded terminal.
+  Routine closes, limit toggles, cleanup and creation successes are silent.
   Selected sessions stay visible in the workspace header even when other
   session labels overflow.
   Worktree tabs fit their labels without padding short names. Longer labels
@@ -137,13 +137,13 @@ AGENT CPU
   other apps take precedence whenever the CPUs are contended, even while the
   agents use less than their share. A scope past its memory share is not
   killed: it is throttled and reclaimed, its pages swapped out first, though
-  systemd-oomd may still kill it when swap runs out. The notice after F3
-  says what is limited; the lower priority below never limits memory.
-  An agent that cannot join the scope still starts, unlimited, and a notice
-  says so. Docker containers run under the Docker daemon, outside the limit.
+  systemd-oomd may still kill it when swap runs out. F3 toggles silently;
+  the lower priority below never limits memory.
+  An agent that cannot join the scope still starts, unlimited, and an error
+  dialog says so. Docker containers run under the Docker daemon, outside the limit.
   Without cgroup v2, a systemd user session, busctl, or a user
   manager that can limit CPU, agents run at a lower priority (nice 10) while
-  the limit is on instead, the key hint shows LOW, and a notice says why. No
+  the limit is on instead, the key hint shows LOW, and a startup warning says why. No
   process can raise that priority again, so turning the limit off then
   applies only to agents started afterwards.
 
@@ -167,16 +167,16 @@ SCRATCH SPACE
   and then daily, in the background at idle CPU and I/O priority, removes the
   scratch of folders that no longer exist, anything inside a workspace's
   scratch or left by Crit's own helpers untouched for 30 days, and the empty
-  folders of workspaces unused for 30 days; a notice says what it freed. A
+  folders of workspaces unused for 30 days; successful cleanup is silent. A
   sandbox under /var/tmp is also aged by the system (systemd-tmpfiles).
   crit sandbox status (or just crit sandbox) shows the sandbox, the space each
   workspace's scratch takes, and your largest entries in a RAM-backed /tmp.
   crit sandbox clean runs a pass now; with --all it deletes all scratch, but
   only while no window owns the saved workspace.
-  At startup a notice says when a RAM-backed /tmp holds over 1 GiB. Files an
+  A startup warning says when a RAM-backed /tmp holds over 1 GiB. Files an
   agent writes to a literal /tmp/... path despite the note still land in RAM,
   and Crit never deletes them: it did not make them. Without a usable
-  sandbox, scratch stays in the default temp folder, and a notice says why
+  sandbox, scratch stays in the default temp folder, and a warning says why
   when that is in RAM.
 
 UPDATES
@@ -186,7 +186,7 @@ UPDATES
   run's time is kept in updates.stamp beside workspace.json; delete it to
   update at the next launch. Nothing waits for the updaters: agents start at
   once with the installed version, and updater banners stay out of the UI. If
-  an update fails, Crit shows a notice with its diagnostic and keeps using the
+  an update fails, Crit shows an error dialog and keeps using the
   installed version. A tool that is not installed is not a failure. An update
   that finishes during a session applies to panes started afterwards and to
   the next launch. Quitting Crit leaves an update still running to finish.
@@ -293,7 +293,7 @@ RESTORE
   --fresh skips restoration and starts a new saved workspace; use it with
   --repo / --agent to choose a different starting point.
   Saved folders, worktrees, chats or agents that cannot be reopened are left
-  out and listed in a notice; everything else reopens and saving continues.
+  out and listed in a recovery dialog; everything else reopens and saving continues.
   The file as it was is kept as workspace.json.bak next to workspace.json.
   An unreadable or invalid snapshot is left untouched and saving is disabled
   in that window; fix it, or use --fresh to replace it.
@@ -314,6 +314,8 @@ DOCKER
     crit env up --repo /path/to/worktree --source /path/to/source-checkout
   Each worktree gets its own project, networks, named volumes, build image,
   and dynamically allocated loopback host ports. Ask \"open the preview\".
+  Explicitly requested environment status appears in a centered result dialog;
+  Enter or Esc dismisses it. Successful start, stop and restart actions are silent.
   External networks/volumes and host networking are refused. Bind mounts
   retain their configured paths: use worktree-relative paths or named volumes,
   not a shared absolute writable directory, for independent data.
@@ -337,11 +339,11 @@ Git-ignored files inside it (build output, .env, bind-mounted data) are deleted
 with it; named Docker volumes are kept. Directories you cannot write, often
 created by containers, block deletion instead of leaving a half-deleted checkout.
 Stop its Docker environment first. If Docker cannot be reached, the checkout is
-still removed and the notice names the stack to clean up. Ordinary folders are
+still removed and an error dialog names the stack to clean up. Ordinary folders are
 never deleted.
-Deletion shows a progress popup; Esc hides it and the result arrives as a notice.
-A refusal stays visible with its reason and leaves the tab and checkout intact;
-Enter returns to the confirmation and Esc dismisses the error. Docker state is
+Deletion shows a progress popup; Esc hides it. Successful deletion is silent.
+A refusal shows an error dialog and leaves the tab and checkout intact;
+Enter or Esc dismisses the error. Docker state is
 checked again at deletion, so stopping the stack outside Crit does not require
 reopening the tab. A checkout whose environment Crit never started needs no Docker.
 Docker down retains volumes.

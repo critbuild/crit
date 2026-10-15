@@ -54,20 +54,14 @@ const TICKER_GAP: &str = "  ·  ";
 static ANIMATION: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 fn areas(app: &App, size: Size) -> ([Rect; 2], usize) {
-    let mut content = size;
-    content.height = content
-        .height
-        .saturating_sub(notice_height(app.notice.as_deref(), size));
-    // The worktree pane takes columns from the window and the content alike, so a split
-    // that no longer fits beside it collapses; the notice rows keep the full width.
+    // The worktree pane takes columns from the content, so a split that no longer
+    // fits beside it collapses.
     let pane = worktree_pane_width(app, size.width);
-    content.width -= pane;
     pane_areas(
         app.project.layout,
         app.project.secondary.is_some(),
         app.project.split_ratio,
         Size::new(size.width - pane, size.height),
-        content,
     )
 }
 
@@ -86,17 +80,9 @@ fn worktree_pane_width(app: &App, width: u16) -> u16 {
     }
 }
 
-fn pane_areas(
-    layout: LayoutMode,
-    split: bool,
-    split_ratio: u16,
-    window: Size,
-    size: Size,
-) -> ([Rect; 2], usize) {
-    // Only visible notices reserve bottom rows; areas() subtracts their height.
+fn pane_areas(layout: LayoutMode, split: bool, split_ratio: u16, size: Size) -> ([Rect; 2], usize) {
     let main = Rect::new(0, 1, size.width, size.height.saturating_sub(1));
-    // The window decides whether both panes fit; a notice must not collapse a split.
-    if !split || layout == LayoutMode::Full || window.width < 60 || window.height < 16 {
+    if !split || layout == LayoutMode::Full || size.width < 60 || size.height < 16 {
         return ([main, Rect::default()], 1);
     }
     match layout {
@@ -128,7 +114,7 @@ fn pane_areas(
         LayoutMode::Full => ([main, Rect::default()], 1),
     }
 }
-/// Columns kept clear on each side of terminal content and the notice row.
+/// Columns kept clear on each side of terminal content.
 /// Crit zeroes Kitty's own padding in its window, so this is the only gap
 /// between text and the window edge; the tab bar still runs edge to edge.
 const MARGIN: u16 = 1;
@@ -200,7 +186,6 @@ pub fn resize_sessions(app: &mut App, size: Size) -> Result<()> {
         if let Some(session) = workspace.sessions.get_mut(selected) {
             let keep = match &mut app.selection {
                 Some(selection) if selection.session == session.id && selection.body != rect => {
-                    // A notice only moves the bottom edge; the frozen rows keep their places.
                     let same = (selection.body.x, selection.body.y, selection.body.width)
                         == (rect.x, rect.y, rect.width);
                     if same {
@@ -272,7 +257,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Duration> {
             area,
             pane_body,
             focused,
-            app.modal.is_none(),
+            app.modal.is_none() && app.alert.is_none(),
             app.selection.as_ref(),
         );
         app.panes.push(Pane {
@@ -315,20 +300,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Duration> {
     if pane_width > 0 {
         draw_worktree_pane(frame, app, pane_width, regions[count - 1].bottom());
     }
-    if let Some(notice) = &app.notice {
-        let height = notice_height(Some(notice), Size::new(bounds.width, bounds.height));
-        draw_notice(
-            frame,
-            notice,
-            Rect::new(
-                MARGIN,
-                bounds.height - height,
-                bounds.width.saturating_sub(2 * MARGIN),
-                height,
-            ),
-        );
-    }
-    if let Some(modal) = &app.modal {
+    if let Some(alert) = &app.alert {
+        draw_alert(frame, alert.title, &alert.text);
+    } else if let Some(modal) = &app.modal {
         draw_modal(frame, app, modal);
     }
     tick
@@ -352,7 +326,7 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
     for (slot, open) in project_slots(project, saved_projects) {
         let separator = u16::from(!tab_hits.is_empty());
         tab_hits.push(TabHit {
-            area: Rect::new(0, 0, (open.name.width() as u16 + 2).min(22) + separator, 1),
+            area: Rect::new(0, 0, (open.name.width() as u16 + 1).min(21) + separator, 1),
             project: slot,
             workspace: None,
         });
@@ -361,12 +335,7 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
                 focused_cell = tab_hits.len();
             }
             tab_hits.push(TabHit {
-                area: Rect::new(
-                    0,
-                    0,
-                    tab_cell_width(index, open.workspaces[index].label()),
-                    1,
-                ),
+                area: Rect::new(0, 0, tab_cell_width(open.workspaces[index].label()), 1),
                 project: slot,
                 workspace: Some(index),
             });
@@ -403,7 +372,7 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
                 Line::from(vec![
                     Span::styled(if cell > 0 { "│" } else { "" }, Style::default().fg(BORDER)),
                     Span::styled(
-                        format!(" {} ", open.name),
+                        format!(" {}", open.name),
                         Style::default().fg(if current { FG } else { MUTED }).bold(),
                     ),
                 ]),
@@ -420,7 +389,7 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
                 let selected = current && index == focused;
                 (
                     Line::from(vec![
-                        Span::raw(format!("{} ", index + 1)),
+                        Span::raw(" "),
                         Span::raw(label),
                         Span::styled(format!(" {mark} "), Style::default().fg(color)),
                     ]),
@@ -442,11 +411,11 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
     tick
 }
 
-/// Columns of worktree tab `index`: number, compact label and one status column. Reserving
-/// only the status column keeps a tab still when a turn starts or is acknowledged.
-fn tab_cell_width(index: usize, label: &str) -> u16 {
-    let number = (index + 1).ilog10() as usize + 1;
-    (number + 1 + label.width().min(LABEL_WIDTH) + 3) as u16
+/// Columns of a worktree tab: its compact label with a space before it, and one status column
+/// with a space on either side. Reserving the status column keeps a tab still when a turn
+/// starts or is acknowledged. Tabs carry no number: Ctrl+Shift+1…9 count them by position.
+fn tab_cell_width(label: &str) -> u16 {
+    (1 + label.width().min(LABEL_WIDTH) + 3) as u16
 }
 
 /// The mark of a tab, its colour and the time until it changes. Completion is an
@@ -1036,10 +1005,41 @@ const FULL_KEYS: (&str, &str) = (" F1 ASK · F2 WORKTREES · F3 CPU ", " · F12 
 /// The key hint around the agent CPU limit's state, for windows too narrow for `FULL_KEYS`.
 const SHORT_KEYS: (&str, &str) = (" F1 · F2 · F3 CPU ", " · F12 ");
 
+/// Draws a centered message without changing the terminal layout.
+pub fn draw_alert(frame: &mut Frame, title: &str, text: &str) {
+    let bounds = frame.area();
+    let width = bounds.width.saturating_sub(6).min(74);
+    let mut rows = 0_u16;
+    message_chunks(text, width, |_| rows = rows.saturating_add(1));
+    let inner = modal_area_in(
+        frame,
+        bounds,
+        title,
+        Size::new(width + 2, rows.saturating_add(4)),
+    );
+    if inner.is_empty() {
+        return;
+    }
+    draw_message(
+        frame,
+        text,
+        Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(1),
+        ),
+    );
+    frame.render_widget(
+        Paragraph::new("Enter / Esc dismiss").style(Style::default().fg(MUTED)),
+        Rect::new(inner.x, inner.bottom() - 1, inner.width, 1),
+    );
+}
+
 pub fn draw_project_chooser(
     frame: &mut Frame,
     picker: &ProjectPicker,
-    notice: &str,
+    error: Option<&str>,
     native_keys: bool,
 ) {
     let bounds = frame.area();
@@ -1059,25 +1059,18 @@ pub fn draw_project_chooser(
         Paragraph::new(" crit · start").style(Style::default().fg(FG).bold()),
         Rect::new(0, 0, bounds.width.saturating_sub(mode_width), 1),
     );
-    let height = notice_height(Some(notice), Size::new(bounds.width, bounds.height));
-    let available = Rect::new(bounds.x, bounds.y, bounds.width, bounds.height - height);
+    let available = bounds;
     let inner = modal_area_in(
         frame,
         available,
         " new terminal / open project ",
         Size::new(76, 22),
     );
-    project_folder(frame, inner, picker);
-    draw_notice(
-        frame,
-        notice,
-        Rect::new(
-            MARGIN,
-            bounds.height - height,
-            bounds.width.saturating_sub(2 * MARGIN),
-            height,
-        ),
-    );
+    if let Some(error) = error {
+        draw_alert(frame, "Error", error);
+    } else {
+        project_folder(frame, inner, picker);
+    }
 }
 
 fn project_folder(frame: &mut Frame, inner: Rect, picker: &ProjectPicker) {
@@ -1220,7 +1213,7 @@ fn intent_dialog(frame: &mut Frame, inner: Rect, dialog: &IntentDialog) {
     );
     let status_area = Rect::new(inner.x, inner.y + 11, inner.width, inner.height - 13);
     if let Some(error) = &dialog.error {
-        draw_notice(frame, error, status_area);
+        draw_message(frame, error, status_area);
     } else {
         let status = if dialog.loading {
             "Finding projects and worktrees..."
@@ -1243,7 +1236,7 @@ fn intent_dialog(frame: &mut Frame, inner: Rect, dialog: &IntentDialog) {
     );
 }
 
-fn modal_area_in(frame: &mut Frame, bounds: Rect, title: &'static str, desired: Size) -> Rect {
+fn modal_area_in(frame: &mut Frame, bounds: Rect, title: &str, desired: Size) -> Rect {
     let width = bounds.width.saturating_sub(4).min(desired.width);
     let height = bounds.height.saturating_sub(2).min(desired.height);
     let area = Rect::new(
@@ -1309,7 +1302,7 @@ fn draw_existing_split_picker(
 ) {
     let mut error_rows = 0_u16;
     if let Some(error) = error {
-        notice_chunks(error, bounds.width.saturating_sub(6).min(74), |_| {
+        message_chunks(error, bounds.width.saturating_sub(6).min(74), |_| {
             error_rows = error_rows.saturating_add(1);
         });
         error_rows = error_rows.clamp(1, 3);
@@ -1352,7 +1345,7 @@ fn draw_existing_split_picker(
         );
     }
     if let Some(error) = error {
-        draw_notice(
+        draw_message(
             frame,
             error,
             Rect::new(inner.x, list.bottom(), inner.width, error_rows),
@@ -1376,13 +1369,7 @@ fn draw_opening_split(frame: &mut Frame, bounds: Rect) {
 }
 
 fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
-    let mut available = frame.area();
-    if app.notice.is_some() {
-        available.height = available.height.saturating_sub(notice_height(
-            app.notice.as_deref(),
-            Size::new(available.width, available.height),
-        ));
-    }
+    let available = frame.area();
     let (title, desired_height) = match modal {
         Modal::Intent(_) => (" ask Crit ", 22),
         Modal::Commands { .. } => (" manual controls ", 24),
@@ -1495,7 +1482,7 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
             .max(kept.width())
             .min(60) as u16;
         let mut rows = 0_u16;
-        notice_chunks(
+        message_chunks(
             message,
             width.min(available.width.saturating_sub(6)),
             |_| {
@@ -1517,7 +1504,7 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
                 inner.width,
                 inner.height.saturating_sub(if failed { 2 } else { 0 }),
             );
-            draw_notice(frame, removal_message.unwrap(), message_area);
+            draw_message(frame, removal_message.unwrap(), message_area);
             if failed {
                 frame.render_widget(
                     Paragraph::new(kept).style(Style::default().fg(AMBER)),
@@ -1706,9 +1693,9 @@ fn draw_confirmation(frame: &mut Frame, inner: Rect, message: &str) {
     );
 }
 
-// Character-wrap notices without dropping text or depending on paragraph's
+// Character-wrap messages without dropping text or depending on paragraph's
 // private word-wrap measurement. Slices borrow the existing message.
-fn notice_chunks<'a>(text: &'a str, width: u16, mut emit: impl FnMut(&'a str)) {
+fn message_chunks<'a>(text: &'a str, width: u16, mut emit: impl FnMut(&'a str)) {
     if width == 0 {
         return;
     }
@@ -1743,24 +1730,12 @@ fn notice_chunks<'a>(text: &'a str, width: u16, mut emit: impl FnMut(&'a str)) {
     }
 }
 
-fn notice_height(notice: Option<&str>, size: Size) -> u16 {
-    let Some(notice) = notice else { return 0 };
-    let mut lines = 0usize;
-    notice_chunks(notice, size.width.saturating_sub(2 * MARGIN), |_| {
-        lines += 1
-    });
-    // Leave room for a usable modal and input even at the minimum size.
-    (lines.min(u16::MAX as usize) as u16)
-        .min((size.height / 3).min(size.height.saturating_sub(8)).max(1))
-        .max(1)
-}
-
-fn draw_notice(frame: &mut Frame, notice: &str, area: Rect) {
+fn draw_message(frame: &mut Frame, message: &str, area: Rect) {
     if area.is_empty() {
         return;
     }
     let mut lines = Vec::new();
-    notice_chunks(notice, area.width, |line| lines.push(Line::raw(line)));
+    message_chunks(message, area.width, |line| lines.push(Line::raw(line)));
     let overflow = lines.len() > area.height as usize;
     if overflow && area.height == 1 {
         frame.render_widget(
@@ -1786,7 +1761,7 @@ fn draw_notice(frame: &mut Frame, notice: &str, area: Rect) {
     );
     if overflow {
         frame.render_widget(
-            Paragraph::new("↑ earlier notice text").style(Style::default().fg(AMBER)),
+            Paragraph::new("↑ earlier message text").style(Style::default().fg(AMBER)),
             Rect::new(area.x, area.y, area.width, 1),
         );
     }
@@ -1830,9 +1805,14 @@ mod tests {
     }
 
     fn row_text(buffer: &Buffer, area: Rect, row: u16) -> String {
-        (area.x..area.right())
-            .map(|column| buffer[(column, row)].symbol())
-            .collect()
+        let mut text = String::with_capacity(area.width as usize);
+        let mut column = area.x;
+        while column < area.right() {
+            let symbol = buffer[(column, row)].symbol();
+            text.push_str(symbol);
+            column += symbol.width().max(1) as u16;
+        }
+        text
     }
 
     #[test]
@@ -1855,7 +1835,7 @@ mod tests {
             for focus_secondary in [false, true] {
                 project.focus_secondary = focus_secondary;
                 for size in [Size::new(80, 24), Size::new(30, 10), Size::new(80, 15)] {
-                    let (_, count) = pane_areas(layout, true, project.split_ratio, size, size);
+                    let (_, count) = pane_areas(layout, true, project.split_ratio, size);
                     if count == 2 {
                         assert_eq!(pane_target(&project, 0, count), (0, 0, false));
                         assert_eq!(pane_target(&project, 1, count), (0, 1, true));
@@ -2226,30 +2206,24 @@ mod tests {
     #[test]
     fn split_picker_keeps_every_selection_and_controls_inside_available_space() {
         for size in [Size::new(30, 10), Size::new(80, 24)] {
-            for notice in [None, Some("progress\nprogress\nprogress")] {
-                let bounds = Rect::new(0, 0, size.width, size.height - notice_height(notice, size));
-                let mut terminal =
-                    Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
-                let mut selected_rows = Vec::new();
-                for selected in 0..3 {
-                    terminal
-                        .draw(|frame| draw_split_picker(frame, bounds, selected))
-                        .unwrap();
-                    let buffer = terminal.backend().buffer();
-                    let row = (0..bounds.bottom())
-                        .find(|&row| row_text(buffer, bounds, row).contains('›'))
-                        .expect("selected split action must be visible");
-                    selected_rows.push(row);
-                    assert!((row + 1..bounds.bottom()).any(|row| {
-                        let text = row_text(buffer, bounds, row);
-                        text.contains("Enter") && text.contains("Esc")
-                    }));
-                    for row in bounds.bottom()..size.height {
-                        assert!(row_text(buffer, buffer.area, row).trim().is_empty());
-                    }
-                }
-                assert!(selected_rows.windows(2).all(|rows| rows[0] < rows[1]));
+            let bounds = Rect::new(0, 0, size.width, size.height);
+            let mut terminal = Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
+            let mut selected_rows = Vec::new();
+            for selected in 0..3 {
+                terminal
+                    .draw(|frame| draw_split_picker(frame, bounds, selected))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let row = (0..bounds.bottom())
+                    .find(|&row| row_text(buffer, bounds, row).contains('›'))
+                    .expect("selected split action must be visible");
+                selected_rows.push(row);
+                assert!((row + 1..bounds.bottom()).any(|row| {
+                    let text = row_text(buffer, bounds, row);
+                    text.contains("Enter") && text.contains("Esc")
+                }));
             }
+            assert!(selected_rows.windows(2).all(|rows| rows[0] < rows[1]));
         }
     }
 
@@ -2259,39 +2233,31 @@ mod tests {
             .map(|index| SplitTarget::Branch(format!("branch-{index:02}")))
             .collect();
         for size in [Size::new(30, 10), Size::new(80, 24)] {
-            for notice in [None, Some("progress\nprogress\nprogress")] {
-                let bounds = Rect::new(0, 0, size.width, size.height - notice_height(notice, size));
-                let mut terminal =
-                    Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
-                for error in [
-                    None,
-                    Some("Opening failed:\ncheckout unavailable\ntry another target"),
-                ] {
-                    for selected in [0, 1, 15, 29, 28, 0] {
-                        terminal
-                            .draw(|frame| {
-                                draw_existing_split_picker(
-                                    frame, bounds, &choices, selected, error,
-                                );
-                            })
-                            .unwrap();
-                        let buffer = terminal.backend().buffer();
-                        let rows: Vec<_> = (0..bounds.bottom())
-                            .map(|row| row_text(buffer, bounds, row))
-                            .collect();
-                        assert!(rows.iter().any(|row| {
-                            row.contains('›') && row.contains(&format!("branch-{selected:02}"))
-                        }));
-                        assert!(
-                            rows.iter()
-                                .any(|row| row.contains("Enter") && row.contains("Esc"))
-                        );
-                        if error.is_some() {
-                            assert!(rows.iter().any(|row| row.contains("try another target")));
-                        }
-                        for row in bounds.bottom()..size.height {
-                            assert!(row_text(buffer, buffer.area, row).trim().is_empty());
-                        }
+            let bounds = Rect::new(0, 0, size.width, size.height);
+            let mut terminal = Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
+            for error in [
+                None,
+                Some("Opening failed:\ncheckout unavailable\ntry another target"),
+            ] {
+                for selected in [0, 1, 15, 29, 28, 0] {
+                    terminal
+                        .draw(|frame| {
+                            draw_existing_split_picker(frame, bounds, &choices, selected, error);
+                        })
+                        .unwrap();
+                    let buffer = terminal.backend().buffer();
+                    let rows: Vec<_> = (0..bounds.bottom())
+                        .map(|row| row_text(buffer, bounds, row))
+                        .collect();
+                    assert!(rows.iter().any(|row| {
+                        row.contains('›') && row.contains(&format!("branch-{selected:02}"))
+                    }));
+                    assert!(
+                        rows.iter()
+                            .any(|row| row.contains("Enter") && row.contains("Esc"))
+                    );
+                    if error.is_some() {
+                        assert!(rows.iter().any(|row| row.contains("try another target")));
                     }
                 }
             }
@@ -2340,12 +2306,7 @@ mod tests {
     #[test]
     fn empty_split_picker_remains_navigable_and_opening_hints_that_esc_hides_it() {
         let size = Size::new(30, 10);
-        let bounds = Rect::new(
-            0,
-            0,
-            size.width,
-            size.height - notice_height(Some("progress\nprogress\nprogress"), size),
-        );
+        let bounds = Rect::new(0, 0, size.width, size.height);
         let mut terminal = Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
         terminal
             .draw(|frame| draw_existing_split_picker(frame, bounds, &[], 0, Some("No repository")))
@@ -2383,13 +2344,8 @@ mod tests {
                 LayoutMode::Vertical,
                 LayoutMode::Horizontal,
             ] {
-                let (panes, count) = pane_areas(
-                    layout,
-                    true,
-                    crate::restore::default_split_ratio(),
-                    size,
-                    size,
-                );
+                let (panes, count) =
+                    pane_areas(layout, true, crate::restore::default_split_ratio(), size);
                 for pane in panes.into_iter().take(count) {
                     let content = body(pane);
                     assert!(content.right() <= size.width);
@@ -2407,7 +2363,7 @@ mod tests {
         for width in [60, 61, 80, 121, 240] {
             let size = Size::new(width, 24);
             for ratio in [0, 1, scale / 4, scale / 2, 3 * scale / 4, scale, u16::MAX] {
-                let (panes, count) = pane_areas(LayoutMode::Vertical, true, ratio, size, size);
+                let (panes, count) = pane_areas(LayoutMode::Vertical, true, ratio, size);
                 let divider = split_divider(LayoutMode::Vertical, panes, count).unwrap();
                 let [left, right] = panes.map(body);
                 assert_eq!(count, 2);
@@ -2453,7 +2409,7 @@ mod tests {
                 Size::new(181, 25),
                 Size::new(160, 24),
             ] {
-                let (panes, count) = pane_areas(LayoutMode::Vertical, true, ratio, size, size);
+                let (panes, count) = pane_areas(LayoutMode::Vertical, true, ratio, size);
                 let divider = split_divider(LayoutMode::Vertical, panes, count).unwrap();
                 let desired = u32::from(size.width) * u32::from(ratio);
                 let actual = u32::from(panes[0].width) * scale;
@@ -2491,15 +2447,10 @@ mod tests {
                     {
                         continue;
                     }
-                    let baseline = pane_areas(
-                        layout,
-                        split,
-                        crate::restore::default_split_ratio(),
-                        size,
-                        size,
-                    );
+                    let baseline =
+                        pane_areas(layout, split, crate::restore::default_split_ratio(), size);
                     for ratio in [0, 2_500, 7_500, u16::MAX] {
-                        let (panes, count) = pane_areas(layout, split, ratio, size, size);
+                        let (panes, count) = pane_areas(layout, split, ratio, size);
                         assert_eq!((panes, count), baseline);
                         assert!(split_divider(layout, panes, count).is_none());
                         if count == 1 {
@@ -2582,11 +2533,11 @@ mod tests {
     }
 
     #[test]
-    fn overflow_notice_shows_final_cause_and_overflow_marker() {
+    fn overflow_message_shows_final_cause_and_overflow_marker() {
         let mut terminal = Terminal::new(TestBackend::new(30, 10)).unwrap();
         terminal
             .draw(|frame| {
-                draw_notice(
+                draw_message(
                     frame,
                     "preparing\nchecking\nprogress\nFATAL\n",
                     Rect::new(1, 8, 28, 2),
@@ -2600,24 +2551,24 @@ mod tests {
     }
 
     #[test]
-    fn notice_chunks_preserve_unicode_and_newline_boundaries() {
+    fn message_chunks_preserve_unicode_and_newline_boundaries() {
         let mut chunks = Vec::new();
-        notice_chunks("界界e\u{301}\nlast", 4, |chunk| chunks.push(chunk));
+        message_chunks("界界e\u{301}\nlast", 4, |chunk| chunks.push(chunk));
         assert_eq!(chunks, ["界界", "e\u{301}", "last"]);
         assert!(chunks.iter().all(|chunk| chunk.width() <= 4));
         // A VS16 emoji is one two-column unit, and a ZWJ sequence is never split.
         let vs16 = "⚠\u{fe0f}".repeat(3);
         let mut emoji = Vec::new();
-        notice_chunks(&vs16, 4, |chunk| emoji.push(chunk));
+        message_chunks(&vs16, 4, |chunk| emoji.push(chunk));
         assert_eq!(emoji, ["⚠\u{fe0f}⚠\u{fe0f}", "⚠\u{fe0f}"]);
         let mut family = Vec::new();
-        notice_chunks("ab👨\u{200d}👩\u{200d}👧cd", 4, |chunk| {
+        message_chunks("ab👨\u{200d}👩\u{200d}👧cd", 4, |chunk| {
             family.push(chunk)
         });
         assert_eq!(family, ["ab👨\u{200d}👩\u{200d}👧", "cd"]);
         // Ratatui drops control characters, so they take no columns on either path.
         let mut controls = Vec::new();
-        notice_chunks("ab\tcd\r\n界\u{1b}[0m", 4, |chunk| controls.push(chunk));
+        message_chunks("ab\tcd\r\n界\u{1b}[0m", 4, |chunk| controls.push(chunk));
         assert_eq!(controls, ["ab\tcd\r", "界\u{1b}[0", "m"]);
     }
 
@@ -2640,39 +2591,27 @@ mod tests {
     }
 
     #[test]
-    fn multiline_notice_geometry_leaves_modal_input_and_output_separate() {
-        for size in [Size::new(30, 10), Size::new(80, 24), Size::new(240, 80)] {
-            let notice = "progress\n".repeat(100);
-            let height = notice_height(Some(&notice), size);
-            let mut content = size;
-            content.height -= height;
-            let (panes, count) = pane_areas(
-                LayoutMode::Horizontal,
-                true,
-                crate::restore::default_split_ratio(),
-                size,
-                content,
-            );
-            for pane in panes.into_iter().take(count) {
-                assert!(body(pane).bottom() <= size.height - height);
-            }
+    fn alert_preserves_dismiss_controls_and_final_unicode_cause() {
+        for size in [Size::new(30, 10), Size::new(80, 24)] {
             let mut terminal = Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
+            let diagnostic = format!("{}原因: 界e\u{301}", "checking\n".repeat(100));
             terminal
-                .draw(|frame| {
-                    let available = Rect::new(0, 0, size.width, size.height - height);
-                    let inner = modal_area_in(frame, available, " input ", Size::new(76, 12));
-                    assert!(inner.height >= 4);
-                    input_line(
-                        frame,
-                        Rect::new(inner.x, inner.y + 2, inner.width, 1),
-                        "界".repeat(100).as_str(),
-                        true,
-                    );
-                    assert!(inner.bottom() < size.height - height);
-                })
+                .draw(|frame| draw_alert(frame, "Error", &diagnostic))
                 .unwrap();
-            let cursor = terminal.get_cursor_position().unwrap();
-            assert!(cursor.y < size.height - height);
+            let buffer = terminal.backend().buffer();
+            let rows: Vec<_> = (0..size.height)
+                .map(|row| row_text(buffer, buffer.area, row))
+                .collect();
+            let cause = rows
+                .iter()
+                .position(|row| row.contains("原因: 界e\u{301}"))
+                .unwrap();
+            let controls = rows
+                .iter()
+                .position(|row| row.contains("Enter") && row.contains("Esc"))
+                .unwrap();
+            assert!(cause < controls);
+            assert!(rows.iter().any(|row| row.contains('↑')));
         }
     }
 

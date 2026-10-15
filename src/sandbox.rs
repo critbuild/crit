@@ -39,7 +39,7 @@ const TMPFS_MAGIC: u32 = 0x0102_1994;
 const RAMFS_MAGIC: u32 = 0x8584_58f6;
 
 /// How full a RAM-backed `/tmp` may be before startup says so.
-const TMP_NOTICE_BYTES: u64 = 1 << 30;
+const TMP_WARNING_BYTES: u64 = 1 << 30;
 
 /// How many of the largest entries in a RAM-backed `/tmp` `crit sandbox status` lists.
 const TMP_LISTED: usize = 8;
@@ -82,8 +82,7 @@ pub struct CleanReport {
 }
 
 impl CleanReport {
-    /// What the pass freed, for the notice row and `crit sandbox clean`; `None` when it removed
-    /// nothing.
+    /// What the pass freed for `crit sandbox clean`; `None` when it removed nothing.
     pub fn summary(&self) -> Option<String> {
         let mut parts = Vec::with_capacity(2);
         match self.removed_workspaces {
@@ -122,17 +121,17 @@ enum Backing {
 
 impl Sandbox {
     /// Picks this window's root, making it when needed: the first candidate that works (see
-    /// `candidates`). Startup news goes to `notices`: a RAM-backed `/tmp` that holds over 1 GiB,
+    /// `candidates`). Startup warnings go to `warnings`: a RAM-backed `/tmp` holding over 1 GiB,
     /// a `CRIT_SANDBOX` that cannot be used, and why there is no sandbox when scratch then stays
     /// in RAM.
-    pub fn open(notices: &mut Vec<String>) -> Option<Self> {
+    pub fn open(warnings: &mut Vec<String>) -> Option<Self> {
         let tmp = Path::new(TMP);
         let tmp_is_ram = is_ram(tmp);
         if tmp_is_ram
             && let Ok(used) = used_bytes(tmp)
-            && used > TMP_NOTICE_BYTES
+            && used > TMP_WARNING_BYTES
         {
-            notices.push(format!(
+            warnings.push(format!(
                 "/tmp is RAM-backed and holds {}; crit sandbox status lists its largest entries.",
                 size(used)
             ));
@@ -142,7 +141,7 @@ impl Sandbox {
         let Some(path) = choose(&found, true, &mut reasons) else {
             let temp = std::env::temp_dir();
             if is_ram(&temp) {
-                notices.push(format!(
+                warnings.push(format!(
                     "No sandbox for agent scratch could be made ({}), so it stays in RAM-backed {}.",
                     reasons.join("; "),
                     temp.display()
@@ -155,7 +154,7 @@ impl Sandbox {
         if std::env::var_os("CRIT_SANDBOX").is_some_and(|value| !value.is_empty())
             && let Some(reason) = reasons.first()
         {
-            notices.push(format!(
+            warnings.push(format!(
                 "CRIT_SANDBOX is not used ({reason}); agent scratch goes to {} instead.",
                 path.display()
             ));
@@ -229,7 +228,7 @@ impl Sandbox {
 
     /// The pass a window runs, at startup and then daily, at idle priority. It first stamps
     /// the workspaces `open` in this window, so that passes of other windows, which do not know
-    /// them, see them in use, then cleans. The error, for the notice row, is the root's own.
+    /// them, see them in use, then cleans. Any error describes the root itself.
     pub fn pass(&self, open: &[PathBuf]) -> Result<CleanReport, String> {
         for folder in open {
             // The scratch of a folder that has gone is the cleaning's to remove.

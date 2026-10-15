@@ -1,7 +1,7 @@
 ---
 /**
  * Fig. 01, the Parallel switchboard: an interactive, illustrative Crit workspace.
- * The window borrows the TUI's own vocabulary and palette: numbered tabs with
+ * The window borrows the TUI's own vocabulary and palette: branch tabs with
  * state marks and a `› label` workspace header with `[kind n · state]` sessions.
  * A muted, low-contrast rule separates the header from terminal content. Every pane,
  * session chip and transcript is rendered here, so Astro's scoped styles apply
@@ -180,12 +180,12 @@ const clientLanes = lanes.map(({ id, branch, sessions }) => ({
       <div class="sb-window" role="group" aria-label="Illustrative Crit workspace for a project called harbor">
         <div class="sb-tabs" aria-hidden="true">
           <span class="sb-project" data-current>harbor</span>
-          {lanes.map((lane, index) => (
-            <span class="sb-tab" data-tab={lane.id} data-selected={lane.id === initialLane ? '' : undefined}>{` ${index + 1} ${lane.branch} `}<span class="sb-mark" data-state={laneState(lane)}>{MARK[laneState(lane)]}</span></span>
+          {lanes.map((lane) => (
+            <span class="sb-tab" data-tab={lane.id} data-selected={lane.id === initialLane ? '' : undefined}>{` ${lane.branch} `}<span class="sb-mark" data-state={laneState(lane)}>{MARK[laneState(lane)]}</span></span>
           ))}
           <span class="sb-divider">│</span>
           <span class="sb-project">site</span>
-          <span class="sb-tab">{' 1 main '}<span class="sb-mark" data-state="idle">·</span></span>
+          <span class="sb-tab">{' main '}<span class="sb-mark" data-state="idle">·</span></span>
         </div>
         <div class="sb-screen" data-screen role="group" aria-label="Workspace panes">
           <div class="sb-panes">

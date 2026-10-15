@@ -210,33 +210,8 @@ impl Limiter {
         }
     }
 
-    /// What the limit does now, for the notice after F3.
-    pub fn describe(&self) -> String {
-        let Inner { percent, cores, .. } = *self.0;
-        match (&self.0.mechanism, self.limited()) {
-            (Mechanism::Scope { memory_high, .. }, true) => {
-                let memory = memory_high
-                    .map(|bytes| format!(" and memory ({})", amount(bytes)))
-                    .unwrap_or_default();
-                format!(
-                    "Agents limited to {percent}% of the CPU ({} of {cores} core{}){memory}.",
-                    share(percent, cores),
-                    if cores == 1 { "" } else { "s" }
-                )
-            }
-            (Mechanism::Scope { memory_high: None, .. }, false) => "Agent CPU limit off.".into(),
-            (Mechanism::Scope { memory_high: Some(_), .. }, false) => {
-                "Agent CPU and memory limit off.".into()
-            }
-            (Mechanism::Priority(reason), true) => format!(
-                "Agents run at a lower CPU priority: {reason}, so they cannot be held to {percent}% of the CPU."
-            ),
-            (Mechanism::Priority(_), false) => "Agent CPU limit off for agents started from now on; running agents keep their lower priority.".into(),
-        }
-    }
-
-    /// The startup notice, when the limit is on but only the lower priority can hold agents.
-    pub fn startup_notice(&self) -> Option<String> {
+    /// The startup warning when only a lower priority can hold agents.
+    pub fn startup_warning(&self) -> Option<String> {
         match &self.0.mechanism {
             Mechanism::Priority(reason) if self.limited() => Some(format!(
                 "Agent CPU limit: {reason}, so agents run at a lower priority instead of at {}% of the CPU.",
@@ -578,34 +553,12 @@ fn quota(percent: u8, cores: u32) -> u64 {
     u64::from(percent) * u64::from(cores) * 10_000
 }
 
-/// `percent` of `cores` CPUs as a number of CPUs, such as `4`, `1.5` or `5.28`.
-fn share(percent: u8, cores: u32) -> String {
-    let hundredths = u64::from(percent) * u64::from(cores);
-    match hundredths % 100 {
-        0 => format!("{}", hundredths / 100),
-        fraction if fraction % 10 == 0 => format!("{}.{}", hundredths / 100, fraction / 10),
-        fraction => format!("{}.{fraction:02}", hundredths / 100),
-    }
-}
-
 /// The agents' memory share, `percent` of `memory` bytes, in bytes. Memory that is not known
 /// is 0, which gives them none rather than a share that would stop them.
 fn memory_high(percent: u8, memory: u64) -> Option<u64> {
     // In 128 bits, the product of any amount of memory and percentage fits.
     let bytes = u128::from(memory) * u128::from(percent) / 100;
     u64::try_from(bytes).ok().filter(|&bytes| bytes > 0)
-}
-
-/// `bytes` of memory as people read them at a glance, such as `15.6 GiB`, or `640 MiB` below
-/// a GiB.
-fn amount(bytes: u64) -> String {
-    const MIB: u64 = 1 << 20;
-    const GIB: u64 = 1 << 30;
-    if bytes < GIB {
-        format!("{} MiB", bytes / MIB)
-    } else {
-        format!("{:.1} GiB", bytes as f64 / GIB as f64)
-    }
 }
 
 /// The machine's memory in bytes, from the text of `/proc/meminfo`, whose `MemTotal` line
@@ -857,17 +810,12 @@ mod tests {
             retune_arguments("u", Some(quota(50, 16)), None)[MANAGER.len() + 7],
             "8000000"
         );
-        assert_eq!(share(50, 8), "4");
-        assert_eq!(share(25, 6), "1.5");
-        assert_eq!(share(33, 16), "5.28");
-        assert_eq!(share(1, 1), "0.01");
     }
 
     #[test]
     fn the_memory_share_is_the_same_share_of_the_machines_memory_in_bytes() {
-        // Half of 32 GiB is 16 GiB, which the notice after F3 shows as such.
+        // Half of 32 GiB is 16 GiB.
         assert_eq!(memory_high(50, 32 << 30), Some(17_179_869_184));
-        assert_eq!(amount(17_179_869_184), "16.0 GiB");
         assert_eq!(memory_high(100, 32 << 30), Some(32 << 30));
         // Rounded down to whole bytes, and no amount of memory overflows.
         assert_eq!(memory_high(33, 1001), Some(330));
@@ -876,11 +824,6 @@ mod tests {
         // Memory that is not known gives no share, rather than one that would stop the agents.
         assert_eq!(memory_high(50, 0), None);
         assert_eq!(memory_high(1, 99), None);
-        assert_eq!(amount(32_779_832 * 1024 / 2), "15.6 GiB");
-        assert_eq!(amount(1 << 30), "1.0 GiB");
-        // Below a GiB in MiB, so that a small share does not read as none.
-        assert_eq!(amount((1 << 30) - 1), "1023 MiB");
-        assert_eq!(amount(41 << 20), "41 MiB");
     }
 
     #[test]
@@ -1084,26 +1027,13 @@ mod tests {
     }
 
     #[test]
-    fn the_hint_and_notices_say_what_holds_the_agents() {
+    fn the_hint_and_startup_warning_say_what_holds_the_agents() {
         let directory = tempfile::tempdir().unwrap();
         let scope = Limiter::scope(directory.path(), "crit-1-0.scope", 50, 16, 32 << 30, true);
         assert_eq!(scope.hint(), "50%");
-        assert_eq!(
-            scope.describe(),
-            "Agents limited to 50% of the CPU (8 of 16 cores) and memory (16.0 GiB)."
-        );
-        assert_eq!(scope.startup_notice(), None);
+        assert_eq!(scope.startup_warning(), None);
         scope.set_limited(false);
         assert_eq!(scope.hint(), "OFF");
-        assert_eq!(scope.describe(), "Agent CPU and memory limit off.");
-        // Where the machine's memory is not known, only the CPU is limited.
-        let one = Limiter::scope(directory.path(), "crit-1-0.scope", 25, 1, 0, true);
-        assert_eq!(
-            one.describe(),
-            "Agents limited to 25% of the CPU (0.25 of 1 core)."
-        );
-        one.set_limited(false);
-        assert_eq!(one.describe(), "Agent CPU limit off.");
 
         let fallback = Limiter::build(
             Mechanism::Priority("busctl is not installed".into()),
@@ -1113,17 +1043,13 @@ mod tests {
         );
         assert_eq!(fallback.hint(), "LOW");
         assert!(!fallback.uses_scope());
-        assert!(fallback.describe().contains("busctl is not installed"));
-        // The lower priority cannot hold memory, and says nothing about it.
-        assert!(!fallback.describe().contains("memory"));
-        assert!(fallback.startup_notice().is_some_and(|notice| {
-            notice.contains("busctl is not installed") && notice.contains("50%")
+        assert!(fallback.startup_warning().is_some_and(|warning| {
+            warning.contains("busctl is not installed") && warning.contains("50%")
         }));
         fallback.set_limited(false);
         assert_eq!(fallback.hint(), "OFF");
-        assert!(fallback.describe().contains("started from now on"));
         // Off, there is nothing to warn about.
-        assert_eq!(fallback.startup_notice(), None);
+        assert_eq!(fallback.startup_warning(), None);
     }
 
     #[test]

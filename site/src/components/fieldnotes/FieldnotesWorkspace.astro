@@ -1,8 +1,8 @@
 ---
 /**
  * Illustrative Crit workspace drawn in the Fieldnotes paper palette.
- * Vocabulary mirrors the real TUI: a tab bar (project name, numbered
- * worktree tabs with state marks), a workspace header per pane
+ * Vocabulary mirrors the real TUI: a tab bar (project name, worktree tabs
+ * with state marks), a workspace header per pane
  * (`› label` plus `[kind n · state]` sessions) and a mono transcript.
  * Everything is static markup so it works without JavaScript and with
  * Astro's scoped styles.
@@ -32,9 +32,8 @@ const { projects, panes, split = 'vertical', description } = Astro.props;
       <span class="ws-project" data-current={project.current ? '' : undefined}>
         {p > 0 && <span class="ws-divider" aria-hidden="true">│</span>}
         <span class="ws-project-name">{project.name}</span>
-        {project.tabs.map((tab, t) => (
+        {project.tabs.map((tab) => (
           <span class="ws-tab" data-selected={tab.selected ? '' : undefined} data-state={tab.state}>
-            <span class="ws-tab-index">{t + 1}</span>
             <span class="ws-tab-label">{tab.label}</span>
             <span class="ws-mark" aria-hidden="true">{MARK[tab.state]}</span>
             {tab.callout && <span class="ws-callout">{tab.callout}</span>}
@@ -104,7 +103,6 @@ const { projects, panes, split = 'vertical', description } = Astro.props;
   .ws-divider { padding: 0 6px; color: var(--ws-rule); }
   .ws-tab { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border-radius: 3px; color: var(--ws-muted); white-space: nowrap; }
   .ws-tab[data-selected] { color: var(--ws-accent); background: var(--ws-bg); box-shadow: inset 0 0 0 1px var(--ws-rule); }
-  .ws-tab-index { font-size: 11px; opacity: .75; }
   .ws-mark { font-weight: 700; }
   .ws-tab[data-state='working'] .ws-mark, .ws-session[data-state='working'] { color: var(--ws-accent); }
   .ws-tab[data-state='input'] .ws-mark { color: var(--ws-ink); }

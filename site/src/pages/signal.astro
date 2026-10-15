@@ -22,7 +22,7 @@ import PreviewLayout from '../layouts/PreviewLayout.astro';
         <div class="hero-instrument" id="workspace">
           <div class="instrument-caption"><span>FIG. 01 / WORKSPACE</span><span>INTERACTIVE ILLUSTRATION</span></div>
           <div class="workspace-console">
-            <div class="console-toolbar"><span class="console-brand">crit <span>/ atlas</span></span><span class="toolbar-status"><span class="signal-dot"></span> 3 WORKTREES</span></div>
+            <div class="console-toolbar"><span class="console-brand">crit <span id="workspace-path">atlas / feat-auth</span></span><span class="toolbar-status"><span class="signal-dot"></span> 3 WORKTREES</span></div>
             <div class="project-bar"><span class="project-active">atlas</span><span class="project-quiet">website</span><span class="project-quiet">sdk</span><span class="project-label">PROJECTS</span></div>
             <div class="console-body">
               <div class="worktree-list" role="group" aria-label="Choose illustrative worktree">
@@ -43,7 +43,6 @@ import PreviewLayout from '../layouts/PreviewLayout.astro';
                 </div>
               </div>
             </div>
-            <div class="console-bottom"><span id="workspace-path">atlas / feat-auth</span><span>F1 ask <span class="bottom-divider">/</span> F2 controls</span></div>
           </div>
           <div class="demo-controls"><button type="button" id="focus-shell"><kbd>Ctrl</kbd><span>+</span><kbd>D</kbd><span class="demo-button-label">Focus the shell</span><span aria-hidden="true">↗</span></button><p id="demo-status" aria-live="polite">Select a branch. Keep the contexts separate.</p></div>
           <div class="instrument-coordinate" aria-hidden="true">BRANCH ≠ CONTEXT SWITCH</div>
@@ -210,8 +209,6 @@ crit</code></pre><p class="install-requirements">You’ll need <strong>Rust / Ca
   .shell-content { padding: 9px 11px; font-size: 9px; line-height: 1.7; }
   .shell-content p { margin: 0 0 4px; white-space: pre; }
   .cursor { display: inline-block; width: 6px; height: 10px; background: #d1ddc2; vertical-align: -1px; }
-  .console-bottom { display: flex; justify-content: space-between; background: #252f1e; color: #9caa8f; font-size: 7px; padding: 9px 12px; }
-  .bottom-divider { margin: 0 7px; color: #98aa87; }
   .demo-controls { position: relative; display: flex; justify-content: space-between; align-items: flex-start; gap: 17px; padding-top: 21px; }
   .demo-controls button { display: flex; align-items: center; gap: 5px; font: 8px var(--font-mono); color: #c8d3bc; border: 0; background: transparent; padding: 0; cursor: pointer; white-space: nowrap; }
   .demo-controls button:disabled { cursor: default; opacity: .55; }

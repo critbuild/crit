@@ -391,10 +391,13 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
                 &rx,
                 &mut screen,
                 b"\x1bOP\x1bOQ\x1b[H\x1b[B\x1b[B\x1b[B\rmain\r",
-                |contents| contents.contains("│› main") && contents.contains("already"),
+                |contents| contents.contains("Enter / Esc dismiss"),
             );
             drive_until(&mut writer, &rx, &mut screen, b"\x1b", |contents| {
-                !contents.contains("│› main")
+                !contents.contains("Enter / Esc dismiss")
+            });
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b", |contents| {
+                !contents.contains("new worktree tab")
             });
             drive_until(
                 &mut writer,
@@ -723,7 +726,7 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
                 "keep this work"
             );
             drive_until(&mut writer, &rx, &mut screen, b"\x1b", |contents| {
-                !contents.contains("Tab and checkout kept.")
+                !contents.contains("refusing to remove dirty worktree")
             });
             drive_until(
                 &mut writer,
@@ -760,7 +763,7 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
             );
             drive_until(&mut writer, &rx, &mut screen, b"\x1b[113;6u", close_menu);
             drive_until(&mut writer, &rx, &mut screen, b"\x1b[A\r", |contents| {
-                contents.contains("Checkout removed")
+                !close_menu(contents)
                     && !contents
                         .lines()
                         .next()
@@ -801,9 +804,8 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
     }
 }
 
-/// Crit on its own PTY with a throwaway `$HOME`. Its `omp` fails the update check, so
-/// startup has a notice of its own, unless `programs` replaces it; no other agent or updater
-/// program can run except the `(name, script)` ones given.
+/// Crit on its own PTY with a throwaway `$HOME`. Only the `(name, script)` programs
+/// given can act as agents or updaters; normal paths never inject update failures.
 struct Crit {
     _child: ChildGuard,
     _master: Box<dyn portable_pty::MasterPty + Send>,
@@ -829,10 +831,7 @@ impl Crit {
             .canonicalize()
             .unwrap();
         std::os::unix::fs::symlink(git, bin.join("git")).unwrap();
-        for (name, script) in [("omp", "#!/bin/sh\necho refused >&2\nexit 1\n")]
-            .iter()
-            .chain(programs)
-        {
+        for (name, script) in programs {
             std::fs::write(bin.join(name), script).unwrap();
             std::fs::set_permissions(bin.join(name), std::fs::Permissions::from_mode(0o755))
                 .unwrap();
@@ -884,6 +883,16 @@ impl Crit {
 
     fn drive(&mut self, input: &[u8], ready: impl Fn(&str) -> bool) {
         drive_until(&mut self.writer, &self.rx, &mut self.screen, input, ready);
+    }
+
+    fn settle(&mut self) {
+        let deadline = Instant::now() + Duration::from_millis(250);
+        while let Ok(bytes) = self
+            .rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        {
+            self.screen.process(&bytes);
+        }
     }
 }
 
@@ -948,20 +957,131 @@ fn restored_workspace_still_opens_explicit_repo() {
 }
 
 #[test]
-fn startup_keeps_update_and_restore_notices() {
+fn startup_recovery_warning_blocks_input_until_dismissed_and_preserves_snapshot() {
     let home = tempfile::tempdir().unwrap();
     let home_path = home.path().canonicalize().unwrap();
     seed_snapshot(&home_path, b"{broken");
     let mut crit = Crit::start(&home_path, &home_path, &[], &[]);
-    // Updates run in the background: the picker has the restore warning, and the failed
-    // update joins it once a workspace is open.
     crit.drive(b"", |screen| {
         screen.contains("Saved workspace could not be loaded")
+            && screen.contains("Enter")
+            && screen.contains("Esc")
     });
-    crit.drive(b"\r", |screen| {
-        screen.contains("OMP update failed")
-            && screen.contains("Saved workspace could not be loaded")
+    crit.writer.write_all(b"ordinary input").unwrap();
+    crit.writer.flush().unwrap();
+    crit.settle();
+    crit.drive(b"\x1b", |screen| {
+        !screen.contains("Saved workspace could not be loaded") && screen.contains("New terminal")
     });
+    crit.drive(b"\r", |screen| screen.contains("CRIT_TEST>"));
+    crit.drive(b"printf 'recovery-%s\\n' dismissed\r", |screen| {
+        screen.contains("recovery-dismissed")
+    });
+    assert_eq!(
+        std::fs::read(home_path.join(".local/state/crit/workspace.json")).unwrap(),
+        b"{broken"
+    );
+}
+
+#[test]
+fn updater_error_requires_enter_before_shell_input_resumes() {
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let mut crit = Crit::start(
+        &home_path,
+        &home_path,
+        &["--fresh", "--agent", "shell"],
+        &[("omp", "#!/bin/sh\necho refused >&2\nexit 1\n")],
+    );
+    crit.drive(b"", |screen| {
+        screen.contains("OMP update failed") && screen.contains("Enter") && screen.contains("Esc")
+    });
+    let blocked = home_path.join("blocked-input");
+    let command = format!("printf blocked > '{}'\r", blocked.display());
+    crit.writer.write_all(command.as_bytes()).unwrap();
+    crit.writer.flush().unwrap();
+    crit.settle();
+    assert!(
+        !blocked.exists(),
+        "error dialog forwarded input to the shell"
+    );
+    crit.drive(b"\r", |screen| !screen.contains("OMP update failed"));
+    crit.drive(b"printf 'update-%s\\n' dismissed\r", |screen| {
+        screen.contains("update-dismissed")
+    });
+    assert!(!blocked.exists(), "dismissal replayed blocked input");
+}
+
+#[test]
+fn bottom_row_stays_usable_without_resize_after_f3_and_tab_close() {
+    let home = tempfile::tempdir().unwrap();
+    let home_path = home.path().canonicalize().unwrap();
+    let project = home_path.join("original-project");
+    std::fs::create_dir(&project).unwrap();
+    let mut crit = Crit::start(&home_path, &project, &["--fresh", "--agent", "shell"], &[]);
+    crit.drive(b"", |screen| screen.contains("CRIT_TEST>"));
+    let sizes = home_path.join("pane-sizes");
+    let resized = home_path.join("pane-resized");
+    let prepare = format!(
+        "trap 'printf resized >> \"{}\"' WINCH; /bin/stty size > '{}'; printf 'pane-%s\\n' prepared\r",
+        resized.display(),
+        sizes.display()
+    );
+    crit.drive(prepare.as_bytes(), |screen| {
+        screen.contains("pane-prepared")
+    });
+    assert_eq!(std::fs::read_to_string(&sizes).unwrap().trim(), "21 158");
+    for (input, marker) in [
+        (b"".as_slice(), "initial"),
+        (b"\x1bOR".as_slice(), "f3-off"),
+        (b"\x1bOR".as_slice(), "f3-on"),
+    ] {
+        let command = format!(
+            "/bin/stty size >> '{}'; printf '\\033[999;1Hbottom-%s\\033[1;1H' '{marker}'\r",
+            sizes.display()
+        );
+        let mut bytes = input.to_vec();
+        bytes.extend_from_slice(command.as_bytes());
+        crit.drive(&bytes, |screen| {
+            screen
+                .lines()
+                .nth(23)
+                .is_some_and(|row| row.contains(&format!("bottom-{marker}")))
+        });
+    }
+    crit.drive(b"\x1b[116;6u\r", |screen| {
+        screen
+            .lines()
+            .nth(1)
+            .is_some_and(|row| row.contains("[shell 1"))
+            && !screen.contains("bottom-f3-on")
+    });
+    crit.drive(b"\x1b[113;6u", |screen| {
+        screen.contains("Yes, delete worktree")
+    });
+    crit.drive(b"\x1b[H\r", |screen| screen.contains("bottom-f3-on"));
+    let command = format!(
+        "/bin/stty size >> '{}'; printf '\\033[999;1Hbottom-%s\\033[1;1H' after-close\r",
+        sizes.display()
+    );
+    crit.drive(command.as_bytes(), |screen| {
+        screen
+            .lines()
+            .nth(23)
+            .is_some_and(|row| row.contains("bottom-after-close"))
+    });
+    crit.settle();
+    assert!(
+        std::fs::read_to_string(&sizes)
+            .unwrap()
+            .lines()
+            .all(|size| size == "21 158"),
+        "a routine operation changed the full-height pane size"
+    );
+    assert!(
+        !resized.exists(),
+        "a routine operation sent SIGWINCH to the surviving pane"
+    );
 }
 
 #[test]
