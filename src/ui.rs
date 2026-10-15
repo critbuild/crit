@@ -326,7 +326,7 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
     for (slot, open) in project_slots(project, saved_projects) {
         let separator = u16::from(!tab_hits.is_empty());
         tab_hits.push(TabHit {
-            area: Rect::new(0, 0, (open.name.width() as u16 + 1).min(21) + separator, 1),
+            area: Rect::new(0, 0, (open.name.width() as u16 + 3).min(23) + separator, 1),
             project: slot,
             workspace: None,
         });
@@ -375,6 +375,8 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
                         format!(" {}", open.name),
                         Style::default().fg(if current { FG } else { MUTED }).bold(),
                     ),
+                    // Sets the name apart from its first tab; `│` is between projects.
+                    Span::styled(" ·", Style::default().fg(BORDER)),
                 ]),
                 Style::default().bg(BG),
             ),

@@ -31,7 +31,7 @@ const { projects, panes, split = 'vertical', description } = Astro.props;
     {projects.map((project, p) => (
       <span class="ws-project" data-current={project.current ? '' : undefined}>
         {p > 0 && <span class="ws-divider" aria-hidden="true">│</span>}
-        <span class="ws-project-name">{project.name}</span>
+        <span class="ws-project-name">{project.name}</span><span class="ws-divider" aria-hidden="true">·</span>
         {project.tabs.map((tab) => (
           <span class="ws-tab" data-selected={tab.selected ? '' : undefined} data-state={tab.state}>
             <span class="ws-tab-label">{tab.label}</span>

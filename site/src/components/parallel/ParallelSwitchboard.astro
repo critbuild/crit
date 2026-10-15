@@ -179,12 +179,12 @@ const clientLanes = lanes.map(({ id, branch, sessions }) => ({
     <div class="sb-stage">
       <div class="sb-window" role="group" aria-label="Illustrative Crit workspace for a project called harbor">
         <div class="sb-tabs" aria-hidden="true">
-          <span class="sb-project" data-current>harbor</span>
+          <span class="sb-project" data-current>harbor</span><span class="sb-divider">·</span>
           {lanes.map((lane) => (
             <span class="sb-tab" data-tab={lane.id} data-selected={lane.id === initialLane ? '' : undefined}>{` ${lane.branch} `}<span class="sb-mark" data-state={laneState(lane)}>{MARK[laneState(lane)]}</span></span>
           ))}
           <span class="sb-divider">│</span>
-          <span class="sb-project">site</span>
+          <span class="sb-project">site</span><span class="sb-divider">·</span>
           <span class="sb-tab">{' main '}<span class="sb-mark" data-state="idle">·</span></span>
         </div>
         <div class="sb-screen" data-screen role="group" aria-label="Workspace panes">
