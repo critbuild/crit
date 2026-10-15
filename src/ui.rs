@@ -140,7 +140,7 @@ fn split_divider(layout: LayoutMode, panes: [Rect; 2], count: usize) -> Option<S
     let track = Rect::new(panes[0].right(), content.y, 1, content.height);
     Some(SplitDivider {
         track,
-        // Reuse adjacent pane margins instead of reserving a middle gutter.
+        // The grip spans both margin columns, so it is easy to hit; only the rail is drawn.
         handle: Rect::new(track.x - MARGIN, track.y + track.height / 2, 2 * MARGIN, 1),
         available_width: panes[0].width + panes[1].width,
     })
@@ -148,11 +148,8 @@ fn split_divider(layout: LayoutMode, panes: [Rect; 2], count: usize) -> Option<S
 
 fn draw_split_handle(buffer: &mut Buffer, divider: SplitDivider, dragging: bool) {
     let color = if dragging { ACCENT } else { HEADER_DIVIDER };
-    buffer[(divider.handle.x, divider.handle.y)]
-        .set_symbol("┤")
-        .set_fg(color);
-    buffer[(divider.handle.right() - 1, divider.handle.y)]
-        .set_symbol("├")
+    buffer[(divider.track.x, divider.handle.y)]
+        .set_symbol("┼")
         .set_fg(color);
 }
 
@@ -284,14 +281,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Duration> {
         frame.buffer_mut()[(regions[1].x, regions[1].y)]
             .set_symbol("│")
             .set_fg(BORDER);
+        // One rail, on the right pane's margin column; the left margin stays clear for the
+        // left pane's scrollbar.
         for y in divider.track.y..divider.track.bottom() {
-            // Keep the left pane's scroll thumb and track when history exists.
-            if app.panes[0].scrollbar.is_none() {
-                frame.buffer_mut()[(divider.handle.x, y)]
-                    .set_symbol("│")
-                    .set_fg(HEADER_DIVIDER);
-            }
-            frame.buffer_mut()[(divider.handle.right() - 1, y)]
+            frame.buffer_mut()[(divider.track.x, y)]
                 .set_symbol("│")
                 .set_fg(HEADER_DIVIDER);
         }
@@ -817,11 +810,12 @@ fn draw_workspace(
             }
         }
         if let Some(bar) = scrollbar {
-            for y in bar.track.y..bar.track.bottom() {
-                let thumb = y >= bar.thumb.y && y < bar.thumb.bottom();
+            // Only the thumb is drawn: a full-height track would read as another rail
+            // beside the split divider. The track stays clickable.
+            for y in bar.thumb.y..bar.thumb.bottom() {
                 frame.buffer_mut()[(bar.track.x, y)]
-                    .set_symbol(if thumb { "┃" } else { "│" })
-                    .set_fg(if thumb { MUTED } else { BORDER });
+                    .set_symbol("┃")
+                    .set_fg(MUTED);
             }
         }
         return scrollbar;

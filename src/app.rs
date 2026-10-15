@@ -9181,12 +9181,13 @@ mod tests {
         assert_eq!(app.panes.len(), 2);
         assert_eq!(app.worktree_area, Some(Rect::new(67, 1, 33, 23)));
         assert!(app.panes[1].body.right() < 67);
-        // The divider's grip is a pair of box-drawing tees, which Kitty draws aligned with the
-        // rails beside them.
-        let handle = app.split_divider.expect("two panes share a divider").handle;
+        // One rail on the right pane's margin column, with the grip on it; the left margin
+        // column stays clear for the left pane's scrollbar.
+        let divider = app.split_divider.expect("two panes share a divider");
         let buffer = terminal.backend().buffer();
-        assert_eq!(buffer[(handle.x, handle.y)].symbol(), "┤");
-        assert_eq!(buffer[(handle.right() - 1, handle.y)].symbol(), "├");
+        assert_eq!(buffer[(divider.track.x, divider.handle.y)].symbol(), "┼");
+        assert_eq!(buffer[(divider.track.x, divider.track.y)].symbol(), "│");
+        assert_eq!(buffer[(divider.track.x - 1, divider.track.y)].symbol(), " ");
         // At 85 columns the 57 left beside the sidebar cannot hold two panes.
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(85, 24)).unwrap();
         draw_frame(&mut app, &mut terminal);

@@ -97,12 +97,13 @@ APPEARANCE
   ○ while it starts, and × when it has exited. ● marks a completed turn you
   have not acknowledged; clicking or keyboard-selecting its tab clears it,
   even if that tab is already selected. Idle shells do not show completion dots.
-  A thin scrollbar uses the right gutter when normal-screen history exists.
-  Click or drag it to review history or return to live output at the bottom.
+  A thin scroll thumb appears in the right gutter when normal-screen history
+  exists; its whole column is clickable and draggable to review history or
+  return to live output at the bottom.
   Mouse-aware apps receive the wheel normally; Shift+wheel scrolls Crit's
   history instead. Typing or pasting returns to live output.
-  Side-by-side panes use adjacent edge rails, with ┤ on the left and ├ on
-  the right, and no blank column between them. Drag either grip without changing focus.
+  Side-by-side panes share one thin rail with a ┼ grip midway; drag the rail
+  or the column beside it without changing focus.
   Each pane keeps a usable minimum width; the proportion follows window resizing
   and is saved per project. Narrow windows show one pane until both fit again.
   After a pane changes size, Crit waits for the app's repaint before drawing
