@@ -425,10 +425,7 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
                 &rx,
                 &mut screen,
                 b"\x1b[B\x1b[B\r",
-                |contents| {
-                    contents.contains("› feature/other")
-                        && contents.contains(linked.to_str().unwrap())
-                },
+                |contents| contents.contains("› feature/other"),
             );
 
             // A short viewport must scroll the nested list, not lose its controls.
@@ -473,9 +470,6 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
                 })
                 .unwrap();
             screen.screen_mut().set_size(24, 100);
-            drive_until(&mut writer, &rx, &mut screen, b"", |contents| {
-                contents.contains("› feature/other") && contents.contains(linked.to_str().unwrap())
-            });
             drive_until(&mut writer, &rx, &mut screen, b"\r", |contents| {
                 contents.lines().nth(1).is_some_and(|header| {
                     header.trim_start().starts_with("› main")

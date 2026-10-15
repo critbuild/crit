@@ -1521,6 +1521,9 @@ impl App {
         if index >= self.project.workspaces.len() {
             return Ok(());
         }
+        for session in &mut self.project.workspaces[index].sessions {
+            session.completed = false;
+        }
         self.workspace_changed();
         if let Some(selected) = self.project.secondary_session
             && index != self.project.active
@@ -1764,6 +1767,7 @@ impl App {
             return self.close_session(slot, workspace, index);
         }
         session.state = AgentState::Exited;
+        session.completed = false;
         session.message = Some(code);
         Ok(())
     }
@@ -2928,6 +2932,14 @@ impl App {
                                 identity_changed = session.resume != resume;
                                 session.resume = resume;
                             }
+                            // Only an actual turn completing notifies. Repeated idle reports
+                            // preserve acknowledgment, and launch-ready shells/agents stay quiet.
+                            session.completed = update.state == AgentState::Idle
+                                && (session.completed
+                                    || matches!(
+                                        session.state,
+                                        AgentState::Working | AgentState::Blocked
+                                    ));
                             session.state = update.state;
                             session.message = update.message;
                         }
@@ -8658,6 +8670,108 @@ mod tests {
     }
 
     #[test]
+    fn selecting_a_tab_acknowledges_completion_without_changing_agent_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        for id in 1..=2 {
+            let mut session = sleeping_session(&app, directory.path(), id);
+            session.kind = "omp".into();
+            session.state = AgentState::Unknown;
+            session.resume = Some(format!("chat-{id}"));
+            app.project.workspaces[id as usize - 1]
+                .sessions
+                .push(session);
+        }
+        // Exercise a completion in another project, not just another tab of this one.
+        let mut other = Project::terminal(directory.path()).unwrap();
+        other.name = "second".into();
+        other.order = 1;
+        other.workspaces = app.project.workspaces.split_off(1);
+        app.saved_projects.push(other);
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        let draw = |app: &mut App, terminal: &mut Terminal<ratatui::backend::TestBackend>| {
+            terminal
+                .draw(|frame| {
+                    ui::draw(frame, app);
+                })
+                .unwrap();
+            terminal.backend().buffer().content[..120]
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        let update = |id, state| {
+            Event::Agent(integration::AgentUpdate {
+                session: id,
+                state,
+                message: None,
+                resume: integration::ResumeUpdate::Unknown,
+            })
+        };
+        for id in 1..=2 {
+            app.handle(update(id, AgentState::Idle)).unwrap();
+        }
+        assert_eq!(draw(&mut app, &mut terminal).matches('●').count(), 0);
+        for id in 1..=2 {
+            app.handle(update(id, AgentState::Working)).unwrap();
+            app.handle(update(id, AgentState::Idle)).unwrap();
+        }
+        assert_eq!(draw(&mut app, &mut terminal).matches('●').count(), 2);
+        let hit = app
+            .tab_hits
+            .iter()
+            .find(|hit| hit.project == Some(0) && hit.workspace == Some(0))
+            .unwrap()
+            .area;
+        app.handle(mouse_event(MouseEventKind::Moved, hit.x, hit.y))
+            .unwrap();
+        assert_eq!(draw(&mut app, &mut terminal).matches('●').count(), 2);
+        app.handle(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            hit.x,
+            hit.y,
+        ))
+        .unwrap();
+        assert_eq!(app.project.name, "second");
+        assert_eq!(draw(&mut app, &mut terminal).matches('●').count(), 1);
+        assert_eq!(app.focused_session().unwrap().state, AgentState::Idle);
+        assert_eq!(
+            app.focused_session().unwrap().resume.as_deref(),
+            Some("chat-2")
+        );
+
+        // A repeated idle report must not resurrect an acknowledged completion.
+        app.handle(update(2, AgentState::Idle)).unwrap();
+        assert_eq!(draw(&mut app, &mut terminal).matches('●').count(), 1);
+        // Keyboard selection acknowledges only the tab it selects.
+        app.action(Action::PreviousWorktree).unwrap();
+        assert_eq!(app.project.name, "fixture");
+        assert_eq!(draw(&mut app, &mut terminal).matches('●').count(), 0);
+        // A new turn can notify again, including while this tab is already focused.
+        app.handle(update(1, AgentState::Working)).unwrap();
+        app.handle(update(1, AgentState::Idle)).unwrap();
+        assert_eq!(draw(&mut app, &mut terminal).matches('●').count(), 1);
+        let hit = app
+            .tab_hits
+            .iter()
+            .find(|hit| hit.project.is_none() && hit.workspace == Some(0))
+            .unwrap()
+            .area;
+        app.handle(mouse_event(
+            MouseEventKind::Down(MouseButton::Left),
+            hit.x,
+            hit.y,
+        ))
+        .unwrap();
+        assert_eq!(draw(&mut app, &mut terminal).matches('●').count(), 0);
+        app.handle(update(1, AgentState::Blocked)).unwrap();
+        let row = draw(&mut app, &mut terminal);
+        assert!(row.contains('◆') || row.contains('◇'), "{row:?}");
+        app.handle(update(1, AgentState::Idle)).unwrap();
+        assert_eq!(draw(&mut app, &mut terminal).matches('●').count(), 1);
+    }
+
+    #[test]
     fn tab_bar_lists_every_open_project_in_opening_order_and_tabs_wrap_across_them() {
         let (tx, _events) = mpsc::sync_channel(8);
         let (jobs, queued) = mpsc::sync_channel(8);
@@ -8757,8 +8871,7 @@ mod tests {
             ("beta", 0)
         );
 
-        // The bar renders both projects; clicking another project's tab switches to it. Each
-        // worktree tab is 24 columns now, so the five cells need a wide window.
+        // The bar renders both projects; clicking another project's tab switches to it.
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(160, 24)).unwrap();
         let mut tick = None;
         terminal
@@ -8773,16 +8886,6 @@ mod tests {
         for expected in ["alpha", "1 main", "2 dev", "beta"] {
             assert!(row.contains(expected), "{expected:?} missing from {row:?}");
         }
-        // Every worktree tab is the same width (number, an 18-column label slot, mark) and
-        // shows the ready mark; nothing on the bar moves, so no frame is asked for.
-        let widths: Vec<u16> = app
-            .tab_hits
-            .iter()
-            .filter(|hit| hit.workspace.is_some())
-            .map(|hit| hit.area.width)
-            .collect();
-        assert_eq!(widths, [24, 24, 24]);
-        assert_eq!(row.matches('●').count(), 3, "{row:?}");
         assert_eq!(tick, None);
         // A long label scrolls and a working tab spins, in a background project too: both
         // ask for a next frame. beta is current here; alpha is `saved_projects[0]`.

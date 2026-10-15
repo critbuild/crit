@@ -91,11 +91,12 @@ APPEARANCE
   items were left out at startup, stay until Esc or a Crit shortcut.
   Selected sessions stay visible in the workspace header even when other
   session labels overflow.
-  Worktree tabs are one width, with an 18-column label slot, so they keep their
-  places when branches change; a longer label scrolls through its slot like a
-  departures board. The tab's mark is its sessions' state: a spinner while an
-  agent works, ● when it is ready for your next prompt, a blinking ◆ when it
-  waits for your decision, ○ while it starts, × when it has exited.
+  Worktree tabs fit their labels without padding short names. Longer labels
+  scroll through an 18-column slot. The status sits directly after the name:
+  a spinner while an agent works, a blinking ◆ when it waits for your decision,
+  ○ while it starts, and × when it has exited. ● marks a completed turn you
+  have not acknowledged; clicking or keyboard-selecting its tab clears it,
+  even if that tab is already selected. Idle shells do not show completion dots.
   A thin scrollbar uses the right gutter when normal-screen history exists.
   Click or drag it to review history or return to live output at the bottom.
   Mouse-aware apps receive the wheel normally; Shift+wheel scrolls Crit's

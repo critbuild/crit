@@ -56,6 +56,8 @@ pub struct Session {
     pub id: u64,
     pub kind: String,
     pub state: AgentState,
+    /// A completed turn not yet acknowledged by selecting its tab. Not persisted.
+    pub completed: bool,
     pub message: Option<String>,
     pub resume: Option<String>,
     pub parser: Arc<Mutex<Parser>>,
@@ -278,6 +280,7 @@ impl Session {
             } else {
                 AgentState::Unknown
             },
+            completed: false,
             message: None,
             resume: match resume {
                 Some(Resume::Chat(identity)) => Some(identity.to_owned()),

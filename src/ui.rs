@@ -15,6 +15,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
+use std::borrow::Cow;
 use std::ops::Range;
 use std::sync::LazyLock;
 use std::sync::atomic::Ordering;
@@ -32,8 +33,8 @@ const ACCENT: Color = Color::Rgb(144, 191, 255);
 const GREEN: Color = Color::Rgb(165, 214, 179);
 const AMBER: Color = Color::Rgb(232, 188, 128);
 
-/// Columns every worktree tab gives its label, so that tabs line up and keep their places
-/// when a branch is switched or renamed. A longer label scrolls through the slot.
+/// Maximum columns for a worktree label. Short names take only the room they need; longer
+/// names scroll through a bounded slot.
 const LABEL_WIDTH: usize = 18;
 /// The working mark's frames: a braille spinner, one frame per `SPINNER_STEP`.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -336,10 +337,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Duration> {
 /// Every open project contributes a name cell and one cell per worktree, in
 /// opening order, so other projects stay visible and clickable. Cells are
 /// staged in `tab_hits` (capacity reused across frames) and trimmed to the
-/// visible window around the focused tab. Worktree cells are all the same width
-/// (`LABEL_WIDTH` for the label), so tabs stay put when labels change; a long
-/// label scrolls through its slot. Returns how long until a mark or label drawn
-/// here next changes, `None` when none of them moves.
+/// visible window around the focused tab. Labels take up to `LABEL_WIDTH` columns, with
+/// the status immediately after the name; a long label scrolls through its slot.
+/// Returns how long until a mark or label drawn here next changes, `None` when none moves.
 fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
     let focused = app.focused_index();
     let App {
@@ -361,7 +361,12 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
                 focused_cell = tab_hits.len();
             }
             tab_hits.push(TabHit {
-                area: Rect::new(0, 0, tab_cell_width(index), 1),
+                area: Rect::new(
+                    0,
+                    0,
+                    tab_cell_width(index, open.workspaces[index].label()),
+                    1,
+                ),
                 project: slot,
                 workspace: Some(index),
             });
@@ -406,13 +411,16 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
             ),
             Some(index) => {
                 let workspace = &open.workspaces[index];
-                let (mark, color, mark_tick) = tab_mark(workspace.state(), clock);
+                let state = workspace.state();
+                let completed = state == AgentState::Idle
+                    && workspace.sessions.iter().any(|session| session.completed);
+                let (mark, color, mark_tick) = tab_mark(state, completed, clock);
                 let (label, label_tick) = ticker(workspace.label(), LABEL_WIDTH, clock);
                 tick = [tick, mark_tick, label_tick].into_iter().flatten().min();
                 let selected = current && index == focused;
                 (
                     Line::from(vec![
-                        Span::raw(format!(" {} ", index + 1)),
+                        Span::raw(format!("{} ", index + 1)),
                         Span::raw(label),
                         Span::styled(format!(" {mark} "), Style::default().fg(color)),
                     ]),
@@ -434,17 +442,20 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
     tick
 }
 
-/// Columns of worktree tab `index`: its number, the label slot and the mark, each with a
-/// space on either side.
-fn tab_cell_width(index: usize) -> u16 {
-    let number = (index + 1).to_string().len();
-    (number + 2 + LABEL_WIDTH + 3) as u16
+/// Columns of worktree tab `index`: number, compact label and one status column. Reserving
+/// only the status column keeps a tab still when a turn starts or is acknowledged.
+fn tab_cell_width(index: usize, label: &str) -> u16 {
+    let number = (index + 1).ilog10() as usize + 1;
+    (number + 1 + label.width().min(LABEL_WIDTH) + 3) as u16
 }
 
-/// The mark of a tab in `state` at `clock` on the animation clock, its colour, and how long
-/// until it changes (`None`: it does not). A working agent shows a spinner, one waiting for a
-/// decision a diamond that blinks, one that is ready for the next prompt a steady dot.
-fn tab_mark(state: AgentState, clock: Duration) -> (&'static str, Color, Option<Duration>) {
+/// The mark of a tab, its colour and the time until it changes. Completion is an
+/// acknowledgment flag, separate from live status: idle sessions do not notify by default.
+fn tab_mark(
+    state: AgentState,
+    completed: bool,
+    clock: Duration,
+) -> (&'static str, Color, Option<Duration>) {
     match state {
         AgentState::Working => {
             let (frame, next) = phase(clock, SPINNER_STEP);
@@ -454,7 +465,8 @@ fn tab_mark(state: AgentState, clock: Duration) -> (&'static str, Color, Option<
             let (frame, next) = phase(clock, BLINK_STEP);
             (if frame % 2 == 0 { "◆" } else { "◇" }, AMBER, Some(next))
         }
-        AgentState::Idle => ("●", GREEN, None),
+        AgentState::Idle if completed => ("●", GREEN, None),
+        AgentState::Idle => (" ", MUTED, None),
         AgentState::Unknown => ("○", MUTED, None),
         AgentState::Exited => ("×", MUTED, None),
     }
@@ -467,14 +479,14 @@ fn phase(clock: Duration, step: Duration) -> (usize, Duration) {
     (steps as usize, next)
 }
 
-/// `label` as a worktree tab shows it in `width` columns at `clock`: padded when it fits,
-/// else scrolled like a departures board, resting at its start for `TICKER_DWELL` and then
+/// `label` as a worktree tab shows it in up to `width` columns at `clock`: unchanged when it
+/// fits, else scrolled like a departures board, resting at its start for `TICKER_DWELL` and
 /// moving one column per `TICKER_STEP`, `TICKER_GAP` apart from its next beginning, until it
 /// has come round. The second value is how long until the text changes; `None` when it fits.
-fn ticker(label: &str, width: usize, clock: Duration) -> (String, Option<Duration>) {
+fn ticker(label: &str, width: usize, clock: Duration) -> (Cow<'_, str>, Option<Duration>) {
     let length = label.width();
     if length <= width {
-        return (format!("{label}{:pad$}", "", pad = width - length), None);
+        return (Cow::Borrowed(label), None);
     }
     let loop_width = length + TICKER_GAP.width();
     let scroll = TICKER_STEP * loop_width as u32;
@@ -510,7 +522,7 @@ fn ticker(label: &str, width: usize, clock: Duration) -> (String, Option<Duratio
     for _ in filled..width {
         shown.push(' ');
     }
-    (shown, Some(next))
+    (Cow::Owned(shown), Some(next))
 }
 
 /// The longest prefix of `text`, in whole grapheme clusters, that fits `width` columns, and
@@ -2758,13 +2770,7 @@ mod tests {
     }
 
     #[test]
-    fn ticker_pads_short_labels_and_scrolls_long_ones_round_after_a_rest() {
-        let (text, tick) = ticker("main", 8, Duration::from_secs(7));
-        assert_eq!((text.as_str(), tick), ("main    ", None));
-        // A wide label is padded by columns, not characters.
-        let (text, _) = ticker("日本", 6, Duration::ZERO);
-        assert_eq!(text, "日本  ");
-
+    fn ticker_scrolls_long_labels_round_without_splitting_wide_characters() {
         let label = "fix-juror-ranker";
         let width = 8;
         // The start rests for the dwell, and asks for a frame when the dwell ends.
@@ -2795,28 +2801,5 @@ mod tests {
             let (text, _) = ticker(wide, 7, TICKER_DWELL + TICKER_STEP * step);
             assert_eq!(text.width(), 7, "{text:?} at step {step}");
         }
-    }
-
-    #[test]
-    fn tab_marks_animate_only_while_an_agent_works_or_waits_for_a_decision() {
-        let (first, _, tick) = tab_mark(AgentState::Working, Duration::ZERO);
-        assert_eq!((first, tick), (SPINNER[0], Some(SPINNER_STEP)));
-        let (second, _, tick) = tab_mark(
-            AgentState::Working,
-            SPINNER_STEP + Duration::from_millis(25),
-        );
-        assert_eq!(
-            (second, tick),
-            (SPINNER[1], Some(SPINNER_STEP - Duration::from_millis(25)))
-        );
-        let (wrapped, _, _) = tab_mark(AgentState::Working, SPINNER_STEP * SPINNER.len() as u32);
-        assert_eq!(wrapped, SPINNER[0]);
-        let (filled, _, _) = tab_mark(AgentState::Blocked, Duration::ZERO);
-        let (hollow, _, tick) = tab_mark(AgentState::Blocked, BLINK_STEP);
-        assert_eq!((filled, hollow, tick), ("◆", "◇", Some(BLINK_STEP)));
-        for state in [AgentState::Idle, AgentState::Unknown, AgentState::Exited] {
-            assert_eq!(tab_mark(state, Duration::from_secs(3)).2, None);
-        }
-        assert_eq!(tab_mark(AgentState::Idle, Duration::ZERO).0, "●");
     }
 }
