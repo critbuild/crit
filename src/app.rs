@@ -14,9 +14,10 @@ use crate::{
 use anyhow::{Context, Result};
 use crossterm::{
     event::{
-        DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton,
-        MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+        EnableFocusChange, EnableMouseCapture, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+        KeyboardEnhancementFlags, MouseButton, MouseEventKind, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
     },
     execute, queue,
     terminal::{
@@ -691,6 +692,12 @@ pub struct App {
     /// Where the last frame drew the worktree pane; every mouse event inside it is the pane's.
     pub worktree_area: Option<Rect>,
     pub interaction_visible: bool,
+    /// Whether the outer window has focus, as the terminal's focus reports (`?1004`) say. It
+    /// starts out true, which is all a terminal without the reports ever says. Without focus, as
+    /// behind a game, no one types here and few watch: the tab bar holds still, frames go out at
+    /// most every 100 ms (`frame_interval`), and Git is polled every
+    /// `UNFOCUSED_METADATA_INTERVAL`.
+    pub window_focused: bool,
     pub should_quit: bool,
     default_agent: String,
     next_session: u64,
@@ -826,7 +833,12 @@ fn environment_summary(label: &str, environment: &compose::Environment) -> Strin
 const ENVIRONMENT_NOT_STARTED: &str = "Worktree created; its Docker environment was not started (command queue busy). Start it from F1 → F2.";
 
 impl App {
+    /// How often Git is polled for the open repositories' worktrees and branches while the
+    /// window has focus, so that a branch switched in another terminal shows within a second.
     const METADATA_INTERVAL: Duration = Duration::from_secs(1);
+    /// How often it is polled while the window has no focus, when few look: a tenth of the
+    /// wake-ups and Git checks. Focus coming back polls at once.
+    const UNFOCUSED_METADATA_INTERVAL: Duration = Duration::from_secs(10);
     /// An agent that ends successfully within this long of starting stays open, as a failed one
     /// does, rather than closing like a Kitty window: it most likely never got going (a tool that
     /// refuses to run can still exit 0), and closing it could end Crit before anyone saw why.
@@ -834,8 +846,25 @@ impl App {
     /// How often a window cleans the sandbox after its pass at startup.
     const SANDBOX_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 
+    /// How long after a Git poll the next one is due, as the window's focus has it.
+    fn metadata_interval(&self) -> Duration {
+        if self.window_focused {
+            Self::METADATA_INTERVAL
+        } else {
+            Self::UNFOCUSED_METADATA_INTERVAL
+        }
+    }
+
+    /// Polls Git once `metadata_interval` has passed since the last poll.
     fn refresh_metadata(&mut self) {
-        if self.metadata_pending || self.metadata_checked.elapsed() < Self::METADATA_INTERVAL {
+        if self.metadata_checked.elapsed() >= self.metadata_interval() {
+            self.request_metadata();
+        }
+    }
+
+    /// Polls Git now, unless a poll is already running: its answer is as fresh.
+    fn request_metadata(&mut self) {
+        if self.metadata_pending {
             return;
         }
         self.metadata_checked = Instant::now();
@@ -2479,6 +2508,23 @@ impl App {
         if self.should_quit {
             return Ok(false);
         }
+        // Focus is the window's, not a pane's: it reaches no program, even one that asked for
+        // focus reports, and it leaves dialogs, selections, scroll positions and drags as they
+        // are, behind an alert or below the minimum size too.
+        match &event {
+            Event::Input(crossterm::event::Event::FocusGained) => {
+                self.window_focused = true;
+                // What changed in Git meanwhile shows now, not a poll later.
+                self.request_metadata();
+                return Ok(true);
+            }
+            // Drawn once more, so that the tab bar settles into its still frame.
+            Event::Input(crossterm::event::Event::FocusLost) => {
+                self.window_focused = false;
+                return Ok(true);
+            }
+            _ => {}
+        }
         if self.alert.is_some() {
             match &event {
                 Event::Input(crossterm::event::Event::Key(key))
@@ -3807,6 +3853,8 @@ impl TerminalGuard {
             EnterAlternateScreen,
             EnableBracketedPaste,
             EnableMouseCapture,
+            // Focus reports let a window without focus draw and poll less: `App::window_focused`.
+            EnableFocusChange,
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )?;
         if use_kitty {
@@ -3826,6 +3874,8 @@ impl TerminalGuard {
         let _ = execute!(
             io::stdout(),
             PopKeyboardEnhancementFlags,
+            // Left on, every focus change would type `^[[I` or `^[[O` into the shell.
+            DisableFocusChange,
             DisableMouseCapture,
             DisableBracketedPaste,
             LeaveAlternateScreen,
@@ -3932,6 +3982,10 @@ fn draw_frame(
     Ok(())
 }
 
+/// The chooser shown at startup when nothing reopens. `window_focused` follows the focus reports
+/// that arrive while it shows, so that the workspace it opens knows whether anyone is looking.
+// Each parameter is one thing the chooser needs; a parameter struct would only move the list.
+#[expect(clippy::too_many_arguments)]
 fn choose_project(
     terminal: &mut Terminal<CrosstermBackend<FrameWriter>>,
     output: &FrameWriter,
@@ -3940,6 +3994,7 @@ fn choose_project(
     path: &Path,
     startup_error: Option<&str>,
     use_kitty: bool,
+    window_focused: &mut bool,
 ) -> Result<Option<(Project, bool, bool)>> {
     let launch_path = std::env::current_dir().context("the current folder no longer exists")?;
     let base = if path.is_dir() {
@@ -4005,6 +4060,15 @@ fn choose_project(
                 picker.paste(&text);
             }
             Event::Input(crossterm::event::Event::Resize(..)) => {}
+            // Nothing in the chooser moves, so a focus change draws nothing.
+            Event::Input(crossterm::event::Event::FocusGained) => {
+                *window_focused = true;
+                redraw = false;
+            }
+            Event::Input(crossterm::event::Event::FocusLost) => {
+                *window_focused = false;
+                redraw = false;
+            }
             Event::Projects { request, projects } if picker.request == request => {
                 picker.set_projects(projects);
             }
@@ -4229,6 +4293,27 @@ fn check_resume(
     Ok(())
 }
 
+/// Frames that come within this long of the one before count as streaming: see `frame_interval`.
+const STREAMING_GAP: Duration = Duration::from_millis(100);
+
+/// How long after the last frame the next one may go out. Frames go out at least 16 ms apart,
+/// so that what is typed shows at once. While app output keeps them coming, each within
+/// `STREAMING_GAP` of the one before (`streaming`), they go out at least 33 ms apart: still
+/// smooth, for half the drawing, in crit and in the outer terminal. Typing keeps the quick pace
+/// for `STREAMING_GAP` after each key (`since_typed`): fast typing and key repeat draw frames
+/// that close together too, and an echo must not wait out the slow pace. A window without focus,
+/// as behind a game, takes no typing and is watched little: it is drawn at most every 100 ms,
+/// which still shows output as it comes, with a third of the frames.
+fn frame_interval(window_focused: bool, streaming: bool, since_typed: Duration) -> Duration {
+    if !window_focused {
+        Duration::from_millis(100)
+    } else if streaming && since_typed >= STREAMING_GAP {
+        Duration::from_millis(33)
+    } else {
+        Duration::from_millis(16)
+    }
+}
+
 pub fn run(
     path: &Path,
     agent: &str,
@@ -4373,6 +4458,9 @@ pub fn run(
         warnings.push(format!("{}\n{summary}", skipped.join("\n")));
     }
     let was_restored = restored.is_some();
+    // Crit starts out as if focused; the chooser, when it shows, follows the focus reports that
+    // come meanwhile.
+    let mut window_focused = true;
     let (project, saved_projects, native_keys, start_shell) =
         if let Some((project, saved)) = restored {
             (
@@ -4399,6 +4487,7 @@ pub fn run(
                         path,
                         (!shown.is_empty()).then_some(shown.as_str()),
                         use_kitty,
+                        &mut window_focused,
                     );
                     warnings.clear();
                     selected
@@ -4437,6 +4526,7 @@ pub fn run(
         worktree_hits: Vec::new(),
         worktree_area: None,
         interaction_visible: true,
+        window_focused,
         should_quit: false,
         default_agent: agent.into(),
         next_session,
@@ -4489,35 +4579,20 @@ pub fn run(
     if !warnings.is_empty() {
         app.show_alert("Startup", warnings.join("\n"));
     }
-    // Frames go out at least 16 ms apart, so that what is typed shows at once. While app output
-    // keeps them coming, each within 100 ms of the one before, they go out at least 33 ms
-    // apart: still smooth, for half the drawing, in crit and in the outer terminal. Typing keeps
-    // the quick pace for 100 ms after each key: fast typing and key repeat draw frames that close
-    // together too, and an echo must not wait out the slow pace.
-    let quick_interval = Duration::from_millis(16);
-    let streaming_interval = Duration::from_millis(33);
-    let streaming_gap = Duration::from_millis(100);
-    let frame_interval = |streaming: bool, last_typed: Instant| {
-        if streaming && last_typed.elapsed() >= streaming_gap {
-            streaming_interval
-        } else {
-            quick_interval
-        }
-    };
     // The longest a frame stays held while panes keep repainting: a window drag resizes
     // them with every pointer move, and an app can stream output after a resize. Either
     // would otherwise freeze the screen until the resize is forgotten.
     let max_hold = Duration::from_millis(120);
     // As if the last frame and keystroke were a quiet spell ago.
-    let mut last_draw = Instant::now() - streaming_gap;
+    let mut last_draw = Instant::now() - STREAMING_GAP;
     let mut last_typed = last_draw;
-    // Whether the last frame came within `streaming_gap` of the one before it.
+    // Whether the last frame came within `STREAMING_GAP` of the one before it.
     let mut streaming = false;
     let mut held_since: Option<Instant> = None;
     let mut redraw = true;
     // How long after `last_draw` the tab bar's animations (spinners, a blinking decision
-    // mark, a scrolling label) next change; `None` while nothing on it moves, so an idle
-    // window draws nothing.
+    // mark, a scrolling label) next change; `None` while nothing on it moves, as in a window
+    // without focus, so an idle window draws nothing.
     let mut tick: Option<Duration> = None;
     while !app.should_quit {
         app.refresh_metadata();
@@ -4530,7 +4605,10 @@ pub fn run(
         if tick.is_some_and(|tick| last_draw.elapsed() >= tick) {
             redraw = true;
         }
-        if redraw && last_draw.elapsed() >= frame_interval(streaming, last_typed) {
+        if redraw
+            && last_draw.elapsed()
+                >= frame_interval(app.window_focused, streaming, last_typed.elapsed())
+        {
             // Sized before the hold is checked: the resize is what makes an app repaint, and
             // a frame drawn before that would show the pane's old content cut to its new size.
             let size = window_size()?;
@@ -4542,7 +4620,7 @@ pub fn run(
                 })?;
                 redraw = false;
                 let now = Instant::now();
-                streaming = now.duration_since(last_draw) < streaming_gap;
+                streaming = now.duration_since(last_draw) < STREAMING_GAP;
                 last_draw = now;
                 held_since = None;
             } else if held_since.is_none() {
@@ -4551,12 +4629,15 @@ pub fn run(
         }
         redraw |= app.checkpoint(&mut store);
         let event = if redraw {
-            // A frame held for an app's update or repaint is retried every few ms, so that it
-            // goes out right after the app is done, or once the hold runs out.
-            let wait = if app.frame_held() {
+            // A frame is tried when it is due, then every few ms while an app's update or repaint
+            // holds it, so that it goes out right after the app is done, or once the hold runs
+            // out. Tries before it is due could not draw it.
+            let due = frame_interval(app.window_focused, streaming, last_typed.elapsed())
+                .saturating_sub(last_draw.elapsed());
+            let wait = if due.is_zero() && app.frame_held() {
                 Duration::from_millis(4)
             } else {
-                frame_interval(streaming, last_typed).saturating_sub(last_draw.elapsed())
+                due
             };
             match rx.recv_timeout(wait) {
                 Ok(event) => Some(event),
@@ -4564,10 +4645,11 @@ pub fn run(
                 Err(_) => break,
             }
         } else {
-            // Up to the next animation frame, else the metadata poll.
-            let wait = tick.map_or(App::METADATA_INTERVAL, |tick| {
-                tick.saturating_sub(last_draw.elapsed())
-                    .min(App::METADATA_INTERVAL)
+            // Up to the next animation frame, else the metadata poll, which is ten times as far
+            // apart while the window has no focus.
+            let poll = app.metadata_interval();
+            let wait = tick.map_or(poll, |tick| {
+                tick.saturating_sub(last_draw.elapsed()).min(poll)
             });
             match rx.recv_timeout(wait) {
                 Ok(event) => Some(event),
@@ -4697,6 +4779,32 @@ mod tests {
             assert!(app.project.secondary.is_none());
             assert!(app.project.secondary_session.is_none());
         }
+    }
+
+    #[test]
+    fn a_window_without_focus_draws_at_most_ten_frames_a_second() {
+        for streaming in [false, true] {
+            for since_typed in [Duration::ZERO, STREAMING_GAP] {
+                assert_eq!(
+                    frame_interval(false, streaming, since_typed),
+                    Duration::from_millis(100)
+                );
+            }
+        }
+        // With focus the pace is as it was: quick after a pause or a key, smooth while output
+        // streams.
+        assert_eq!(
+            frame_interval(true, false, STREAMING_GAP),
+            Duration::from_millis(16)
+        );
+        assert_eq!(
+            frame_interval(true, true, Duration::ZERO),
+            Duration::from_millis(16)
+        );
+        assert_eq!(
+            frame_interval(true, true, STREAMING_GAP),
+            Duration::from_millis(33)
+        );
     }
 
     #[test]
@@ -5154,6 +5262,26 @@ mod tests {
             queued.try_recv().unwrap(),
             Job::RefreshMetadata(_)
         ));
+    }
+
+    #[test]
+    fn git_polls_slow_down_without_focus_and_catch_up_when_it_returns() {
+        let (mut app, queued, _events) = interaction_app();
+        assert_eq!(app.metadata_interval(), Duration::from_secs(1));
+        assert!(app.handle(focus_event(false)).unwrap());
+        assert_eq!(app.metadata_interval(), Duration::from_secs(10));
+        // A poll two seconds old is due in a focused window, not in one without focus.
+        app.metadata_checked = Instant::now() - Duration::from_secs(2);
+        app.refresh_metadata();
+        assert!(queued.try_recv().is_err());
+        app.metadata_checked = Instant::now() - App::UNFOCUSED_METADATA_INTERVAL;
+        app.refresh_metadata();
+        assert!(matches!(queued.try_recv(), Ok(Job::RefreshMetadata(_))));
+        assert!(!app.handle(Event::Metadata(Vec::new())).unwrap());
+        // Focus coming back polls at once, though the last poll has only just ended.
+        assert!(app.handle(focus_event(true)).unwrap());
+        assert!(matches!(queued.try_recv(), Ok(Job::RefreshMetadata(_))));
+        assert_eq!(app.metadata_interval(), Duration::from_secs(1));
     }
 
     #[test]
@@ -5947,6 +6075,59 @@ mod tests {
                 assert!(app.selection.is_none());
             }
         }
+    }
+
+    #[test]
+    fn focus_reports_stay_with_crit_and_leave_the_screen_as_it_is() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        let session = sleeping_session(&app, directory.path(), 1);
+        let parser = session.parser.clone();
+        // History to scroll back through.
+        parser.lock().process("line\r\n".repeat(30).as_bytes());
+        app.project.workspaces[0].sessions.push(session);
+        let body = Rect::new(0, 1, 40, 10);
+        for native_keys in [false, true] {
+            for alert in [false, true] {
+                // Below the minimum size, as behind an alert, other input is held back.
+                for visible in [true, false] {
+                    app.native_keys = native_keys;
+                    app.interaction_visible = visible;
+                    if alert {
+                        app.show_error("still here");
+                    }
+                    app.selection = Some(Selection::new(1, body, parser.lock().screen(), 0, 1));
+                    app.scroll_drag = Some((1, 0));
+                    app.split_drag = Some(0);
+                    app.mouse_capture = Some((1, body));
+                    app.project.workspaces[0].sessions[0].scroll_to(5);
+                    // Losing focus draws once more, for the tab bar to hold still; regaining it
+                    // draws at once.
+                    assert!(app.handle(focus_event(false)).unwrap());
+                    assert!(!app.window_focused);
+                    assert!(app.handle(focus_event(true)).unwrap());
+                    assert!(app.window_focused);
+                    assert_eq!(app.alert.is_some(), alert);
+                    assert!(app.selection.is_some());
+                    assert!(app.scroll_drag.is_some() && app.split_drag.is_some());
+                    assert!(app.mouse_capture.is_some());
+                    assert_eq!(parser.lock().screen().scrollback(), 5);
+                    app.alert = None;
+                }
+            }
+        }
+        // None of it reached the program: its terminal echoes what it is sent, and the first
+        // thing it echoes is a key typed after the focus changes.
+        app.native_keys = false;
+        app.interaction_visible = true;
+        app.handle(key_event(KeyCode::Char('x'))).unwrap();
+        let echoed = || parser.lock().screen().rows(0, 40).last().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while echoed().is_empty() {
+            assert!(Instant::now() < deadline, "the key was never echoed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(echoed(), "x");
     }
 
     #[test]
@@ -7174,6 +7355,15 @@ mod tests {
         ))
     }
 
+    /// The outer terminal's report that its window gained or lost focus.
+    fn focus_event(gained: bool) -> Event {
+        Event::Input(if gained {
+            crossterm::event::Event::FocusGained
+        } else {
+            crossterm::event::Event::FocusLost
+        })
+    }
+
     /// A live pane running `/bin/sleep`.
     fn sleeping_session(app: &App, directory: &Path, id: u64) -> Session {
         Session::spawn(
@@ -7309,6 +7499,7 @@ mod tests {
             worktree_hits: Vec::new(),
             worktree_area: None,
             interaction_visible: true,
+            window_focused: true,
             should_quit: false,
             default_agent: "shell".into(),
             next_session: 1,
@@ -8258,6 +8449,7 @@ mod tests {
             worktree_hits: Vec::new(),
             worktree_area: None,
             interaction_visible: true,
+            window_focused: true,
             should_quit: false,
             default_agent: "shell".into(),
             next_session: 1,
@@ -8309,6 +8501,7 @@ mod tests {
             worktree_hits: Vec::new(),
             worktree_area: None,
             interaction_visible: true,
+            window_focused: true,
             should_quit: false,
             default_agent: "omp".into(),
             next_session: 1,
@@ -8482,6 +8675,44 @@ mod tests {
     }
 
     #[test]
+    fn a_tab_bar_without_focus_holds_still() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _queued, _events) = interaction_app();
+        // A working agent, and one waiting for a decision behind a label too long to fit.
+        for (workspace, id, state) in [(0, 1, AgentState::Working), (1, 2, AgentState::Blocked)] {
+            let mut session = sleeping_session(&app, directory.path(), id);
+            session.state = state;
+            app.project.workspaces[workspace].sessions.push(session);
+        }
+        app.project.workspaces[1].tree.branch = "fix-juror-ranker-silent-fallback".into();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 24)).unwrap();
+        let mut draw = |app: &mut App| {
+            let mut tick = None;
+            terminal
+                .draw(|frame| {
+                    tick = ui::draw(frame, app);
+                })
+                .unwrap();
+            (screen_row(&terminal, 0), tick)
+        };
+        // With focus, the marks and the label ask for frames of their own.
+        assert!(draw(&mut app).1.is_some());
+        assert!(app.handle(focus_event(false)).unwrap());
+        let (still, tick) = draw(&mut app);
+        assert_eq!(tick, None);
+        // Spinner steps later, the bar is unchanged: each animation at its first frame.
+        std::thread::sleep(Duration::from_millis(300));
+        let (later, tick) = draw(&mut app);
+        assert_eq!(tick, None);
+        assert_eq!(later, still);
+        assert!(still.contains(" main ⠋ "), "{still:?}");
+        assert!(still.contains(" fix-juror-ranker-s ◆ "), "{still:?}");
+        // Focus brings the animations back.
+        assert!(app.handle(focus_event(true)).unwrap());
+        assert!(draw(&mut app).1.is_some());
+    }
+
+    #[test]
     fn tab_bar_lists_every_open_project_in_opening_order_and_tabs_wrap_across_them() {
         let (tx, _events) = mpsc::sync_channel(8);
         let (jobs, queued) = mpsc::sync_channel(8);
@@ -8531,6 +8762,7 @@ mod tests {
             worktree_hits: Vec::new(),
             worktree_area: None,
             interaction_visible: true,
+            window_focused: true,
             should_quit: false,
             default_agent: "shell".into(),
             next_session: 1,
@@ -8718,6 +8950,7 @@ mod tests {
             worktree_hits: Vec::new(),
             worktree_area: None,
             interaction_visible: true,
+            window_focused: true,
             should_quit: false,
             default_agent: "shell".into(),
             next_session: 1,

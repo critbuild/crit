@@ -109,6 +109,12 @@ APPEARANCE
   After a pane changes size, Crit waits for the app's repaint before drawing
   it, so a resize never shows cut-off lines; apps that do not repaint are
   drawn after a short pause.
+  While the Crit window does not have focus (you are in a game or another
+  window), its tab bar holds still: spinners, the blinking ◆ and scrolling
+  labels show one still frame. Pane output is drawn at most 10 times a second,
+  and Git branches and worktrees are checked every 10 seconds instead of every
+  second. Focusing the window brings all of it back at once, with a fresh Git
+  check. Terminals that do not report focus always count as focused.
 
 COPY, PASTE, AND LINKS
   Drag terminal text to select it and copy to the clipboard and primary selection.
@@ -140,13 +146,28 @@ AGENT CPU
   killed: it is throttled and reclaimed, its pages swapped out first, though
   systemd-oomd may still kill it when swap runs out. F3 toggles silently;
   the lower priority below never limits memory.
+  While limited, the scope also keeps the agents off the machine's best
+  cores (AllowedCPUs): they get its least-preferred physical cores, both
+  threads of each, as few as cover the share; at 50% of an 8-core, 16-thread
+  CPU, the 4 cores it ranks lowest. The ranking is AMD's preferred-core
+  ranking, else ACPI CPPC's highest performance, else the CPU capacity the
+  kernel reports; Intel's E-cores rank below all others, and of equal cores
+  the highest-numbered go first, so that CPU 0 stays free. The agents'
+  threads also run as SCHED_BATCH, so they never preempt a game's threads
+  when they wake up, and agents started while limited get a 1 ms timer slack,
+  which lets the kernel batch their timer wake-ups. F3 moves running agents'
+  cores and class live; their timer slack stays as it was when they started,
+  since changing another process's takes CAP_SYS_NICE. A user manager that
+  cannot hand out the cpuset controller leaves the agents on every core.
+  Threads that another tool put in SCHED_IDLE or a real-time class stay there.
   An agent that cannot join the scope still starts, unlimited, and an error
   dialog says so. Docker containers run under the Docker daemon, outside the limit.
   Without cgroup v2, a systemd user session, busctl, or a user
   manager that can limit CPU, agents run at a lower priority (nice 10) while
-  the limit is on instead, the key hint shows LOW, and a startup warning says why. No
-  process can raise that priority again, so turning the limit off then
-  applies only to agents started afterwards.
+  the limit is on instead, those started while it is on as SCHED_BATCH with
+  the 1 ms timer slack too; the key hint shows LOW, and a startup warning
+  says why. No process can raise that priority again, so turning the limit
+  off then applies only to agents started afterwards.
 
 SCRATCH SPACE
   Agents leave scratch behind: clones, virtualenvs, builds, downloads. In a
@@ -180,6 +201,28 @@ SCRATCH SPACE
   sandbox, scratch stays in the default temp folder, and a warning says why
   when that is in RAM.
 
+AGENT RUNTIME
+  OMP and OpenCode run on Bun, whose garbage collector keeps waking the CPU
+  while an agent works, and even while it waits on a command. So their panes
+  get BUN_GC_TIMER_INTERVAL=10000: the collections Bun forces while memory
+  changes come every 10 seconds instead of every second, and JavaScriptCore
+  still collects as memory fills. They also get BUN_JSC_numberOfGCMarkers=2:
+  collections mark on two threads instead of up to one per core. Bun refuses
+  to start with a BUN_JSC_ option its JavaScriptCore does not know, and those
+  options change between releases, so Crit passes this one only to an agent
+  whose executable, found in Crit's PATH, ships it. Everything an agent runs,
+  such as bun test, inherits both.
+  OMP panes also get PI_CONFIG_FILES naming Crit's settings overlay,
+  omp-overlay.yml in $XDG_DATA_HOME/crit/integrations (default
+  ~/.local/share/crit/integrations). It turns off tui.titleState,
+  terminal.showProgress and terminal.programStatus: the spinner OMP animates
+  in the terminal title while it works, its OSC 9;4 progress and its OSC 7501
+  status, none of which Crit shows. Overlays of your own in PI_CONFIG_FILES
+  come after Crit's, so yours win.
+  A BUN_GC_TIMER_INTERVAL or BUN_JSC_numberOfGCMarkers already set in Crit's
+  environment wins: the panes inherit it as it is. Shell panes get none of
+  these.
+
 UPDATES
   At most once a day, Crit runs omp update and opencode upgrade together, in
   the background while the workspace opens. Only the window that owns the
@@ -190,7 +233,11 @@ UPDATES
   an update fails, Crit shows an error dialog and keeps using the
   installed version. A tool that is not installed is not a failure. An update
   that finishes during a session applies to panes started afterwards and to
-  the next launch. Quitting Crit leaves an update still running to finish.
+  the next launch. Quitting Crit leaves an update still running to finish,
+  but every update has 10 minutes, even after Crit quits: one still running
+  then is stopped with everything it started (and killed 30 seconds later
+  if it keeps running), and a running Crit reports that it timed out. The
+  limit needs coreutils timeout; without it, updates are not limited.
 
 PROJECTS
   Run crit from any folder, including a Git checkout, to choose New terminal

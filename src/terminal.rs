@@ -166,10 +166,16 @@ impl Session {
         // cannot leave a started child behind.
         let writer = pair.master.take_writer()?;
         let mut reader = pair.master.try_clone_reader()?;
-        let mut child = pair
-            .slave
-            .spawn_command(builder)
-            .with_context(|| format!("launching {program} in {}", cwd.display()))?;
+        let spawned = {
+            // An agent started while the limit is on takes the batch class and the coarse timer
+            // slack from this thread, which has them only while the child is created.
+            let _batch = limiter
+                .zip(gate.as_ref())
+                .and_then(|(limiter, gate)| limiter.batch(gate));
+            pair.slave.spawn_command(builder)
+        };
+        let mut child =
+            spawned.with_context(|| format!("launching {program} in {}", cwd.display()))?;
         drop(pair.slave);
         let pid = child.process_id();
         let killer = child.clone_killer();
@@ -877,6 +883,7 @@ impl vt100::Callbacks for Responses {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::limits;
 
     fn response_parser() -> (Parser, Receiver<Input>) {
         let (input, queue) = std::sync::mpsc::sync_channel(INPUT_QUEUE);
@@ -1413,19 +1420,98 @@ mod tests {
         assert_eq!(session.parser.lock().screen().size(), (2, 2));
     }
 
+    /// The scheduling class of thread `tid`, or of the calling thread for 0, without the flag
+    /// that resets it in children; `None` for a thread that is gone.
+    fn class(tid: libc::pid_t) -> Option<libc::c_int> {
+        let policy = unsafe { libc::sched_getscheduler(tid) };
+        (policy >= 0).then_some(policy & !libc::SCHED_RESET_ON_FORK)
+    }
+
+    #[test]
+    fn agents_started_while_limited_take_the_batch_class_and_slack_but_shells_never() {
+        // On a thread of its own in the normal class with the default timer slack, which it
+        // hands down to the panes it starts.
+        std::thread::spawn(|| {
+            // The tests may run in the batch class, which any thread may leave.
+            let policy = unsafe { libc::sched_getscheduler(0) };
+            if class(0) == Some(libc::SCHED_BATCH) {
+                let normal = libc::SCHED_OTHER | (policy & libc::SCHED_RESET_ON_FORK);
+                let parameters = libc::sched_param { sched_priority: 0 };
+                unsafe { libc::sched_setscheduler(0, normal, &parameters) };
+            }
+            let (slack, unused): (libc::c_ulong, libc::c_ulong) = (50_000, 0);
+            unsafe { libc::prctl(libc::PR_SET_TIMERSLACK, slack, unused, unused, unused) };
+            if class(0) != Some(libc::SCHED_OTHER) {
+                eprintln!("skipped: this thread cannot take the normal scheduling class");
+                return;
+            }
+            // A limit without a scope never calls systemd; agents start the same with one.
+            let limiter = Limiter::off();
+            limiter.set_limited(true);
+            let (tx, _events) = std::sync::mpsc::sync_channel(32);
+            let script =
+                "read slack < /proc/self/timerslack_ns; echo \"slack $slack\"; exec sleep 30";
+            let spawn = |kind: &str| {
+                Session::spawn(
+                    1,
+                    kind,
+                    None,
+                    Path::new("/"),
+                    Path::new("/unused.sock"),
+                    tx.clone(),
+                    24,
+                    80,
+                    Some(("/bin/sh".into(), vec!["-c".into(), script.into()])),
+                    Some(&limiter),
+                    None,
+                )
+                .unwrap()
+            };
+            let agent = spawn("omp");
+            let shell = spawn("shell");
+            limiter.set_limited(false);
+            let unlimited = spawn("opencode");
+            // The thread has its own class back.
+            assert_eq!(class(0), Some(libc::SCHED_OTHER));
+            for (session, expected, slack) in [
+                (&agent, libc::SCHED_BATCH, "slack 1000000"),
+                (&shell, libc::SCHED_OTHER, "slack 50000"),
+                (&unlimited, libc::SCHED_OTHER, "slack 50000"),
+            ] {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !session.parser.lock().screen().contents().contains("slack ") {
+                    assert!(
+                        Instant::now() < deadline,
+                        "{} reported no slack",
+                        session.kind
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let contents = session.parser.lock().screen().contents();
+                assert!(contents.contains(slack), "{}: {contents:?}", session.kind);
+                let pid = session.pid.unwrap() as libc::pid_t;
+                assert_eq!(class(pid), Some(expected), "{}", session.kind);
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
     /// The memory that `limited_pane`'s limit takes its share of: whole pages, which the kernel
     /// keeps as they are, and far more than the panes' busy loops use.
     const PANE_MEMORY: u64 = 4 << 30;
 
     /// An OMP pane that runs `script` under a limit of `percent` of one CPU and of
-    /// `PANE_MEMORY`, with the cgroup of the scope it runs in; `None` where no systemd user
-    /// scope can hold agents.
+    /// `PANE_MEMORY`, on the cores that a limit of half the machine would leave the agents,
+    /// with the cgroup of the scope it runs in; `None` where no systemd user scope can hold
+    /// agents.
     fn limited_pane(
         directory: &Path,
         percent: u8,
         script: &str,
     ) -> Option<(Limiter, Session, std::path::PathBuf)> {
-        let limiter = Limiter::with_cores(directory, percent, 1, PANE_MEMORY, true);
+        let cpus = limits::agent_cpus(Path::new("/sys"), 50);
+        let limiter = Limiter::with_cores(directory, percent, 1, cpus, PANE_MEMORY, true);
         let unit = match limiter.unit() {
             Ok(unit) => unit.to_owned(),
             Err(reason) => {
@@ -1435,6 +1521,12 @@ mod tests {
         };
         if limiter.memory_high().is_none() {
             eprintln!("memory not checked: the systemd user manager cannot limit memory here");
+        }
+        if limiter.cpus().is_none() {
+            eprintln!("CPUs not checked: the scope cannot hold the agents to some CPUs here");
+        }
+        if !matches!(class(0), Some(libc::SCHED_OTHER | libc::SCHED_BATCH)) {
+            eprintln!("class not checked: the tests run in a class that agents would inherit");
         }
         let (tx, events) = std::sync::mpsc::sync_channel(32);
         let session = Session::spawn(
@@ -1507,6 +1599,51 @@ mod tests {
         }
     }
 
+    /// The scheduling class and the CPUs of every thread in `cgroup`, leaving out any that
+    /// ends meanwhile.
+    fn placement(cgroup: &Path) -> Vec<(libc::c_int, Vec<u32>)> {
+        let tids = std::fs::read_to_string(cgroup.join("cgroup.threads")).unwrap();
+        tids.lines()
+            .filter_map(|tid| {
+                let status = std::fs::read_to_string(format!("/proc/{tid}/status")).ok()?;
+                let cpus = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))?;
+                Some((class(tid.parse().ok()?)?, limits::cpu_list(cpus).unwrap()))
+            })
+            .collect()
+    }
+
+    /// Asserts that the agents' threads in `cgroup` run as `limiter` holds them while it is
+    /// `limited`: in the batch class and on its CPUs, or else in the normal class on more
+    /// CPUs. A class that the tests' own thread could not hand down, such as the idle one, is
+    /// not checked, nor are the CPUs where the scope holds the agents to none.
+    fn assert_placed(cgroup: &Path, limiter: &Limiter, limited: bool) {
+        let classed = matches!(class(0), Some(libc::SCHED_OTHER | libc::SCHED_BATCH));
+        let expected = if limited {
+            libc::SCHED_BATCH
+        } else {
+            libc::SCHED_OTHER
+        };
+        let threads = placement(cgroup);
+        assert!(!threads.is_empty(), "no thread runs in the scope");
+        for (class, cpus) in threads {
+            if classed {
+                assert_eq!(class, expected, "limited: {limited}");
+            }
+            if let Some(chosen) = limiter.cpus() {
+                if limited {
+                    assert_eq!(cpus, chosen);
+                } else {
+                    assert!(
+                        cpus.len() > chosen.len() && chosen.iter().all(|cpu| cpus.contains(cpu)),
+                        "lifted, the agents still run on {cpus:?}"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn agent_panes_run_in_their_scope_at_its_shares() {
         let directory = tempfile::Builder::new()
@@ -1529,8 +1666,10 @@ mod tests {
         if limiter.memory_high().is_some() {
             assert_eq!(read("memory.high"), format!("{PANE_MEMORY}\n"));
         }
-        // What the agent starts runs in its scope too: the shell, both loops and `sleep`.
+        // What the agent starts runs in its scope too: the shell, both loops and `sleep`, in the
+        // batch class and on the scope's cores.
         wait_for_processes(&cgroup, 4);
+        assert_placed(&cgroup, &limiter, true);
         // Two busy processes would keep two CPUs busy; the quota holds them to one. Other
         // apps that contend for the CPUs can leave them less.
         let rate = cpu_rate(&cgroup, Duration::from_secs(2));
@@ -1554,6 +1693,7 @@ mod tests {
         let read = |name| std::fs::read_to_string(cgroup.join(name)).unwrap();
         let memory = limiter.memory_high().is_some();
         wait_for_processes(&cgroup, 4);
+        assert_placed(&cgroup, &limiter, true);
         // Over a window the rate strays a little from the quota, either way.
         let window = Duration::from_secs(2);
         assert_eq!(read("cpu.max"), "100000 100000\n");
@@ -1570,6 +1710,8 @@ mod tests {
         if memory {
             assert_eq!(read("memory.high"), "max\n");
         }
+        // The agents' threads go back to the normal class and to every core, and return.
+        assert_placed(&cgroup, &limiter, false);
         limiter.set_limited(true);
         limiter.retune().unwrap();
         assert_eq!(
@@ -1579,6 +1721,7 @@ mod tests {
         if memory {
             assert_eq!(read("memory.high"), format!("{PANE_MEMORY}\n"));
         }
+        assert_placed(&cgroup, &limiter, true);
         // The scheduler lets the agents overrun the quota for a moment as it returns, and
         // takes that time back right after.
         std::thread::sleep(Duration::from_secs(1));

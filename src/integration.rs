@@ -5,9 +5,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
+use std::ffi::{CString, OsStr, OsString};
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -88,7 +90,11 @@ pub fn start(tx: SyncSender<crate::event::Event>) -> Result<IntegrationServer> {
     start_in(tx, &bases)
 }
 
-/// Serve from the first base, in order, that can hold the private directory.
+/// The longest path a Unix socket can be bound at: `sun_path` holds 108 bytes, the last of
+/// them the closing NUL.
+const SOCKET_PATH_MAX: usize = 107;
+
+/// Serve from the first base, in order, that can hold the private directory and its socket.
 fn start_in(tx: SyncSender<crate::event::Event>, bases: &[PathBuf]) -> Result<IntegrationServer> {
     let mut random = [0u8; 8];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
@@ -100,6 +106,19 @@ fn start_in(tx: SyncSender<crate::event::Event>, bases: &[PathBuf]) -> Result<In
     let mut created = None;
     for (index, base) in bases.iter().enumerate() {
         let directory = base.join(&name);
+        let last = index + 1 == bases.len();
+        // A base so deep that the socket's path would not fit could hold the directory, but
+        // binding there would end Crit: the next base may be shorter.
+        let socket = directory.join("agent.sock");
+        if socket.as_os_str().len() > SOCKET_PATH_MAX {
+            if last {
+                bail!(
+                    "the integration socket {} is longer than a Unix socket path can be ({SOCKET_PATH_MAX} bytes)",
+                    socket.display()
+                );
+            }
+            continue;
+        }
         match DirBuilder::new().mode(0o700).create(&directory) {
             Ok(()) => {
                 created = Some(directory);
@@ -107,7 +126,7 @@ fn start_in(tx: SyncSender<crate::event::Event>, bases: &[PathBuf]) -> Result<In
             }
             Err(error) => {
                 // An existing name is not ours; any other failure moves on to the next base.
-                if error.kind() == std::io::ErrorKind::AlreadyExists || index + 1 == bases.len() {
+                if error.kind() == std::io::ErrorKind::AlreadyExists || last {
                     return Err(error).with_context(|| {
                         format!(
                             "creating private integration directory {}",
@@ -485,6 +504,8 @@ fn launch(
             Some(Resume::Continue) => args.push("--continue".into()),
             None => {}
         }
+        // Written before `PI_CONFIG_FILES` names it: OMP refuses to start without the file.
+        managed_write(&directory.join(OMP_OVERLAY_FILE), OMP_OVERLAY.as_bytes())?;
     } else {
         match resume {
             Some(Resume::Chat(identity)) => args.extend(["--session".into(), identity.into()]),
@@ -540,7 +561,174 @@ fn launch(
                 .into(),
         ));
     }
+    env.extend(runtime_env(
+        kind,
+        directory,
+        |name| std::env::var_os(name),
+        gc_markers_supported,
+    ));
     Ok((kind.into(), args, env))
+}
+
+/// The settings overlay that OMP panes get through `PI_CONFIG_FILES`, in the assets directory.
+const OMP_OVERLAY_FILE: &str = "omp-overlay.yml";
+/// Turns off what OMP sends that Crit's panes never show: the run-state spinner it animates in
+/// the terminal title while it works, OSC 9;4 progress, and OSC 7501 program status (Crit
+/// learns an agent's state from its own extension).
+const OMP_OVERLAY: &str = "\
+# Crit's OMP panes read this through PI_CONFIG_FILES: Crit never shows the terminal
+# title, OSC 9;4 progress or OSC 7501 status, so OMP need not send them.
+tui:
+  titleState: false
+terminal:
+  showProgress: false
+  programStatus: false
+";
+/// Bun forces a garbage collection every `BUN_GC_TIMER_INTERVAL` ms (1000 by default) while
+/// the heap changes. JavaScriptCore's own timers still collect as memory fills.
+const GC_TIMER: (&str, &str) = ("BUN_GC_TIMER_INTERVAL", "10000");
+/// JavaScriptCore marks the heap on a thread per core, up to a cap, and those `HeapHelper`
+/// threads wake more often than any other thread of a working agent.
+const GC_MARKERS: (&str, &str) = ("BUN_JSC_numberOfGCMarkers", "2");
+/// How an executable holds the `GC_MARKERS` option's name: JavaScriptCore's option table keeps
+/// each name as a C string.
+const GC_MARKERS_NAME: &[u8] = b"\0JSC_numberOfGCMarkers\0";
+/// Bytes `contains` reads at a time.
+const SCAN_CHUNK: usize = 256 * 1024;
+
+/// What agent pane `kind` adds to its environment so that its runtime wakes the CPU less: a
+/// longer Bun GC timer and fewer GC markers (an idle OMP woke 195 times a second; 33 with the
+/// timer alone, 40 with the markers alone, 15 with both), and for OMP the overlay in
+/// `directory` that turns off output Crit never shows. `inherited` looks a variable up in
+/// Crit's own environment: a value set there is the user's, which the pane inherits as it is,
+/// and overlays listed there stay after Crit's so that they win. `ships_gc_markers` says
+/// whether the executable `kind` names knows the marker option; it is only asked when the
+/// option would be added.
+fn runtime_env(
+    kind: &str,
+    directory: &Path,
+    inherited: impl Fn(&str) -> Option<OsString>,
+    ships_gc_markers: impl FnOnce(&str) -> bool,
+) -> Vec<(String, String)> {
+    let mut env = Vec::new();
+    if inherited(GC_TIMER.0).is_none() {
+        env.push((GC_TIMER.0.to_owned(), GC_TIMER.1.to_owned()));
+    }
+    // Bun exits at startup ("invalid JSC environment variable") on a `BUN_JSC_` option its
+    // JavaScriptCore does not know, and the options change between releases, so only an
+    // executable that ships this one gets it. Everything the agent starts inherits it too, a
+    // `bun test` say, which exits the same way if its own Bun lacks the option.
+    if inherited(GC_MARKERS.0).is_none() && ships_gc_markers(kind) {
+        env.push((GC_MARKERS.0.to_owned(), GC_MARKERS.1.to_owned()));
+    }
+    if kind == "omp" {
+        // OMP applies the overlays in `PI_CONFIG_FILES` in order, each over those before. A
+        // path with the list's `:` in it would split into files that do not exist, which OMP
+        // refuses to start with, and a list that is not UTF-8 cannot be extended.
+        let overlay = directory.join(OMP_OVERLAY_FILE);
+        if let Some(overlay) = overlay.to_str().filter(|path| !path.contains(':')) {
+            let files = match inherited("PI_CONFIG_FILES") {
+                Some(theirs) if !theirs.is_empty() => theirs
+                    .into_string()
+                    .ok()
+                    .map(|theirs| format!("{overlay}:{theirs}")),
+                _ => Some(overlay.to_owned()),
+            };
+            env.extend(files.map(|files| ("PI_CONFIG_FILES".to_owned(), files)));
+        }
+    }
+    env
+}
+
+/// Whether the `program` a pane spawns, found in Crit's `PATH`, ships the GC-marker option.
+fn gc_markers_supported(program: &str) -> bool {
+    std::env::var_os("PATH")
+        .and_then(|path| find_in_path(program, &path))
+        .is_some_and(|executable| knows_gc_markers(&executable))
+}
+
+/// The file a pane's spawn runs for `program`: the first executable of that name in the folders
+/// of `path`. `None` without one, and when a relative folder comes first: the spawn resolves
+/// that from the pane's own folder, which is not known here.
+fn find_in_path(program: &str, path: &OsStr) -> Option<PathBuf> {
+    for folder in std::env::split_paths(path) {
+        if !folder.is_absolute() {
+            return None;
+        }
+        let candidate = folder.join(program);
+        let runnable = !candidate.is_dir()
+            && CString::new(candidate.as_os_str().as_bytes())
+                .is_ok_and(|name| unsafe { libc::access(name.as_ptr(), libc::X_OK) } == 0);
+        if runnable {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Whether the executable at `path` names the GC-marker option. Opening it follows symlinks,
+/// such as OpenCode's `opencode` to `opencode.exe`. The answer is kept for the life of Crit per
+/// file, by device, inode, size and modification time, so only the first launch of a binary
+/// reads it, and a binary that an update replaces or rewrites is read again.
+fn knows_gc_markers(path: &Path) -> bool {
+    type Identity = (u64, u64, u64, i64, i64);
+    static KNOWN: parking_lot::Mutex<Vec<(Identity, bool)>> = parking_lot::Mutex::new(Vec::new());
+    // Non-blocking, so that a FIFO in its place cannot hang the launch; only a file is read.
+    let Ok(mut file) = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+    else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    let identity = (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.size(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+    );
+    let mut known = KNOWN.lock();
+    if let Some(&(_, answer)) = known.iter().find(|(seen, _)| *seen == identity) {
+        return answer;
+    }
+    // A read that fails is not remembered: the next launch tries again.
+    let Ok(answer) = contains(&mut file, GC_MARKERS_NAME) else {
+        return false;
+    };
+    known.push((identity, answer));
+    answer
+}
+
+/// Whether `needle` occurs in what `reader` yields, read up to `SCAN_CHUNK` bytes at a time.
+/// Each read is searched together with the last `needle.len() - 1` bytes before it, so that a
+/// match across two reads is found too. JavaScriptCore's option names sit about a quarter
+/// megabyte into Bun's executables, so a scan for one ends within the first two reads.
+fn contains(mut reader: impl Read, needle: &[u8]) -> std::io::Result<bool> {
+    let finder = memchr::memmem::Finder::new(needle);
+    let overlap = needle.len().saturating_sub(1);
+    let mut buffer = vec![0; SCAN_CHUNK];
+    let mut filled = 0;
+    loop {
+        match reader.read(&mut buffer[filled..]) {
+            Ok(0) => return Ok(false),
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+        if finder.find(&buffer[..filled]).is_some() {
+            return Ok(true);
+        }
+        let kept = filled.min(overlap);
+        buffer.copy_within(filled - kept..filled, 0);
+        filled = kept;
+    }
 }
 
 /// Refuses a saved chat identity that cannot be resumed. For OMP it also reads the chat
@@ -853,6 +1041,7 @@ fn substitute_tui_config(text: &str, base: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::ffi::OsStringExt;
     use std::sync::mpsc;
 
     fn send(socket: &Path, frame: &[u8]) -> bool {
@@ -897,6 +1086,194 @@ mod tests {
         let (_, args, env) = launch("omp", 7, &socket, None, None, assets.path()).unwrap();
         let noted = env.iter().any(|(name, _)| name == "CRIT_SANDBOX_NOTE");
         assert!(!flagged(&args) && !noted, "{args:?} {env:?}");
+    }
+
+    /// `runtime_env` for agent `kind` with its assets in `directory`, given Crit's environment
+    /// as `pairs` and whether the agent's executable ships the GC-marker option.
+    fn runtime(
+        kind: &str,
+        directory: &str,
+        pairs: &[(&str, &str)],
+        ships: bool,
+    ) -> HashMap<String, String> {
+        let inherited = |name: &str| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| OsString::from(value))
+        };
+        runtime_env(kind, Path::new(directory), inherited, |_| ships)
+            .into_iter()
+            .collect()
+    }
+
+    #[test]
+    fn agents_get_runtime_settings_unless_crits_environment_has_them() {
+        let assets = "/data/crit/integrations";
+        for kind in ["omp", "opencode"] {
+            let env = runtime(kind, assets, &[], true);
+            assert_eq!(env["BUN_GC_TIMER_INTERVAL"], "10000");
+            assert_eq!(env["BUN_JSC_numberOfGCMarkers"], "2");
+            // Bun exits on a JavaScriptCore option it lacks: only one that ships it gets it.
+            let env = runtime(kind, assets, &[], false);
+            assert_eq!(env["BUN_GC_TIMER_INTERVAL"], "10000");
+            assert!(!env.contains_key("BUN_JSC_numberOfGCMarkers"), "{env:?}");
+            // The executable asked about is the agent's own...
+            runtime_env(
+                kind,
+                Path::new(assets),
+                |_| None,
+                |program| {
+                    assert_eq!(program, kind);
+                    true
+                },
+            );
+            // ...and it is not even read when the user set the option: their values stand.
+            let user = |name: &str| name.starts_with("BUN_").then(|| OsString::from("1"));
+            let env = runtime_env(kind, Path::new(assets), user, |_| panic!("asked"));
+            assert!(
+                env.iter().all(|(name, _)| !name.starts_with("BUN_")),
+                "{env:?}"
+            );
+        }
+        // Only OMP gets the overlay. Overlays the user lists come after Crit's, so theirs win.
+        let overlay = "/data/crit/integrations/omp-overlay.yml";
+        let files = |kind: &str, pairs: &[(&str, &str)]| {
+            runtime(kind, assets, pairs, false).remove("PI_CONFIG_FILES")
+        };
+        assert_eq!(files("omp", &[]).as_deref(), Some(overlay));
+        assert_eq!(files("opencode", &[]), None);
+        let theirs = [("PI_CONFIG_FILES", "/home/u/a.yml:b.yml")];
+        assert_eq!(
+            files("omp", &theirs),
+            Some(format!("{overlay}:/home/u/a.yml:b.yml"))
+        );
+        assert_eq!(files("opencode", &theirs), None);
+        assert_eq!(
+            files("omp", &[("PI_CONFIG_FILES", "")]).as_deref(),
+            Some(overlay)
+        );
+        // A list Crit cannot extend stays the user's, and a path the list cannot hold is left
+        // out.
+        let unreadable = |name: &str| {
+            (name == "PI_CONFIG_FILES").then(|| OsString::from_vec(b"/\xff.yml".to_vec()))
+        };
+        let env = runtime_env("omp", Path::new(assets), unreadable, |_| false);
+        assert!(
+            env.iter().all(|(name, _)| name != "PI_CONFIG_FILES"),
+            "{env:?}"
+        );
+        assert!(!runtime("omp", "/data:crit", &[], false).contains_key("PI_CONFIG_FILES"));
+    }
+
+    #[test]
+    fn omp_panes_get_an_overlay_that_turns_off_what_crit_never_shows() {
+        let assets = tempfile::tempdir().unwrap();
+        let socket = assets.path().join("agent.sock");
+        let overlay = assets.path().join("omp-overlay.yml");
+        let listed = |env: &[(String, String)]| {
+            env.iter()
+                .find(|(name, _)| name == "PI_CONFIG_FILES")
+                .map(|(_, files)| files.clone())
+        };
+        let (_, _, env) = launch("opencode", 7, &socket, None, None, assets.path()).unwrap();
+        assert_eq!(listed(&env), None);
+        assert!(!overlay.exists());
+        let (_, _, env) = launch("omp", 7, &socket, None, None, assets.path()).unwrap();
+        // Crit's own environment may list overlays as well, inside an OMP pane say: they follow.
+        let files = listed(&env).expect("OMP gets the overlay");
+        assert_eq!(files.split(':').next(), overlay.to_str());
+        assert!(fs::symlink_metadata(&overlay).unwrap().is_file());
+    }
+
+    #[test]
+    fn agents_are_found_in_path_as_their_spawn_finds_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let folders = ["plain", "folder", "runnable"].map(|name| temp.path().join(name));
+        for folder in &folders {
+            fs::create_dir(folder).unwrap();
+        }
+        let [plain, folder, runnable] = &folders;
+        // A file that may not run, or a folder of the name, is not what a spawn runs.
+        fs::write(plain.join("omp"), "").unwrap();
+        fs::create_dir(folder.join("omp")).unwrap();
+        fs::write(runnable.join("omp"), "").unwrap();
+        fs::set_permissions(runnable.join("omp"), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = std::env::join_paths(&folders).unwrap();
+        assert_eq!(find_in_path("omp", &path), Some(runnable.join("omp")));
+        assert_eq!(find_in_path("opencode", &path), None);
+        // A relative folder resolves from the pane's own folder, which is not known here.
+        let path = std::env::join_paths([Path::new("bin"), runnable.as_path()]).unwrap();
+        assert_eq!(find_in_path("omp", &path), None);
+        let path = std::env::join_paths([runnable.as_path(), Path::new("bin")]).unwrap();
+        assert_eq!(find_in_path("omp", &path), Some(runnable.join("omp")));
+    }
+
+    #[test]
+    fn executables_are_read_for_the_gc_marker_option_until_they_change() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent = temp.path().join("agent");
+        // Across the end of the first read, the name is only found with the bytes kept from it.
+        let start = SCAN_CHUNK - 10;
+        let mut bytes = vec![b'x'; SCAN_CHUNK + 64];
+        bytes[start..start + GC_MARKERS_NAME.len()].copy_from_slice(GC_MARKERS_NAME);
+        fs::write(&agent, &bytes).unwrap();
+        assert!(knows_gc_markers(&agent));
+        // The answer stands while the file keeps its device, inode, size and modification
+        // time...
+        let modified = fs::metadata(&agent).unwrap().modified().unwrap();
+        bytes[start] = b'x';
+        fs::write(&agent, &bytes).unwrap();
+        let file = OpenOptions::new().write(true).open(&agent).unwrap();
+        file.set_modified(modified).unwrap();
+        assert!(
+            knows_gc_markers(&agent),
+            "an unchanged file is not read again"
+        );
+        // ...and a file that changed, if only by a nanosecond, is read again.
+        file.set_modified(modified + Duration::from_nanos(1))
+            .unwrap();
+        assert!(!knows_gc_markers(&agent));
+        // Another option, or the name without its NULs, is not the option.
+        fs::write(
+            &agent,
+            b"\0JSC_numberOfGCMarkersMax\0JSC_numberOfGCMarkers numberOfGCMarkers\0",
+        )
+        .unwrap();
+        assert!(!knows_gc_markers(&agent));
+        // Neither a missing file nor a FIFO, which must not block the launch, is read.
+        assert!(!knows_gc_markers(&temp.path().join("missing")));
+        let fifo = temp.path().join("fifo");
+        let name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o700) }, 0);
+        assert!(!knows_gc_markers(&fifo));
+    }
+
+    #[test]
+    fn a_name_split_across_reads_is_found() {
+        /// Yields at most five bytes a read, so that every match spans reads.
+        struct Trickle<'a>(&'a [u8]);
+        impl Read for Trickle<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = buffer.len().min(self.0.len()).min(5);
+                buffer[..count].copy_from_slice(&self.0[..count]);
+                self.0 = &self.0[count..];
+                Ok(count)
+            }
+        }
+        for offset in 0..10 {
+            let mut bytes = vec![b'x'; offset];
+            bytes.extend_from_slice(GC_MARKERS_NAME);
+            assert!(
+                contains(Trickle(&bytes), GC_MARKERS_NAME).unwrap(),
+                "{offset}"
+            );
+            bytes.pop();
+            assert!(
+                !contains(Trickle(&bytes), GC_MARKERS_NAME).unwrap(),
+                "{offset}"
+            );
+        }
     }
 
     #[test]
@@ -1208,6 +1585,27 @@ mod tests {
         let (tx, _rx) = mpsc::sync_channel(1);
         let error = start_in(tx, &[missing]).err().unwrap();
         assert!(format!("{error:#}").contains("/proc/crit-nonexistent"));
+    }
+
+    #[test]
+    fn start_in_skips_bases_too_deep_for_the_socket_path() {
+        let temp = tempfile::tempdir().unwrap();
+        // Deep enough that `<base>/crit-<pid>-<16 hex>/agent.sock` passes 107 bytes.
+        let deep = temp.path().join("d".repeat(SOCKET_PATH_MAX));
+        fs::create_dir(&deep).unwrap();
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let server = start_in(tx, &[deep.clone(), temp.path().to_path_buf()]).unwrap();
+        assert!(server.socket_path.starts_with(temp.path()));
+        assert!(!server.socket_path.starts_with(&deep));
+        assert!(UnixStream::connect(&server.socket_path).is_ok());
+        assert_eq!(
+            fs::read_dir(&deep).unwrap().count(),
+            0,
+            "nothing is left in the deep base"
+        );
+        let (tx, _rx) = mpsc::sync_channel(1);
+        let error = start_in(tx, &[deep]).err().unwrap();
+        assert!(format!("{error:#}").contains("longer than a Unix socket path"));
     }
 
     #[test]

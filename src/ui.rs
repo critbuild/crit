@@ -204,7 +204,7 @@ pub fn resize_sessions(app: &mut App, size: Size) -> Result<()> {
 
 /// Draws the whole window. Returns how long until the tab bar's animations (a working mark's
 /// spinner, a blinking decision mark, a scrolling label) next change, so the main loop can
-/// draw again then; `None` while nothing on the bar moves.
+/// draw again then; `None` while nothing on the bar moves, as in a window without focus.
 pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Duration> {
     app.split_divider = None;
     let bounds = frame.area();
@@ -306,13 +306,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Duration> {
 /// staged in `tab_hits` (capacity reused across frames) and trimmed to the
 /// visible window around the focused tab. Labels take up to `LABEL_WIDTH` columns, with
 /// the status immediately after the name; a long label scrolls through its slot.
-/// Returns how long until a mark or label drawn here next changes, `None` when none moves.
+/// Returns how long until a mark or label drawn here next changes, `None` when none moves, as in
+/// a window without focus.
 fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
     let focused = app.focused_index();
     let App {
         project,
         saved_projects,
         tab_hits,
+        window_focused,
         ..
     } = app;
     let mut focused_cell = 0;
@@ -348,7 +350,15 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
         );
         x = 2;
     }
-    let clock = ANIMATION.elapsed();
+    // A window without focus, as behind a game, is watched little: its bar holds still, each
+    // animation at its first frame (the spinner's first dots, a filled decision mark, a label
+    // at its start), and asks for no frame of its own.
+    let animated = *window_focused;
+    let clock = if animated {
+        ANIMATION.elapsed()
+    } else {
+        Duration::ZERO
+    };
     let mut tick: Option<Duration> = None;
     let mut end = start;
     for (cell, hit) in tab_hits.iter_mut().enumerate().skip(start) {
@@ -403,7 +413,7 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
     }
     tab_hits.truncate(end);
     tab_hits.drain(..start);
-    tick
+    tick.filter(|_| animated)
 }
 
 /// Columns of a worktree tab: its compact label with a space before it, and one status column

@@ -139,6 +139,7 @@ dependencies = [
  "crossterm",
  "jsonc-parser",
  "libc",
+ "memchr",
  "parking_lot",
  "portable-pty",
  "ratatui",

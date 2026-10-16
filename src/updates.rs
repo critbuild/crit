@@ -1,20 +1,29 @@
 use anyhow::{Context, Result};
 use std::{
+    env,
+    ffi::CString,
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom},
     os::unix::{
+        ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-        process::CommandExt,
+        process::{CommandExt, ExitStatusExt},
     },
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 const TOOLS: [(&str, &str, &str); 2] = [
     ("OMP", "omp", "update"),
     ("OpenCode", "opencode", "upgrade"),
 ];
+/// How long an updater may run, even after Crit has quit. One still running by then has hung, as
+/// `opencode upgrade` has: left waiting in epoll for hours, holding its runtime's memory and waking
+/// the CPU, until killed by hand.
+const UPDATE_DEADLINE: Duration = Duration::from_secs(10 * 60);
+/// How long an updater stopped at its deadline gets to clean up before it is killed.
+const STOP_GRACE: Duration = Duration::from_secs(30);
 const DIAGNOSTIC_BYTES: u64 = 4096;
 /// In the workspace state directory. Its modification time is when the updaters last started;
 /// it holds no data.
@@ -28,13 +37,49 @@ const UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 struct UpdateProcess {
     child: Child,
     output: File,
+    started: Instant,
+    /// The deadline `timeout` holds the updater to; `None` when it runs without one.
+    deadline: Option<Duration>,
+}
+
+/// Why an updater did not succeed.
+enum Failure {
+    /// It was still running at its deadline, and was stopped.
+    TimedOut(Duration),
+    /// It could not start or be waited for, or it exited unsuccessfully: how, and the end of
+    /// what it printed.
+    Error(String),
 }
 
 impl UpdateProcess {
-    /// `None` when the program is not installed.
-    fn spawn(program: &str, argument: &str) -> Result<Option<Self>> {
+    /// `None` when the program is not installed. Updaters outlive Crit, so only a process of
+    /// their own can stop one that hangs: coreutils `timeout`, holding it to `deadline`. It leads
+    /// the process group the updater runs in, so its signals reach what the updater started too:
+    /// at the deadline it asks them all to stop (SIGTERM), and if the updater is still running
+    /// `STOP_GRACE` later, it kills them (SIGKILL). Without `timeout`, the updater runs directly,
+    /// with no deadline.
+    fn spawn(program: &str, argument: &str, deadline: Duration) -> Result<Option<Self>> {
+        let context = || format!("start {program} {argument}");
+        // Looked up before anything starts: `timeout` starts whether or not the tool is
+        // installed, and would report one that is not as a failure.
+        let Some(path) = locate(program).with_context(context)? else {
+            return Ok(None);
+        };
+        let timeout = locate("timeout").ok().flatten();
+        let mut command = match &timeout {
+            Some(timeout) => {
+                let mut command = Command::new(timeout);
+                command
+                    .arg(format!("--kill-after={}s", STOP_GRACE.as_secs_f64()))
+                    .arg(format!("{}s", deadline.as_secs_f64()))
+                    .arg(&path);
+                command
+            }
+            None => Command::new(&path),
+        };
         let output = tempfile::tempfile().context("capture updater output")?;
-        let child = match Command::new(program)
+        let started = Instant::now();
+        let child = command
             .arg(argument)
             .stdin(Stdio::null())
             .stdout(output.try_clone()?)
@@ -42,12 +87,13 @@ impl UpdateProcess {
             .env("NO_COLOR", "1")
             .process_group(0)
             .spawn()
-        {
-            Ok(child) => child,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error).with_context(|| format!("start {program} {argument}")),
-        };
-        Ok(Some(Self { child, output }))
+            .with_context(context)?;
+        Ok(Some(Self {
+            child,
+            output,
+            started,
+            deadline: timeout.is_some().then_some(deadline),
+        }))
     }
 
     fn diagnostic(&mut self) -> Result<String> {
@@ -69,28 +115,39 @@ impl UpdateProcess {
     }
 
     /// `None` while the updater runs; its outcome once it has exited.
-    fn poll(&mut self) -> Option<Result<(), String>> {
+    fn poll(&mut self) -> Option<Result<(), Failure>> {
         let status = match self.child.try_wait() {
             Ok(None) => return None,
             Ok(Some(status)) => status,
-            Err(error) => return Some(Err(error.to_string())),
+            Err(error) => return Some(Err(Failure::Error(error.to_string()))),
         };
         if status.success() {
             return Some(Ok(()));
         }
+        // How `timeout` ends at the deadline: exit status 124 once the updater has stopped or,
+        // when it had to be killed, 137, or SIGKILL itself where `timeout` kills its whole
+        // process group, itself included, as GNU's does. Before the deadline, these statuses are
+        // the updater's own.
+        if let Some(deadline) = self.deadline
+            && self.started.elapsed() >= deadline
+            && (matches!(status.code(), Some(124 | 137)) || status.signal() == Some(libc::SIGKILL))
+        {
+            return Some(Err(Failure::TimedOut(deadline)));
+        }
         let detail = self
             .diagnostic()
             .unwrap_or_else(|error| format!("could not read updater output: {error}"));
-        Some(Err(if detail.is_empty() {
+        Some(Err(Failure::Error(if detail.is_empty() {
             status.to_string()
         } else {
             format!("{status}: {detail}")
-        }))
+        })))
     }
 }
 
 /// The updaters running in the background, each reported on once, when it finishes. Dropping
-/// this leaves the ones still running alone: an interrupted install is worse than an orphan.
+/// this leaves the ones still running alone: an interrupted install is worse than an orphan, and
+/// each stays held to its deadline (see `UpdateProcess::spawn`).
 #[derive(Default)]
 pub struct Checks {
     /// In tool order, by the name their diagnostic carries. An updater that could not start keeps
@@ -121,14 +178,15 @@ impl Checks {
         // Updating matters more than the stamp: one that cannot be written only means the next
         // launch updates again.
         let _ = touch(&stamp, now);
-        Self::spawn(tools)
+        Self::spawn(tools, UPDATE_DEADLINE)
     }
 
-    fn spawn(tools: &[(&str, &str, &str)]) -> Self {
+    /// Starts each of `tools`, held to `deadline`.
+    fn spawn(tools: &[(&str, &str, &str)], deadline: Duration) -> Self {
         let updaters = tools
             .iter()
             .filter_map(|&(name, program, argument)| {
-                let process = match UpdateProcess::spawn(program, argument) {
+                let process = match UpdateProcess::spawn(program, argument, deadline) {
                     Ok(Some(process)) => Ok(process),
                     // Not installed: nothing to update, nothing to report.
                     Ok(None) => return None,
@@ -149,13 +207,18 @@ impl Checks {
                     None => return true,
                     Some(outcome) => outcome,
                 },
-                Err(error) => Err(std::mem::take(error)),
+                Err(error) => Err(Failure::Error(std::mem::take(error))),
             };
-            if let Err(failure) = outcome {
-                errors.push(format!(
-                    "{name} update failed: {failure}. Continuing with the installed version."
-                ));
-            }
+            let failure = match outcome {
+                Ok(()) => return false,
+                Err(Failure::TimedOut(deadline)) => {
+                    format!("timed out after {}", in_words(deadline))
+                }
+                Err(Failure::Error(detail)) => format!("failed: {detail}"),
+            };
+            errors.push(format!(
+                "{name} update {failure}. Continuing with the installed version."
+            ));
             false
         });
         errors
@@ -201,10 +264,56 @@ fn private_file(metadata: &fs::Metadata) -> bool {
     metadata.is_file() && metadata.uid() == unsafe { libc::geteuid() } && metadata.nlink() == 1
 }
 
+/// Where `program` is, found the way spawning it finds it: a path with a slash as it is, a name in
+/// the first `PATH` folder with an executable file by that name. `None` when there is no file by
+/// that name. One that is there but cannot be run, with no other to run instead, is a permission
+/// error, as it is to spawn: a failure to start, not a tool that is not installed.
+fn locate(program: &str) -> io::Result<Option<PathBuf>> {
+    let mut denied = false;
+    let mut runnable = |candidate: PathBuf| match fs::metadata(&candidate) {
+        Ok(metadata) if metadata.is_file() && executable(&candidate) => Some(candidate),
+        Ok(_) => {
+            denied = true;
+            None
+        }
+        Err(error) => {
+            denied |= error.kind() == io::ErrorKind::PermissionDenied;
+            None
+        }
+    };
+    let found = if program.contains('/') {
+        runnable(program.into())
+    } else {
+        env::var_os("PATH").and_then(|path| {
+            env::split_paths(&path).find_map(|folder| runnable(folder.join(program)))
+        })
+    };
+    match found {
+        None if denied => Err(io::Error::from_raw_os_error(libc::EACCES)),
+        found => Ok(found),
+    }
+}
+
+/// Whether this process may execute `path`.
+fn executable(path: &Path) -> bool {
+    CString::new(path.as_os_str().as_bytes())
+        .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0)
+}
+
+/// `duration` as a report words it: in whole minutes when it is some, otherwise in seconds.
+fn in_words(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let (count, unit) = if seconds >= 60 && seconds.is_multiple_of(60) {
+        (seconds / 60, "minute")
+    } else {
+        (seconds, "second")
+    };
+    format!("{count} {unit}{}", if count == 1 { "" } else { "s" })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     /// Polls until every updater has finished; the errors, in the order they came.
     fn finish(checks: &mut Checks) -> Vec<String> {
@@ -235,8 +344,10 @@ mod tests {
         let tools = [
             ("Absent", "/nonexistent/crit-test-tool", "update"),
             ("Also absent", "/nonexistent/crit-test-other", "upgrade"),
+            // Looked up in PATH, as the real updaters are.
+            ("Not on PATH", "crit-test-tool-not-on-path", "update"),
         ];
-        let mut checks = Checks::spawn(&tools);
+        let mut checks = Checks::spawn(&tools, UPDATE_DEADLINE);
         assert!(checks.updaters.is_empty());
         assert!(checks.poll().is_empty());
     }
@@ -254,7 +365,7 @@ mod tests {
             ("Succeeding", "/bin/true", "update"),
             ("Locked", locked.to_str().unwrap(), "update"),
         ];
-        let mut checks = Checks::spawn(&tools);
+        let mut checks = Checks::spawn(&tools, UPDATE_DEADLINE);
         let mut errors = finish(&mut checks);
         errors.sort();
         assert_eq!(
@@ -291,7 +402,7 @@ echo "peer never started" >&2; exit 9"#;
             ("First", "/bin/sh", first.as_str()),
             ("Second", "/bin/sh", second.as_str()),
         ];
-        let mut errors = finish(&mut Checks::spawn(&tools));
+        let mut errors = finish(&mut Checks::spawn(&tools, UPDATE_DEADLINE));
         errors.sort();
         assert_eq!(
             errors,
@@ -320,11 +431,87 @@ exit 9"#,
         )
         .unwrap();
         let tools = [("Slow", "/bin/sh", script.to_str().unwrap())];
-        let checks = Checks::spawn(&tools);
+        let checks = Checks::spawn(&tools, UPDATE_DEADLINE);
         wait_for(&directory.path().join("started"));
         drop(checks);
         fs::write(directory.path().join("go"), "").unwrap();
         wait_for(&directory.path().join("finished"));
+    }
+
+    /// Whether process `pid` still runs: it is neither gone nor dead and waiting to be reaped.
+    fn running(pid: u32) -> bool {
+        // The state follows the command name, which ends at the last parenthesis.
+        fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, fields)| !fields.starts_with('Z'))
+        })
+    }
+
+    #[test]
+    fn updaters_past_the_deadline_are_stopped_with_everything_they_started() {
+        let directory = tempfile::tempdir().unwrap();
+        let hanging = directory.path().join("hanging.sh");
+        // Records itself and a child of its own, then waits for the child, which would outlast
+        // the deadline by far.
+        fs::write(
+            &hanging,
+            r#"d=$(dirname "$0"); sleep 60 & echo $! > "$d/child"; echo $$ > "$d/updater"; wait"#,
+        )
+        .unwrap();
+        let tools = [
+            ("Hanging", "/bin/sh", hanging.to_str().unwrap()),
+            // Found in PATH, as the real updaters are, and done well within the deadline.
+            ("Quick", "true", "update"),
+        ];
+        let mut checks = Checks::spawn(&tools, Duration::from_secs(1));
+        assert_eq!(checks.updaters.len(), 2);
+        assert_eq!(
+            finish(&mut checks),
+            ["Hanging update timed out after 1 second. Continuing with the installed version."]
+        );
+        for process in ["updater", "child"] {
+            let pid = fs::read_to_string(directory.path().join(process)).unwrap();
+            let pid = pid.trim().parse().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while running(pid) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the {process} outlived the deadline"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[test]
+    fn ending_like_a_timeout_before_the_deadline_is_a_plain_failure() {
+        // `timeout` passes the updater's exit status on, and dies of the signal that killed it.
+        let directory = tempfile::tempdir().unwrap();
+        let exiting = directory.path().join("exiting.sh");
+        fs::write(&exiting, "exit 124").unwrap();
+        let killed = directory.path().join("killed.sh");
+        fs::write(&killed, "kill -KILL $$").unwrap();
+        let tools = [
+            ("Exiting", "/bin/sh", exiting.to_str().unwrap()),
+            ("Killed", "/bin/sh", killed.to_str().unwrap()),
+        ];
+        let mut errors = finish(&mut Checks::spawn(&tools, UPDATE_DEADLINE));
+        errors.sort();
+        assert_eq!(
+            errors,
+            [
+                "Exiting update failed: exit status: 124. Continuing with the installed version.",
+                "Killed update failed: signal: 9 (SIGKILL). Continuing with the installed version.",
+            ]
+        );
+    }
+
+    #[test]
+    fn deadlines_are_worded_in_whole_minutes_where_possible() {
+        assert_eq!(in_words(UPDATE_DEADLINE), "10 minutes");
+        assert_eq!(in_words(Duration::from_secs(60)), "1 minute");
+        assert_eq!(in_words(Duration::from_secs(90)), "90 seconds");
+        assert_eq!(in_words(Duration::from_secs(1)), "1 second");
     }
 
     /// One updater that always starts, so a start that is not skipped has one running.
