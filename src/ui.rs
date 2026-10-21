@@ -3,8 +3,9 @@ use crate::{
         App, COMMANDS, Confirm, IntentDialog, LayoutMode, Modal, Pane, Project, ProjectPicker,
         Scrollbar, SplitDivider, TabHit, Workspace, WorktreeHit, WorktreeHitAction, project_slots,
     },
+    checks::{Phase, View},
     integration::AgentState,
-    worktree::SplitTarget,
+    updates::{State as UpdateState, TOOLS as UPDATE_TOOLS},
 };
 use anyhow::Result;
 use ratatui::{
@@ -17,6 +18,7 @@ use ratatui::{
 };
 use std::borrow::Cow;
 use std::ops::Range;
+use std::path::Path;
 use std::sync::LazyLock;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -36,10 +38,10 @@ const AMBER: Color = Color::Rgb(232, 188, 128);
 /// Maximum columns for a worktree label. Short names take only the room they need; longer
 /// names scroll through a bounded slot.
 const LABEL_WIDTH: usize = 18;
-/// The working mark's frames: a braille spinner, one frame per `SPINNER_STEP`.
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// The original six-dot ring in the bottom three braille rows, aligned with the label's baseline.
+const SPINNER: [&str; 10] = ["⠖", "⠲", "⢲", "⢰", "⣰", "⣠", "⣄", "⣆", "⡆", "⡖"];
 const SPINNER_STEP: Duration = Duration::from_millis(125);
-/// The decision mark alternates between its filled and hollow forms at this pace.
+/// The decision mark blinks at this pace.
 const BLINK_STEP: Duration = Duration::from_millis(500);
 /// A long label rests at its start for this long before it scrolls, like a departures board,
 /// so that its beginning can be read, then moves one column per `TICKER_STEP` until it has
@@ -138,19 +140,26 @@ fn split_divider(layout: LayoutMode, panes: [Rect; 2], count: usize) -> Option<S
         return None;
     }
     let track = Rect::new(panes[0].right(), content.y, 1, content.height);
+    let grip_height = (2 + track.height % 2).min(track.height);
     Some(SplitDivider {
         track,
-        // The grip spans both margin columns, so it is easy to hit; only the rail is drawn.
-        handle: Rect::new(track.x - MARGIN, track.y + track.height / 2, 2 * MARGIN, 1),
+        // The hit area also includes the left margin, keeping the rail easy to grab.
+        handle: Rect::new(
+            track.x - MARGIN,
+            track.y + (track.height - grip_height) / 2,
+            2 * MARGIN,
+            grip_height,
+        ),
         available_width: panes[0].width + panes[1].width,
     })
 }
 
 fn draw_split_handle(buffer: &mut Buffer, divider: SplitDivider, dragging: bool) {
-    let color = if dragging { ACCENT } else { HEADER_DIVIDER };
-    buffer[(divider.track.x, divider.handle.y)]
-        .set_symbol("┼")
-        .set_fg(color);
+    let color = if dragging { ACCENT } else { MUTED };
+    // Recolor the rail's own stroke so the grip stays exactly aligned.
+    for y in divider.handle.y..divider.handle.bottom() {
+        buffer[(divider.track.x, y)].set_symbol("│").set_fg(color);
+    }
 }
 
 fn pane_target(project: &Project, pane: usize, count: usize) -> (usize, usize, bool) {
@@ -225,9 +234,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Duration> {
         );
         return None;
     }
-    let width = draw_key_mode(frame, app.native_keys, Some(app.limiter.hint()));
-    let tick = draw_tabs(frame, app, bounds.width.saturating_sub(width));
     let (regions, count) = areas(app, Size::new(bounds.width, bounds.height));
+    let primary = pane_target(&app.project, 0, count).0;
+    app.acknowledge_viewed(primary);
+    if count == 2 {
+        let secondary = pane_target(&app.project, 1, count).0;
+        if secondary != primary {
+            app.acknowledge_viewed(secondary);
+        }
+    }
+    let width = draw_key_mode(
+        frame,
+        app.native_keys,
+        Some(app.limiter.hint()),
+        app.worktree_pane.is_some(),
+    );
+    let tick = draw_tabs(frame, app, bounds.width.saturating_sub(width));
     let pane_width = worktree_pane_width(app, bounds.width);
     let content_width = bounds.width - pane_width;
     app.split_divider = split_divider(app.project.layout, regions, count);
@@ -277,16 +299,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) -> Option<Duration> {
         }
     }
     if let Some(divider) = app.split_divider {
-        // The right header's leading space belongs to the shared pane boundary.
-        frame.buffer_mut()[(regions[1].x, regions[1].y)]
-            .set_symbol("│")
-            .set_fg(BORDER);
-        // One rail, on the right pane's margin column; the left margin stays clear for the
-        // left pane's scrollbar.
-        for y in divider.track.y..divider.track.bottom() {
+        // Keep the whole separator on the same column, including the header and its rule.
+        for y in regions[1].y..divider.track.bottom() {
             frame.buffer_mut()[(divider.track.x, y)]
                 .set_symbol("│")
-                .set_fg(HEADER_DIVIDER);
+                .set_fg(BORDER);
         }
         draw_split_handle(frame.buffer_mut(), divider, app.split_drag.is_some());
     }
@@ -319,7 +336,7 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
     } = app;
     let mut focused_cell = 0;
     for (slot, open) in project_slots(project, saved_projects) {
-        let separator = u16::from(!tab_hits.is_empty());
+        let separator = 2 * u16::from(!tab_hits.is_empty());
         tab_hits.push(TabHit {
             area: Rect::new(0, 0, (open.name.width() as u16 + 3).min(23) + separator, 1),
             project: slot,
@@ -373,7 +390,10 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
         let (line, style) = match hit.workspace {
             None => (
                 Line::from(vec![
-                    Span::styled(if cell > 0 { "│" } else { "" }, Style::default().fg(BORDER)),
+                    Span::styled(
+                        if cell > 0 { " │" } else { "" },
+                        Style::default().fg(BORDER),
+                    ),
                     Span::styled(
                         format!(" {}", open.name),
                         Style::default().fg(if current { FG } else { MUTED }).bold(),
@@ -396,7 +416,7 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
                     Line::from(vec![
                         Span::raw(" "),
                         Span::raw(label),
-                        Span::styled(format!(" {mark} "), Style::default().fg(color)),
+                        Span::styled(format!(" {mark}"), Style::default().fg(color)),
                     ]),
                     Style::default()
                         .fg(if selected { ACCENT } else { MUTED })
@@ -416,11 +436,10 @@ fn draw_tabs(frame: &mut Frame, app: &mut App, width: u16) -> Option<Duration> {
     tick.filter(|_| animated)
 }
 
-/// Columns of a worktree tab: its compact label with a space before it, and one status column
-/// with a space on either side. Reserving the status column keeps a tab still when a turn
-/// starts or is acknowledged. Tabs carry no number: Ctrl+Shift+1…9 count them by position.
+/// A label's leading space, one gap and one reserved status column. The next tab or project
+/// separator supplies the trailing gutter, so adjacent tabs do not double their padding.
 fn tab_cell_width(label: &str) -> u16 {
-    (1 + label.width().min(LABEL_WIDTH) + 3) as u16
+    (1 + label.width().min(LABEL_WIDTH) + 2) as u16
 }
 
 /// The mark of a tab, its colour and the time until it changes. Completion is an
@@ -439,7 +458,7 @@ fn tab_mark(
             let (frame, next) = phase(clock, BLINK_STEP);
             (if frame % 2 == 0 { "◆" } else { "◇" }, AMBER, Some(next))
         }
-        AgentState::Idle if completed => ("●", GREEN, None),
+        AgentState::Idle if completed => ("✓", GREEN, None),
         AgentState::Idle => (" ", MUTED, None),
         AgentState::Unknown => ("○", MUTED, None),
         AgentState::Exited => ("×", MUTED, None),
@@ -526,7 +545,7 @@ fn put_clipped(buffer: &mut Buffer, x: u16, y: u16, text: &str, width: u16, styl
     end
 }
 
-/// Which of `total` worktree rows show in `capacity` lines when scrolled to `scroll`: the first
+/// Which of `total` resource rows show in `capacity` lines when scrolled to `scroll`: the first
 /// row, how many follow it, and whether `↑ n more` / `↓ n more` take a line at the top / bottom.
 /// The offset is clamped so the last row can still be reached.
 fn worktree_window(total: usize, capacity: usize, scroll: usize) -> (usize, usize, bool, bool) {
@@ -545,20 +564,135 @@ fn worktree_window(total: usize, capacity: usize, scroll: usize) -> (usize, usiz
     (first, room - usize::from(below), above, below)
 }
 
-/// The F2 sidebar: `width` columns at the right edge from row 1 down to `bottom`. A header
-/// names the project and holds the close cell; below it come one row per worktree of
-/// `project.trees`, each ending in a 🗑 cell, or the reason a non-Git project has none. Click
-/// cells are staged in `worktree_hits`, and the scroll offset is clamped to what fits.
+fn check_phase(phase: &Phase) -> (&'static str, Color) {
+    match phase {
+        Phase::Stopped => ("stopped", MUTED),
+        Phase::Queued => ("queued", AMBER),
+        Phase::Starting => ("starting", AMBER),
+        Phase::Active => ("active", GREEN),
+        Phase::Stopping => ("stopping", AMBER),
+        Phase::Blocked => ("blocked", AMBER),
+    }
+}
+
+/// Worktree membership comes from the project view, never from open tabs or focus.
+fn check_row<'a>(view: Option<&'a View>, path: &Path) -> (Option<&'a Phase>, Option<usize>) {
+    let Some(view) = view else {
+        return (None, None);
+    };
+    let owner = view.active.as_ref().filter(|entry| entry.worktree == path);
+    let queued = view.queue.iter().position(|entry| entry.worktree == path);
+    (owner.map(|_| &view.phase), queued.map(|index| index + 1))
+}
+
+/// Logical resource rows are visited twice (count, then draw), without a per-frame inventory.
+enum ResourceRow<'a> {
+    Project(&'a Project),
+    External(&'a View),
+    Check(Option<&'a View>),
+    Owner(&'a crate::checks::Entry),
+    Queue(usize, &'a crate::checks::Entry),
+    Blocked(&'a View),
+    Tree(&'a Project, usize, Option<&'a View>),
+    Workspace(&'a Project, &'a Workspace),
+    Session(&'a crate::terminal::Session),
+}
+
+fn visit_check_rows<'a>(view: Option<&'a View>, visit: &mut impl FnMut(ResourceRow<'a>)) {
+    visit(ResourceRow::Check(view));
+    if let Some(view) = view {
+        if let Some(owner) = &view.active {
+            visit(ResourceRow::Owner(owner));
+        }
+        for (index, entry) in view.queue.iter().enumerate() {
+            visit(ResourceRow::Queue(index + 1, entry));
+        }
+        if view.phase == Phase::Blocked {
+            visit(ResourceRow::Blocked(view));
+        }
+    }
+}
+
+fn visit_resource_rows<'a>(
+    current: &'a Project,
+    saved: &'a [Project],
+    checks: &'a [View],
+    mut visit: impl FnMut(ResourceRow<'a>),
+) {
+    for (_, project) in project_slots(current, saved) {
+        let check = project.repository.as_ref().and_then(|repository| {
+            checks
+                .iter()
+                .find(|view| view.project == repository.common_dir)
+        });
+        visit(ResourceRow::Project(project));
+        if project.repository.is_some() {
+            visit_check_rows(check, &mut visit);
+        }
+        for (index, tree) in project.trees.iter().enumerate() {
+            visit(ResourceRow::Tree(project, index, check));
+            for workspace in project
+                .workspaces
+                .iter()
+                .filter(|workspace| workspace.tree.id == tree.id)
+            {
+                for session in workspace
+                    .sessions
+                    .iter()
+                    .filter(|session| session.alive.load(Ordering::Acquire))
+                {
+                    visit(ResourceRow::Session(session));
+                }
+            }
+        }
+        // Non-Git folders and workspaces missing from refreshed checkout metadata still own PTYs.
+        for workspace in project.workspaces.iter().filter(|workspace| {
+            !project
+                .trees
+                .iter()
+                .any(|tree| tree.id == workspace.tree.id)
+        }) {
+            visit(ResourceRow::Workspace(project, workspace));
+            for session in workspace
+                .sessions
+                .iter()
+                .filter(|session| session.alive.load(Ordering::Acquire))
+            {
+                visit(ResourceRow::Session(session));
+            }
+        }
+    }
+    for view in checks.iter().filter(|view| {
+        (view.phase != Phase::Stopped || view.active.is_some() || !view.queue.is_empty())
+            && !project_slots(current, saved).any(|(_, project)| {
+                project
+                    .repository
+                    .as_ref()
+                    .is_some_and(|repository| repository.common_dir == view.project)
+            })
+    }) {
+        visit(ResourceRow::External(view));
+        visit_check_rows(Some(view), &mut visit);
+    }
+}
+
+/// F2's workspace-wide inventory. Every group, check and session shares the same scroll window.
 fn draw_worktree_pane(frame: &mut Frame, app: &mut App, width: u16, bottom: u16) {
     let focused = app.focused_index();
     let App {
         project,
+        saved_projects,
+        checks,
         worktree_pane,
         worktree_hits,
         worktree_area,
         ..
     } = app;
     let Some(pane) = worktree_pane else { return };
+    let focused_path = project
+        .workspaces
+        .get(focused)
+        .map(|workspace| workspace.tree.path.as_path());
     let area = Rect::new(
         frame.area().width - width,
         1,
@@ -567,12 +701,6 @@ fn draw_worktree_pane(frame: &mut Frame, app: &mut App, width: u16, bottom: u16)
     );
     *worktree_area = Some(area);
     let inner = Rect::new(area.x + 1, area.y, area.width - 1, area.height);
-    let list = Rect::new(
-        inner.x,
-        inner.y + 1,
-        inner.width,
-        inner.height.saturating_sub(1),
-    );
     let buffer = frame.buffer_mut();
     for y in area.y..area.bottom() {
         buffer[(area.x, y)].set_symbol("│").set_fg(BORDER);
@@ -586,108 +714,266 @@ fn draw_worktree_pane(frame: &mut Frame, app: &mut App, width: u16, bottom: u16)
         area: close,
         action: WorktreeHitAction::Close,
     });
-    let (title, _) = buffer.set_stringn(
-        inner.x,
-        inner.y,
-        " Worktrees ",
-        usize::from(close.x - inner.x),
-        Style::default().fg(FG).bold(),
-    );
+    let mut total = 0;
+    let mut projects = 0;
+    let mut sessions = 0;
+    visit_resource_rows(project, saved_projects, checks, |row| {
+        total += 1;
+        match row {
+            ResourceRow::Project(_) | ResourceRow::External(_) => projects += 1,
+            ResourceRow::Session(_) => sessions += 1,
+            _ => {}
+        }
+    });
     put_clipped(
         buffer,
-        title,
+        inner.x,
         inner.y,
-        &project.name,
-        close.x - title,
-        muted,
+        &format!(" Resources · {projects}P {sessions}S"),
+        close.x - inner.x,
+        Style::default().fg(FG).bold(),
     );
     buffer.set_string(close.x, inner.y, " × ", muted);
-    if project.repository.is_none() {
-        frame.render_widget(
-            Paragraph::new("Not a Git project.\nOpen a Git folder to manage worktrees.")
-                .style(muted)
-                .wrap(Wrap { trim: true }),
-            Rect::new(list.x + 1, list.y, list.width - 1, list.height),
-        );
-        return;
-    }
-    let total = project.trees.len();
+    let list = Rect::new(
+        inner.x,
+        inner.y + 1,
+        inner.width,
+        inner.height.saturating_sub(1),
+    );
     let (first, count, above, below) =
         worktree_window(total, usize::from(list.height), pane.scroll);
     pane.scroll = first;
-    let more = usize::from(list.width) - 1;
     let mut y = list.y;
     if above {
-        buffer.set_stringn(list.x + 1, y, format!("↑ {first} more"), more, muted);
+        buffer.set_stringn(
+            list.x + 1,
+            y,
+            format!("↑ {first} more"),
+            usize::from(list.width - 1),
+            muted,
+        );
         y += 1;
     }
-    for index in first..first + count {
-        let tree = &project.trees[index];
-        let open = project
-            .workspaces
-            .iter()
-            .any(|workspace| workspace.tree.id == tree.id);
-        // The label and markers share the room left of the trash cell, after a margin column.
-        let text = Rect::new(list.x, y, list.width - WORKTREE_CELL, 1);
-        let trash = Rect::new(text.right(), y, WORKTREE_CELL, 1);
-        let markers = [
-            (open, " ●", GREEN),
-            (tree.is_main, " main", MUTED),
-            (tree.locked, " locked", AMBER),
-            (tree.prunable, " missing", AMBER),
-        ];
-        let markers_width: u16 = markers
-            .iter()
-            .filter(|marker| marker.0)
-            .map(|marker| marker.1.width() as u16)
-            .sum();
-        let current = tree.id == project.workspaces[focused].tree.id;
-        let mut x = put_clipped(
-            buffer,
-            text.x + 1,
-            y,
-            // A bare repository has neither branch nor commit, so `label` would say "terminal".
-            if tree.bare {
-                "bare repository"
-            } else {
-                tree.label()
-            },
-            (text.width - 1).saturating_sub(markers_width),
-            Style::default().fg(if current { ACCENT } else { FG }),
-        );
-        for (_, marker, color) in markers.iter().filter(|marker| marker.0) {
-            let style = Style::default().fg(*color);
-            x = buffer
-                .set_stringn(
-                    x,
-                    y,
-                    marker,
-                    usize::from(text.right().saturating_sub(x)),
-                    style,
-                )
-                .0;
+    let mut index = 0;
+    visit_resource_rows(project, saved_projects, checks, |row| {
+        let visible = index >= first && index - first < count;
+        index += 1;
+        if !visible {
+            return;
         }
-        // Rows that cannot be deleted dim the cell; clicking it says why.
-        let removable = !(tree.is_main || tree.locked || tree.bare);
-        buffer.set_string(
-            trash.x,
-            y,
-            " 🗑 ",
-            Style::default().fg(if removable { MUTED } else { BORDER }),
+        draw_resource_row(
+            buffer,
+            Rect::new(list.x, y, list.width, 1),
+            row,
+            focused_path,
+            worktree_hits,
         );
-        worktree_hits.push(WorktreeHit {
-            area: text,
-            action: WorktreeHitAction::Open(index),
-        });
-        worktree_hits.push(WorktreeHit {
-            area: trash,
-            action: WorktreeHitAction::Remove(index),
-        });
         y += 1;
-    }
+    });
     if below {
-        let hidden = total - first - count;
-        buffer.set_stringn(list.x + 1, y, format!("↓ {hidden} more"), more, muted);
+        buffer.set_stringn(
+            list.x + 1,
+            y,
+            format!("↓ {} more", total - first - count),
+            usize::from(list.width - 1),
+            muted,
+        );
+    }
+}
+
+fn draw_resource_row(
+    buffer: &mut Buffer,
+    area: Rect,
+    row: ResourceRow<'_>,
+    focused_path: Option<&Path>,
+    hits: &mut Vec<WorktreeHit>,
+) {
+    let (text, color, action) = match row {
+        ResourceRow::Project(project) => (
+            format!(" {}", project.name),
+            ACCENT,
+            Some(WorktreeHitAction::Project(project.order)),
+        ),
+        ResourceRow::External(view) => {
+            let directory = if view.project.ends_with(".git") {
+                view.project.parent().unwrap_or(&view.project)
+            } else {
+                &view.project
+            };
+            let name = directory
+                .file_name()
+                .unwrap_or(directory.as_os_str())
+                .to_string_lossy();
+            (format!(" {name} · no local tab"), ACCENT, None)
+        }
+        ResourceRow::Check(view) => {
+            if let Some(view) = view {
+                let (phase, color) = check_phase(&view.phase);
+                (
+                    format!(" Check {phase} · Q{}", view.queue.len()),
+                    color,
+                    None,
+                )
+            } else {
+                (" Check not requested".into(), MUTED, None)
+            }
+        }
+        ResourceRow::Owner(entry) => (
+            format!(" Owner {} · session {}", entry.branch, entry.owner.session),
+            MUTED,
+            None,
+        ),
+        ResourceRow::Queue(position, entry) => (
+            format!(" Queued Q{position} {} · no container", entry.branch),
+            AMBER,
+            None,
+        ),
+        ResourceRow::Blocked(view) => (
+            format!(
+                " {}",
+                view.error
+                    .as_deref()
+                    .and_then(|error| error.lines().next())
+                    .unwrap_or("Cleanup unresolved")
+            ),
+            AMBER,
+            None,
+        ),
+        ResourceRow::Workspace(project, workspace) => (
+            format!(
+                "  {}",
+                if project.repository.is_none() {
+                    workspace.tree.path.to_str().unwrap_or(workspace.label())
+                } else {
+                    workspace.label()
+                }
+            ),
+            FG,
+            Some(WorktreeHitAction::Project(project.order)),
+        ),
+        ResourceRow::Session(session) => {
+            let state = if session.state == AgentState::Unknown && !session.has_output() {
+                "starting"
+            } else {
+                state_name(session.state)
+            };
+            (
+                format!("   {} #{} · {state}", session.kind, session.id),
+                state_color(session.state),
+                Some(WorktreeHitAction::Session(session.id)),
+            )
+        }
+        ResourceRow::Tree(project, index, check) => {
+            let tree = &project.trees[index];
+            let text = Rect::new(area.x, area.y, area.width - WORKTREE_CELL, 1);
+            let trash = Rect::new(text.right(), area.y, WORKTREE_CELL, 1);
+            let (owner, queued) = check_row(check, &tree.path);
+            let open = project
+                .workspaces
+                .iter()
+                .any(|workspace| workspace.tree.id == tree.id);
+            let markers = [
+                (open, " ●", GREEN),
+                (tree.is_main, " main", MUTED),
+                (tree.locked, " locked", AMBER),
+                (tree.prunable, " missing", AMBER),
+            ];
+            let owner_marker = owner.map(check_phase);
+            let queue_marker = queued.map(|position| format!(" Q{position}"));
+            let marker_width: u16 = markers
+                .iter()
+                .filter(|marker| marker.0)
+                .map(|marker| marker.1.width() as u16)
+                .sum();
+            let check_width = owner_marker.map_or(0, |(name, _)| name.width() as u16 + 1)
+                + queue_marker
+                    .as_ref()
+                    .map_or(0, |marker| marker.width() as u16);
+            let room = text.width.saturating_sub(1);
+            let mut x = put_clipped(
+                buffer,
+                text.x + 1,
+                area.y,
+                if tree.bare {
+                    "bare repository"
+                } else {
+                    tree.label()
+                },
+                room.saturating_sub(check_width)
+                    .saturating_sub(marker_width.min(room.saturating_sub(check_width + 4))),
+                Style::default().fg(if focused_path == Some(tree.path.as_path()) {
+                    ACCENT
+                } else {
+                    FG
+                }),
+            );
+            if let Some((name, color)) = owner_marker {
+                x = buffer
+                    .set_stringn(
+                        x,
+                        area.y,
+                        format!(" {name}"),
+                        usize::from(text.right().saturating_sub(x)),
+                        Style::default().fg(color),
+                    )
+                    .0;
+            }
+            if let Some(marker) = &queue_marker {
+                x = buffer
+                    .set_stringn(
+                        x,
+                        area.y,
+                        marker,
+                        usize::from(text.right().saturating_sub(x)),
+                        Style::default().fg(AMBER),
+                    )
+                    .0;
+            }
+            for (_, marker, color) in markers.iter().filter(|marker| marker.0) {
+                x = buffer
+                    .set_stringn(
+                        x,
+                        area.y,
+                        marker,
+                        usize::from(text.right().saturating_sub(x)),
+                        Style::default().fg(*color),
+                    )
+                    .0;
+            }
+            let removable = !(tree.is_main || tree.locked || tree.bare);
+            buffer.set_string(
+                trash.x,
+                area.y,
+                " 🗑 ",
+                Style::default().fg(if removable { MUTED } else { BORDER }),
+            );
+            hits.push(WorktreeHit {
+                area: text,
+                action: WorktreeHitAction::Open {
+                    project: project.order,
+                    tree: index,
+                },
+            });
+            hits.push(WorktreeHit {
+                area: trash,
+                action: WorktreeHitAction::Remove {
+                    project: project.order,
+                    tree: index,
+                },
+            });
+            return;
+        }
+    };
+    put_clipped(
+        buffer,
+        area.x,
+        area.y,
+        &text,
+        area.width,
+        Style::default().fg(color),
+    );
+    if let Some(action) = action {
+        hits.push(WorktreeHit { area, action });
     }
 }
 
@@ -972,44 +1258,95 @@ fn line_horizontal(buffer: &mut Buffer, x: u16, y: u16, width: u16, color: Color
     }
 }
 
-/// Draws the key hint at the right end of the top row and returns its width. `cpu` is the agent
-/// CPU limit's state for F3 once a project is open, and `None` on the start screen, which only
-/// takes F12. The full labels take at most half the row, so the tabs keep the rest; narrower
-/// windows get shorter forms that leave the tabs at least 15 columns, so a focused tab fits
-/// even at the 30-column minimum.
-fn draw_key_mode(frame: &mut Frame, native_keys: bool, cpu: Option<&str>) -> u16 {
-    let width = usize::from(frame.area().width);
-    let hint_width =
-        |(start, end): (&str, &str), cpu: &str| start.width() + cpu.width() + end.width();
-    let (start, state, end) = match cpu {
-        _ if native_keys => (" F12  KITTY KEYS ", "", ""),
-        None => (" F12  CRIT KEYS ", "", ""),
-        Some(cpu) if 2 * hint_width(FULL_KEYS, cpu) <= width => (FULL_KEYS.0, cpu, FULL_KEYS.1),
-        Some(cpu) if hint_width(SHORT_KEYS, cpu) + 15 <= width => (SHORT_KEYS.0, cpu, SHORT_KEYS.1),
-        Some(_) => (" F1·F2·F3·F12 ", "", ""),
+/// Draws the right-aligned shortcut strip without taking the tabs' last 15 columns.
+/// Navigation is muted; values stay readable, an open worktree pane gets the accent,
+/// and disabled CPU limits or native key routing get the warning color.
+fn draw_key_mode(
+    frame: &mut Frame,
+    native_keys: bool,
+    cpu: Option<&str>,
+    worktrees_open: bool,
+) -> u16 {
+    let bounds = frame.area();
+    let (cpu_state, cpu_color) = match cpu {
+        Some("OFF") => ("Off", AMBER),
+        Some("LOW") => ("Low", FG),
+        Some(state) => (state, FG),
+        None => ("", FG),
     };
-    let used = (start.width() + state.width() + end.width()) as u16;
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::raw(start),
-            Span::raw(state),
-            Span::raw(end),
-        ]))
-        .style(
-            Style::default()
-                .fg(if native_keys { AMBER } else { ACCENT })
-                .bg(BG),
+    let trees_color = if worktrees_open { ACCENT } else { MUTED };
+    let full = [
+        (" F1 Ask  ", MUTED),
+        ("F2 Resources", trees_color),
+        ("   F3 CPU ", MUTED),
+        (cpu_state, cpu_color),
+        ("   F12 ", MUTED),
+        ("Crit keys ", FG),
+    ];
+    let short = [
+        (" F1  ", MUTED),
+        ("F2", trees_color),
+        ("  F3 CPU ", MUTED),
+        (cpu_state, cpu_color),
+        ("  F12 ", MUTED),
+    ];
+    let keys = [
+        (" F1 ", MUTED),
+        ("F2", trees_color),
+        (" F3", if cpu == Some("OFF") { AMBER } else { MUTED }),
+        (" F12 ", MUTED),
+    ];
+    let mode = [
+        (" F12 ", MUTED),
+        (
+            if native_keys {
+                if bounds.width < 31 {
+                    "Kitty "
+                } else {
+                    "Kitty keys "
+                }
+            } else {
+                "Crit keys "
+            },
+            if native_keys { AMBER } else { FG },
         ),
-        Rect::new(frame.area().width.saturating_sub(used), 0, used, 1),
-    );
+    ];
+    let columns = |parts: &[(&str, Color)]| {
+        parts
+            .iter()
+            .map(|(text, _)| text.width() as u16)
+            .sum::<u16>()
+    };
+    let (parts, used): (&[(&str, Color)], u16) = if native_keys || cpu.is_none() {
+        (&mode, columns(&mode))
+    } else {
+        let full_width = columns(&full);
+        if full_width * 2 <= bounds.width {
+            (&full, full_width)
+        } else {
+            let short_width = columns(&short);
+            if short_width + 15 <= bounds.width {
+                (&short, short_width)
+            } else {
+                (&keys, columns(&keys))
+            }
+        }
+    };
+    let mut x = bounds.right().saturating_sub(used);
+    let buffer = frame.buffer_mut();
+    for &(text, color) in parts {
+        x = buffer
+            .set_stringn(
+                x,
+                bounds.y,
+                text,
+                usize::from(bounds.right() - x),
+                Style::default().fg(color).bg(BG),
+            )
+            .0;
+    }
     used
 }
-
-/// The key hint around the agent CPU limit's state, with every key named.
-const FULL_KEYS: (&str, &str) = (" F1 ASK · F2 WORKTREES · F3 CPU ", " · F12 CRIT KEYS ");
-
-/// The key hint around the agent CPU limit's state, for windows too narrow for `FULL_KEYS`.
-const SHORT_KEYS: (&str, &str) = (" F1 · F2 · F3 CPU ", " · F12 ");
 
 /// Draws a centered message without changing the terminal layout.
 pub fn draw_alert(frame: &mut Frame, title: &str, text: &str) {
@@ -1042,6 +1379,114 @@ pub fn draw_alert(frame: &mut Frame, title: &str, text: &str) {
     );
 }
 
+pub fn draw_startup_updates(
+    frame: &mut Frame,
+    states: &[UpdateState; UPDATE_TOOLS.len()],
+    tick: usize,
+) {
+    let bounds = frame.area();
+    if bounds.is_empty() {
+        return;
+    }
+    let buffer = frame.buffer_mut();
+    buffer.set_style(bounds, Style::default().fg(FG).bg(BG));
+    let width = bounds.width.min(48);
+    let x = bounds.x + (bounds.width - width) / 2;
+    let y = bounds.y + bounds.height.saturating_sub(7) / 2;
+    buffer.set_stringn(
+        x,
+        y,
+        "crit",
+        width as usize,
+        Style::default().fg(ACCENT).bold(),
+    );
+    if width > 4 {
+        let checking = states.iter().any(|state| *state == UpdateState::Checking);
+        let label = if !checking {
+            " is ready"
+        } else if width >= 43 {
+            " is checking for updates"
+        } else {
+            " is checking"
+        };
+        buffer.set_stringn(
+            x + 4,
+            y,
+            label,
+            (width - 4) as usize,
+            Style::default().fg(FG),
+        );
+    }
+    if width >= 30 {
+        let start = x + width - 13;
+        let head = if tick < 12 { tick } else { 23 - tick };
+        // The original travelling wave, not a percentage or simulated download bar.
+        for column in 0_usize..12 {
+            let (glyph, color) = match column.abs_diff(head) {
+                0 => ("⣿", ACCENT),
+                1 => ("⣶", Color::Rgb(120, 162, 220)),
+                2 => ("⣤", Color::Rgb(85, 118, 164)),
+                3 => ("⣀", Color::Rgb(60, 80, 110)),
+                _ => ("·", BORDER),
+            };
+            buffer[(start + column as u16, y)]
+                .set_symbol(glyph)
+                .set_fg(color);
+        }
+    } else if width > 17 {
+        const FRAMES: [&str; 4] = ["⣀", "⣤", "⣶", "⣿"];
+        buffer[(x + width - 1, y)]
+            .set_symbol(FRAMES[tick % FRAMES.len()])
+            .set_fg(ACCENT);
+    }
+    for (index, state) in states.iter().enumerate() {
+        let row = y + 2 + index as u16;
+        if row >= bounds.bottom() || width < 3 {
+            break;
+        }
+        let (mark, text, color) = match state {
+            UpdateState::Checking => ("›", "checking", ACCENT),
+            UpdateState::Ready => ("✓", "ready", GREEN),
+            UpdateState::Failed => ("!", "using installed version", AMBER),
+            UpdateState::Missing => ("·", "not installed", MUTED),
+        };
+        buffer.set_stringn(
+            x + 2,
+            row,
+            mark,
+            (width - 2) as usize,
+            Style::default().fg(color),
+        );
+        if width > 5 {
+            buffer.set_stringn(
+                x + 5,
+                row,
+                UPDATE_TOOLS[index].0,
+                (width - 5) as usize,
+                Style::default().fg(FG),
+            );
+        }
+        if width > 15 {
+            buffer.set_stringn(
+                x + 15,
+                row,
+                text,
+                (width - 15) as usize,
+                Style::default().fg(color),
+            );
+        }
+    }
+    if y + 5 < bounds.bottom() {
+        buffer.set_stringn(
+            x,
+            y + 5,
+            "esc quit · ctrl+c quit",
+            width as usize,
+            Style::default().fg(MUTED),
+        );
+    }
+}
+
 pub fn draw_project_chooser(
     frame: &mut Frame,
     picker: &ProjectPicker,
@@ -1060,7 +1505,7 @@ pub fn draw_project_chooser(
         );
         return;
     }
-    let mode_width = draw_key_mode(frame, native_keys, None);
+    let mode_width = draw_key_mode(frame, native_keys, None, false);
     frame.render_widget(
         Paragraph::new(" crit · start").style(Style::default().fg(FG).bold()),
         Rect::new(0, 0, bounds.width.saturating_sub(mode_width), 1),
@@ -1263,12 +1708,7 @@ fn modal_area_in(frame: &mut Frame, bounds: Rect, title: &str, desired: Size) ->
 }
 
 fn draw_split_picker(frame: &mut Frame, bounds: Rect, selected: usize) {
-    let existing = if bounds.width < 32 {
-        "Existing branch/tree"
-    } else {
-        "Existing branch/worktree"
-    };
-    let choices = ["New worktree", "Split terminal", existing];
+    let choices = ["New worktree", "Split terminal"];
     let controls = "↑/↓ select · Enter · Esc";
     let width = choices
         .iter()
@@ -1299,81 +1739,6 @@ fn draw_split_picker(frame: &mut Frame, bounds: Rect, selected: usize) {
     );
 }
 
-fn draw_existing_split_picker(
-    frame: &mut Frame,
-    bounds: Rect,
-    choices: &[SplitTarget],
-    selected: usize,
-    error: Option<&str>,
-) {
-    let mut error_rows = 0_u16;
-    if let Some(error) = error {
-        message_chunks(error, bounds.width.saturating_sub(6).min(74), |_| {
-            error_rows = error_rows.saturating_add(1);
-        });
-        error_rows = error_rows.clamp(1, 3);
-    }
-    let rows = if choices.is_empty() {
-        2
-    } else {
-        choices.len().min(17) as u16
-    };
-    let inner = modal_area_in(
-        frame,
-        bounds,
-        " existing branch / worktree ",
-        Size::new(76, (rows + error_rows + 3).min(20)),
-    );
-    let error_rows = error_rows.min(inner.height.saturating_sub(2));
-    let list = Rect::new(
-        inner.x,
-        inner.y,
-        inner.width,
-        inner.height.saturating_sub(error_rows + 1),
-    );
-    if choices.is_empty() {
-        frame.render_widget(
-            Paragraph::new("No other branches or\nworktrees to open.")
-                .style(Style::default().fg(MUTED)),
-            list,
-        );
-    } else {
-        choice_list(
-            frame,
-            list,
-            choices.iter().map(|choice| match choice {
-                SplitTarget::Worktree(tree) => {
-                    format!("{}  {}", tree.label(), tree.path.display())
-                }
-                SplitTarget::Branch(branch) => format!("{branch}  (create worktree)"),
-            }),
-            selected,
-        );
-    }
-    if let Some(error) = error {
-        draw_message(
-            frame,
-            error,
-            Rect::new(inner.x, list.bottom(), inner.width, error_rows),
-        );
-    }
-    frame.render_widget(
-        Paragraph::new("↑↓ choose · Enter · Esc").style(Style::default().fg(MUTED)),
-        Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
-    );
-}
-
-fn draw_opening_split(frame: &mut Frame, bounds: Rect) {
-    let message = "Opening split… Esc hides";
-    let inner = modal_area_in(
-        frame,
-        bounds,
-        " opening ",
-        Size::new(message.width() as u16 + 2, 3),
-    );
-    frame.render_widget(Paragraph::new(message), inner);
-}
-
 fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
     let available = frame.area();
     let (title, desired_height) = match modal {
@@ -1388,26 +1753,11 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
         ),
         Modal::NewWorktree { split: None, .. } => (" new worktree tab ", 12),
         Modal::NewWorktree { .. } => (" new worktree in split ", 12),
-        Modal::NewSession { .. } => (" new session ", 8),
+        Modal::ChooseAgent { .. } => (" choose agent ", 8),
         Modal::OpenWorktree { trees, .. } => {
             (" open existing worktree ", (trees.len() as u16 + 4).min(20))
         }
         Modal::Split { selected, .. } => return draw_split_picker(frame, available, *selected),
-        Modal::ExistingSplit {
-            choices,
-            selected,
-            error,
-            ..
-        } => {
-            return draw_existing_split_picker(
-                frame,
-                available,
-                choices,
-                *selected,
-                error.as_deref(),
-            );
-        }
-        Modal::OpeningSplit { .. } => return draw_opening_split(frame, available),
         Modal::Preview { urls, .. } => (" open endpoint ", (urls.len() as u16 + 4).min(20)),
         Modal::Confirm(_) => (" confirm ", 9),
         Modal::Removal { error, .. } => (
@@ -1496,6 +1846,8 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
             },
         );
         Size::new(width + 2, rows.saturating_add(if failed { 4 } else { 2 }))
+    } else if matches!(modal, Modal::ChooseAgent { .. }) {
+        Size::new(27, desired_height)
     } else {
         Size::new(76, desired_height)
     };
@@ -1547,7 +1899,9 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
                 Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
             );
         }
-        Modal::NewTab { choices, selected } => choice_list(
+        Modal::NewTab {
+            choices, selected, ..
+        } => choice_list(
             frame,
             inner,
             choices.iter().map(|(label, _)| label.clone()),
@@ -1571,7 +1925,7 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
             }),
             *selected,
         ),
-        Modal::NewWorktree { input, split } => {
+        Modal::NewWorktree { input, split, .. } => {
             let outcome = match split {
                 Some(LayoutMode::Vertical) => "opens it side by side with",
                 Some(_) => "opens it below",
@@ -1592,24 +1946,37 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
             if inner.height > 5 {
                 frame.render_widget(
                     Paragraph::new(format!(
-                        "Enter creates the checkout from {base}, starts its Compose stack, and {outcome} {base}.",
+                        "Enter selects the branch, then asks which program to run. Crit {outcome} {base}. Docker starts only on a check request.",
                         base = app.focused().label(),
                     )).wrap(Wrap { trim: false }),
                     Rect::new(inner.x, inner.y + 4, inner.width, inner.height - 5),
                 );
             }
             frame.render_widget(
-                Paragraph::new("Enter create · Esc cancel").style(Style::default().fg(MUTED)),
+                Paragraph::new("Enter next · Esc cancel").style(Style::default().fg(MUTED)),
                 Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
             );
         }
-        Modal::NewSession { selected } => choice_list(
-            frame,
-            inner,
-            ["OMP", "OpenCode", "Shell"].into_iter().map(String::from),
-            *selected,
-        ),
-        Modal::OpenWorktree { trees, selected } => choice_list(
+        Modal::ChooseAgent { selected, .. } => {
+            choice_list(
+                frame,
+                Rect::new(
+                    inner.x,
+                    inner.y,
+                    inner.width,
+                    inner.height.saturating_sub(1),
+                ),
+                ["OMP", "OpenCode", "Terminal"],
+                *selected,
+            );
+            frame.render_widget(
+                Paragraph::new("↑/↓ select · Enter · Esc").style(Style::default().fg(MUTED)),
+                Rect::new(inner.x, inner.bottom().saturating_sub(1), inner.width, 1),
+            );
+        }
+        Modal::OpenWorktree {
+            trees, selected, ..
+        } => choice_list(
             frame,
             inner,
             trees
@@ -1617,7 +1984,7 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
                 .map(|tree| format!("{}  {}", tree.label(), tree.path.display())),
             *selected,
         ),
-        Modal::Split { .. } | Modal::ExistingSplit { .. } | Modal::OpeningSplit { .. } => {
+        Modal::Split { .. } => {
             unreachable!("split dialogs are rendered above")
         }
         Modal::Preview { urls, selected } => choice_list(
@@ -1630,17 +1997,17 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
             let named;
             let message = match confirm {
                 Confirm::Quit => {
-                    "Exit Crit; stop sessions?\nSaved chats reopen.\nDocker/checkouts stay."
+                    "Exit Crit; stop sessions and owned checks?\nSaved chats reopen.\nCheckouts and volumes stay."
                 }
                 Confirm::CloseWorktree { .. } => unreachable!("close tab is rendered above"),
                 Confirm::CloseSession => {
-                    "End the focused session?\nA tab left empty closes, like a Kitty window.\nOther sessions, checkouts and Docker remain."
+                    "End the focused session?\nA tab left empty closes, like a Kitty window.\nIts check turn ends; checkouts and volumes remain."
                 }
                 Confirm::StopEnvironment => {
-                    "Stop this worktree's Docker?\nOther worktrees unaffected.\nVolumes remain."
+                    "Release your project check turn?\nOwned checks stop before the next queued turn.\nCheckouts and volumes remain."
                 }
                 Confirm::RemoveWorktree { tree: None } => {
-                    "Delete this checkout?\nIgnored files go with it.\nDirty/main/locked refused.\nStop Docker first.\nBranch remains."
+                    "Delete this checkout?\nIgnored files go with it.\nDirty/main/locked refused.\nRelease its check turn first.\nBranch remains."
                 }
                 Confirm::RemoveWorktree { tree: Some(tree) } => {
                     // The branch shares one line with the question, so the warnings keep their rows.
@@ -1648,7 +2015,7 @@ fn draw_modal(frame: &mut Frame, app: &App, modal: &Modal) {
                     let (label, cut) = clip_width(tree.label(), room);
                     let ellipsis = if cut { "…" } else { "" };
                     named = format!(
-                        "Delete worktree {label}{ellipsis}?\nIgnored files go with it.\nDirty/main/locked refused.\nStop Docker first.\nBranch remains."
+                        "Delete worktree {label}{ellipsis}?\nIgnored files go with it.\nDirty/main/locked refused.\nRelease its check turn first.\nBranch remains."
                     );
                     named.as_str()
                 }
@@ -1790,6 +2157,200 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
 
+    fn check_entry(path: &str, session: u64) -> crate::checks::Entry {
+        crate::checks::Entry {
+            owner: crate::checks::Owner {
+                window: 100,
+                session,
+                pid: 200,
+                start: 1,
+                window_start: 1,
+            },
+            worktree: path.into(),
+            branch: format!("branch-{session}"),
+            revision: "abcdef".into(),
+            automatic: true,
+        }
+    }
+
+    #[test]
+    fn check_rows_track_project_owner_and_fifo_without_open_tabs() {
+        let mut view = View {
+            project: "/repo/.git".into(),
+            phase: Phase::Starting,
+            active: Some(check_entry("/repo/owner", 1)),
+            queue: vec![
+                check_entry("/repo/waiting", 2),
+                check_entry("/repo/owner", 3),
+            ],
+            environment: None,
+            error: None,
+        };
+        assert_eq!(
+            check_row(Some(&view), Path::new("/repo/owner")),
+            (Some(&Phase::Starting), Some(2))
+        );
+        assert_eq!(
+            check_row(Some(&view), Path::new("/repo/waiting")),
+            (None, Some(1))
+        );
+        assert_eq!(
+            check_row(Some(&view), Path::new("/repo/unrequested")),
+            (None, None)
+        );
+        for phase in [Phase::Active, Phase::Stopping, Phase::Blocked] {
+            view.phase = phase;
+            assert_eq!(
+                check_row(Some(&view), Path::new("/repo/owner")).0,
+                Some(&view.phase)
+            );
+        }
+        assert_eq!(check_row(None, Path::new("/repo/owner")), (None, None));
+    }
+
+    #[test]
+    fn resource_inventory_keeps_project_order_and_external_check_owners_without_focus() {
+        let make_project = |order| Project {
+            repository: None,
+            name: format!("project-{order}"),
+            workspaces: vec![test_workspace()],
+            trees: Vec::new(),
+            active: 0,
+            secondary: None,
+            secondary_session: None,
+            focus_secondary: false,
+            layout: LayoutMode::Full,
+            split_ratio: crate::restore::default_split_ratio(),
+            order,
+        };
+        let mut first = make_project(10);
+        first.repository = Some(crate::worktree::Repository {
+            root: "/repo".into(),
+            common_dir: "/repo/.git".into(),
+        });
+        first.trees.push(test_workspace().tree);
+        let second = make_project(20);
+        let local = View {
+            project: "/repo/.git".into(),
+            phase: Phase::Stopped,
+            active: None,
+            queue: Vec::new(),
+            environment: None,
+            error: None,
+        };
+        let external = View {
+            project: "/external/.git".into(),
+            phase: Phase::Blocked,
+            active: Some(check_entry("/external/owner", 71)),
+            queue: vec![check_entry("/external/queue", 72)],
+            environment: None,
+            error: Some("Cleanup unresolved".into()),
+        };
+        let mut stopped = external.clone();
+        stopped.project = "/stopped/.git".into();
+        stopped.phase = Phase::Stopped;
+        stopped.active = None;
+        stopped.queue.clear();
+        let checks = [local, external, stopped];
+        let inventory = |current: &Project, saved: &[Project]| {
+            let mut rows = Vec::new();
+            visit_resource_rows(current, saved, &checks, |row| {
+                rows.push(match row {
+                    ResourceRow::Project(project) => (0, project.order),
+                    ResourceRow::Tree(project, index, _) => (1, project.order + index as u64),
+                    ResourceRow::Workspace(project, _) => (2, project.order),
+                    ResourceRow::Check(Some(view)) => (3, u64::from(view.phase == Phase::Stopped)),
+                    ResourceRow::External(_) => (4, 0),
+                    ResourceRow::Owner(entry) => (5, entry.owner.session),
+                    ResourceRow::Queue(position, entry) => {
+                        (6 + position as u64, entry.owner.session)
+                    }
+                    ResourceRow::Blocked(_) => (8, 0),
+                    _ => panic!("unexpected resource row"),
+                })
+            });
+            rows
+        };
+        let before = inventory(&first, std::slice::from_ref(&second));
+        let after = inventory(&second, std::slice::from_ref(&first));
+        assert_eq!(before, after);
+        assert_eq!(
+            before,
+            [
+                (0, 10),
+                (3, 1),
+                (1, 10),
+                (0, 20),
+                (2, 20),
+                (4, 0),
+                (3, 0),
+                (5, 71),
+                (7, 72),
+                (8, 0)
+            ]
+        );
+        for width in [23, 37] {
+            let bounds = Rect::new(0, 0, width + 2, 3);
+            let area = Rect::new(1, 1, width, 1);
+            let mut buffer = Buffer::empty(bounds);
+            let mut hits = Vec::new();
+            draw_resource_row(
+                &mut buffer,
+                area,
+                ResourceRow::Tree(&first, 0, Some(&checks[0])),
+                None,
+                &mut hits,
+            );
+            assert_eq!(hits.len(), 2);
+            assert!(matches!(
+                hits[0].action,
+                WorktreeHitAction::Open {
+                    project: 10,
+                    tree: 0
+                }
+            ));
+            assert!(matches!(
+                hits[1].action,
+                WorktreeHitAction::Remove {
+                    project: 10,
+                    tree: 0
+                }
+            ));
+            assert_eq!(hits[0].area.right(), hits[1].area.x);
+            assert_eq!(hits[1].area.right(), area.right());
+            assert_eq!(buffer[(0, 1)].symbol(), " ");
+            assert_eq!(buffer[(bounds.right() - 1, 1)].symbol(), " ");
+        }
+    }
+
+    #[test]
+    fn resource_check_rows_clip_without_overwriting_neighbor_cells() {
+        let view = View {
+            project: "/repo/.git".into(),
+            phase: Phase::Blocked,
+            active: Some(check_entry("/repo/closed-tab", 1)),
+            queue: vec![check_entry("/repo/waiting", 2)],
+            environment: None,
+            error: Some("Conflict: 外部の環境 is still running\nfull detail".into()),
+        };
+        for width in [1, 2, 23, 37] {
+            let bounds = Rect::new(0, 0, width + 2, 3);
+            let area = Rect::new(1, 1, width, 1);
+            visit_check_rows(Some(&view), &mut |row| {
+                let mut buffer = Buffer::empty(bounds);
+                let mut hits = Vec::new();
+                draw_resource_row(&mut buffer, area, row, None, &mut hits);
+                assert!(hits.is_empty());
+                for x in 0..bounds.width {
+                    assert_eq!(buffer[(x, 0)].symbol(), " ");
+                    assert_eq!(buffer[(x, 2)].symbol(), " ");
+                }
+                assert_eq!(buffer[(0, 1)].symbol(), " ");
+                assert_eq!(buffer[(bounds.right() - 1, 1)].symbol(), " ");
+            });
+        }
+    }
+
     fn test_workspace() -> Workspace {
         Workspace {
             tree: crate::worktree::Worktree {
@@ -1805,8 +2366,7 @@ mod tests {
             source: None,
             sessions: Vec::new(),
             selected: 0,
-            environment: None,
-            pending: false,
+            removing: false,
         }
     }
 
@@ -2092,7 +2652,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_sessions_say_they_are_starting() {
+    fn blank_terminal_setup_does_not_hide_first_real_output() {
         use std::time::{Duration, Instant};
         let directory = tempfile::tempdir().unwrap();
         let area = Rect::new(0, 1, 100, 6);
@@ -2128,49 +2688,6 @@ mod tests {
                 .unwrap();
             terminal.backend().buffer().clone()
         };
-        // Silent programs. An agent whose state is not known yet is "starting"; a shell is
-        // idle from its first moment, and its pane still says what it is waiting for.
-        for (kind, chat, line, state) in [
-            ("shell", None, "Starting shell…", "idle"),
-            ("omp", None, "Starting omp…", "starting"),
-            (
-                "omp",
-                Some("/chats/a.jsonl"),
-                "Starting omp — loading its saved chat…",
-                "starting",
-            ),
-            ("opencode", None, "Starting opencode…", "starting"),
-            (
-                "opencode",
-                Some("ses_a"),
-                "Starting opencode — opening its saved chat…",
-                "starting",
-            ),
-        ] {
-            let workspace = spawn(kind, chat, "/bin/sleep", &["5"]);
-            assert!(!workspace.sessions[0].has_output());
-            let buffer = draw(&workspace, area);
-            // One muted line in the body's top-left corner, and nothing else in the body.
-            assert_eq!(row_text(&buffer, content, content.y).trim_end(), line);
-            assert_eq!(buffer[(content.x, content.y)].fg, MUTED);
-            for row in content.y + 1..content.bottom() {
-                assert!(row_text(&buffer, content, row).trim().is_empty());
-            }
-            let header = row_text(&buffer, area, area.y);
-            assert!(
-                header.contains(&format!("[{kind} 1 · {state}]")),
-                "{header:?}"
-            );
-        }
-        // A body too narrow for the line cuts it with `…` and never draws outside itself.
-        let workspace = spawn("omp", None, "/bin/sleep", &["5"]);
-        let narrow = Rect::new(0, 1, 12, 6);
-        let buffer = draw(&workspace, narrow);
-        assert_eq!(
-            row_text(&buffer, body(narrow), body(narrow).y),
-            "Starting …"
-        );
-        assert_eq!(buffer[(body(narrow).right(), body(narrow).y)].symbol(), " ");
         // Terminal setup and a screen of blanks show nothing, so an agent that has sent only
         // those is still starting. Once text shows, its output is drawn as it is.
         let script = "printf '\\033[?1049h\\033[?1000h%200s' ''; read line; \
@@ -2183,12 +2700,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!session.has_output());
-        let buffer = draw(&workspace, area);
-        assert_eq!(
-            row_text(&buffer, content, content.y).trim_end(),
-            "Starting omp…"
-        );
-        assert!(row_text(&buffer, area, area.y).contains("[omp 1 · starting]"));
         // The newline ends the program's `read`; its echo moves the cursor and paints nothing.
         session.paste("\n").unwrap();
         while !session.has_output() {
@@ -2197,7 +2708,6 @@ mod tests {
         }
         let buffer = draw(&workspace, area);
         assert_eq!(row_text(&buffer, content, content.y).trim_end(), "painted");
-        assert!(row_text(&buffer, area, area.y).contains("[omp 1 · unknown]"));
         // A program that exited without painting is not starting any more.
         let workspace = spawn("omp", None, "/bin/true", &[]);
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -2215,7 +2725,7 @@ mod tests {
             let bounds = Rect::new(0, 0, size.width, size.height);
             let mut terminal = Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
             let mut selected_rows = Vec::new();
-            for selected in 0..3 {
+            for selected in 0..2 {
                 terminal
                     .draw(|frame| draw_split_picker(frame, bounds, selected))
                     .unwrap();
@@ -2231,110 +2741,6 @@ mod tests {
             }
             assert!(selected_rows.windows(2).all(|rows| rows[0] < rows[1]));
         }
-    }
-
-    #[test]
-    fn existing_split_picker_keeps_navigation_and_errors_visible_during_scroll() {
-        let choices: Vec<_> = (0..30)
-            .map(|index| SplitTarget::Branch(format!("branch-{index:02}")))
-            .collect();
-        for size in [Size::new(30, 10), Size::new(80, 24)] {
-            let bounds = Rect::new(0, 0, size.width, size.height);
-            let mut terminal = Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
-            for error in [
-                None,
-                Some("Opening failed:\ncheckout unavailable\ntry another target"),
-            ] {
-                for selected in [0, 1, 15, 29, 28, 0] {
-                    terminal
-                        .draw(|frame| {
-                            draw_existing_split_picker(frame, bounds, &choices, selected, error);
-                        })
-                        .unwrap();
-                    let buffer = terminal.backend().buffer();
-                    let rows: Vec<_> = (0..bounds.bottom())
-                        .map(|row| row_text(buffer, bounds, row))
-                        .collect();
-                    assert!(rows.iter().any(|row| {
-                        row.contains('›') && row.contains(&format!("branch-{selected:02}"))
-                    }));
-                    assert!(
-                        rows.iter()
-                            .any(|row| row.contains("Enter") && row.contains("Esc"))
-                    );
-                    if error.is_some() {
-                        assert!(rows.iter().any(|row| row.contains("try another target")));
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn existing_split_picker_distinguishes_paths_and_creation_without_filling_screen() {
-        let mut first = test_workspace().tree;
-        first.branch = "detached".into();
-        first.path = "/repo/one".into();
-        let mut second = first.clone();
-        second.path = "/repo/two".into();
-        let choices = [
-            SplitTarget::Worktree(first),
-            SplitTarget::Worktree(second),
-            SplitTarget::Branch("topic".into()),
-        ];
-        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal
-            .draw(|frame| {
-                let bounds = frame.area();
-                draw_existing_split_picker(frame, bounds, &choices, 2, None);
-            })
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let rows: Vec<_> = (0..buffer.area.height)
-            .map(|row| row_text(buffer, buffer.area, row))
-            .filter(|row| !row.trim().is_empty())
-            .collect();
-        assert!(
-            rows.iter()
-                .any(|row| row.contains("detached") && row.contains("/repo/one"))
-        );
-        assert!(
-            rows.iter()
-                .any(|row| row.contains("detached") && row.contains("/repo/two"))
-        );
-        assert!(
-            rows.iter()
-                .any(|row| row.contains("topic") && row.contains("create"))
-        );
-        assert!(rows.len() < buffer.area.height as usize / 2);
-    }
-
-    #[test]
-    fn empty_split_picker_remains_navigable_and_opening_hints_that_esc_hides_it() {
-        let size = Size::new(30, 10);
-        let bounds = Rect::new(0, 0, size.width, size.height);
-        let mut terminal = Terminal::new(TestBackend::new(size.width, size.height)).unwrap();
-        terminal
-            .draw(|frame| draw_existing_split_picker(frame, bounds, &[], 0, Some("No repository")))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let rows: Vec<_> = (0..bounds.bottom())
-            .map(|row| row_text(buffer, bounds, row))
-            .collect();
-        assert!(rows.iter().any(|row| row.contains("No other")));
-        assert!(rows.iter().any(|row| row.contains("No repository")));
-        assert!(rows.iter().any(|row| row.contains("Esc")));
-        terminal
-            .draw(|frame| draw_opening_split(frame, bounds))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let rows: Vec<_> = (0..size.height)
-            .map(|row| row_text(buffer, buffer.area, row))
-            .filter(|row| !row.trim().is_empty())
-            .collect();
-        assert!(rows.iter().any(|row| row.contains("Opening")));
-        assert!(rows.iter().any(|row| row.contains("Esc")));
-        assert!(rows.len() < bounds.height as usize / 2);
     }
 
     #[test]
@@ -2391,7 +2797,6 @@ mod tests {
                 assert_eq!(divider.handle.right(), right.x);
                 assert_eq!(right.right() + MARGIN, size.width);
                 assert_eq!(divider.handle.x, left.right());
-                assert_eq!(divider.handle.height, 1);
                 let above = divider.handle.y - divider.track.y;
                 let below = divider.track.bottom() - divider.handle.bottom();
                 assert!(above.abs_diff(below) <= 1);
@@ -2622,54 +3027,33 @@ mod tests {
     }
 
     #[test]
-    fn key_mode_hint_lists_f2_and_f3_and_compacts_on_narrow_frames() {
-        // The pane's trash cell relies on this glyph taking one column, not two.
-        assert_eq!("🗑".width(), 1);
-        let hint = |width: u16, native_keys: bool, cpu: Option<&str>| {
-            let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
-            let mut used = 0;
-            terminal
-                .draw(|frame| used = draw_key_mode(frame, native_keys, cpu))
-                .unwrap();
-            let buffer = terminal.backend().buffer();
-            let row: String = (0..width)
-                .map(|column| buffer[(column, 0)].symbol())
-                .collect();
-            (used, row)
-        };
-        // Every key is named where that takes at most half the row.
-        for (width, cpu) in [(104, "50%"), (104, "OFF"), (106, "100%"), (200, "LOW")] {
-            let (used, row) = hint(width, false, Some(cpu));
-            let expected = format!(" F1 ASK · F2 WORKTREES · F3 CPU {cpu} · F12 CRIT KEYS ");
-            assert!(row.ends_with(&expected), "{row:?}");
-            assert_eq!(usize::from(used), expected.width());
-            assert!(width - used >= used);
+    fn key_hint_preserves_the_tab_slot_across_compaction_boundaries() {
+        let tab = "visible-tab....";
+        for width in 30..=140 {
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            for (native_keys, cpu) in [
+                (false, None),
+                (false, Some("50%")),
+                (false, Some("100%")),
+                (true, Some("50%")),
+            ] {
+                let mut used = 0;
+                terminal
+                    .draw(|frame| {
+                        frame.buffer_mut().set_string(0, 0, tab, Style::default());
+                        used = draw_key_mode(frame, native_keys, cpu, false);
+                    })
+                    .unwrap();
+                assert!(width - used >= 15, "width {width}, native {native_keys}");
+                let buffer = terminal.backend().buffer();
+                for (column, character) in tab.char_indices() {
+                    assert_eq!(
+                        buffer[(column as u16, 0)].symbol(),
+                        &tab[column..column + character.len_utf8()]
+                    );
+                }
+            }
         }
-        // Narrower, the keys and the limit's state still show while the tab bar keeps 15.
-        for (width, cpu) in [
-            (103, "50%"),
-            (105, "100%"),
-            (64, "50%"),
-            (43, "50%"),
-            (43, "OFF"),
-        ] {
-            let (used, row) = hint(width, false, Some(cpu));
-            assert!(
-                row.ends_with(&format!(" F1 · F2 · F3 CPU {cpu} · F12 ")),
-                "{row:?}"
-            );
-            assert!(width - used >= 15);
-        }
-        // Down to the 30-column minimum, the keys alone; a focused tab still fits.
-        for width in [30, 42] {
-            let (used, row) = hint(width, false, Some("100%"));
-            assert_eq!(used, 14);
-            assert!(row.ends_with(" F1·F2·F3·F12 "), "{row:?}");
-            assert!(width - used >= 15);
-        }
-        // Native mode, where F3 belongs to the terminal, and the project chooser keep their labels.
-        assert_eq!(hint(100, true, Some("50%")).0, 17);
-        assert_eq!(hint(100, false, None).0, 16);
     }
 
     #[test]

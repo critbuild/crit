@@ -53,9 +53,9 @@ const heroPanes: Pane[] = [
     ],
     lines: [
       { kind: 'label', text: ciPath },
-      { kind: 'cmd', text: 'crit env status', callout: 3 },
-      { kind: 'out', text: 'web   running   127.0.0.1:41873 → 3000' },
-      { kind: 'out', text: 'api   running   127.0.0.1:41874 → 8000' },
+      { kind: 'cmd', text: 'crit check status', callout: 3 },
+      { kind: 'out', text: 'owner: feat/login-fixes · running' },
+      { kind: 'out', text: 'queue: fix/flaky-ci #1 · no containers' },
       { kind: 'cursor', text: '' },
     ],
   },
@@ -103,7 +103,7 @@ const requests: Request[] = [
     projects: [critProject('feat/login-fixes')],
     panes: [loginPane([{ kind: 'omp', state: 'working', active: true }], ompLines)],
     note:
-      'A fresh checkout from the focused HEAD, in its own tab, with your default agent started. If crit.toml configures Compose, this worktree’s stack comes up as well, on its own loopback ports.',
+      'A fresh checkout from the focused HEAD, in its own tab. Choose a folder or branch first, including an existing worktree, then OMP, OpenCode or Terminal. Creating, opening or restoring a checkout never starts the checking runtime.',
   },
   {
     id: 'project',
@@ -158,11 +158,11 @@ const requests: Request[] = [
       },
     ],
     note:
-      'The split picker offers New worktree for a separate checkout, Split terminal for a shell in the same folder beside whatever the pane runs, and Existing branch/worktree for a list of checkouts and local branches. Existing checkouts are reused; a branch without one gets its own worktree at its own commit. Ctrl+Shift+, opens the picker by hand. Ctrl+Shift+L cycles full, vertical and horizontal layouts; returning to full width keeps the focused session.',
+      'The split picker offers New worktree for a separate checkout and Split terminal for a shell in the same folder beside whatever the pane runs. F2 groups live sessions, registered checkouts and checking ownership across all open projects: click a session to focus its existing process, a checkout to open its tab, or the trash icon to delete it. Uncreated branches are not worktrees. Ctrl+Shift+, opens the split picker by hand. Ctrl+Shift+L cycles full, vertical and horizontal layouts; returning to full width keeps the focused session.',
   },
   {
     id: 'logs',
-    label: 'this worktree’s Compose logs',
+    label: 'the shared checking runtime’s logs',
     input: "Show this workspace's logs.",
     plan: '{"action":"command","command":"environment_logs"}',
     projects: [critProject('feat/login-fixes')],
@@ -173,8 +173,8 @@ const requests: Request[] = [
           { kind: 'logs', state: 'working', active: true },
         ],
         [
-          { kind: 'label', text: 'logs · compose project crit-7c1f3a9e…' },
-          { kind: 'cmd', text: 'docker compose logs --follow' },
+          { kind: 'label', text: 'logs · project checking runtime · owner feat/login-fixes' },
+          { kind: 'cmd', text: 'crit check logs' },
           { kind: 'out', text: 'web-1  | listening on http://0.0.0.0:3000' },
           { kind: 'out', text: 'api-1  | ready on :8000' },
           { kind: 'out', text: 'api-1  | GET /session 200 3ms' },
@@ -182,7 +182,7 @@ const requests: Request[] = [
       ),
     ],
     note:
-      'Logs open as a session inside the focused worktree, scoped to that worktree’s own Compose project. Worktree and Docker actions need an open Git project first.',
+      'Logs follow the project-owned checking runtime, currently serving its active owner’s checkout, not necessarily the focused tab. Worktree and Docker actions need an open Git project first.',
   },
   {
     id: 'vague',
@@ -216,9 +216,10 @@ const manualItems = [
   'Split side by side',
   'Split top and bottom',
   'Full width',
-  'Start isolated environment',
-  'Stop environment (retain data)',
-  'Environment logs',
+  'Request checking turn',
+  'Release / cancel checking turn',
+  'Checking status / queue',
+  'Checking logs',
   'Open preview endpoint',
   'Remove worktree (clean only)',
 ];
@@ -244,32 +245,36 @@ const shellPanes: Pane[] = [
 const ledger = [
   ['Inside OMP or OpenCode', 'Reaches the agent, which quits on it. Its pane closes; a split’s other half goes full width.'],
   ['Inside a shell', 'End of input, exactly as it has always been. The shell ends and its pane closes the same way.'],
-  ['In the last session of a tab', 'The tab closes; the checkout and its Docker stack stay. The last tab closes Crit.'],
+  ['In the last session of a tab', 'The tab closes; the checkout stays. Closing the owning pane cancels its checking turn. The last tab closes Crit.'],
   ['Native Kitty mode (F12)', 'Forwarded to the focused terminal, untouched, as every key is.'],
 ];
 
-const envCommands = [
-  ['crit env up', 'Start this worktree’s stack'],
-  ['crit env down', 'Stop it; volumes are retained'],
-  ['crit env status', 'Services, health and loopback ports'],
-  ['crit env logs', 'Follow the stack’s logs'],
+const checkCommands = [
+  ['crit check acquire', 'Wait for healthy services; automatic turn'],
+  ['crit check request', 'Queue a manual turn without waiting'],
+  ['crit check exec -- cargo test', 'Run a host command in the owned checkout'],
+  ['crit check release', 'Release ownership; preserve code and volumes'],
+  ['crit check cancel', 'Cancel ownership or a queued request'],
+  ['crit check status', 'Owner, queue, endpoints and errors'],
+  ['crit check restart', 'Rebuild the owner’s turn without yielding'],
+  ['crit check logs', 'Follow shared runtime logs'],
 ];
 
 const boundaries = [
   ['Not a coding agent.', 'Crit launches OMP and OpenCode and keeps their sessions in order. It does not replace them, and Ask Crit never writes code.'],
   ['Not an editor.', 'Your editor stays yours. Crit is the terminal around the work, not the place you type it.'],
-  ['Not a daemon.', 'Exiting stops agent and shell processes. The next launch restores saved projects, layouts and OMP/OpenCode chats; shells start fresh. Docker stacks are left as they are.'],
-  ['Not a sandbox.', 'Compose per worktree keeps ports, networks and named volumes apart for convenience. Configured bind mounts still share whatever they point at. Nothing here hardens anything.'],
+  ['Not a daemon.', 'Exiting stops owned agent and shell processes and cancels checking turns. Queue drain leaves zero managed containers; code and volumes stay. Restoration starts no runtime.'],
+  ['Not a sandbox.', 'The shared runtime is local development convenience, not a security boundary. Configured bind mounts still share whatever they point at.'],
 ];
 
 const guide = [
   {
     q: 'Which tools does Crit launch?',
-    a: 'OMP, OpenCode and plain shells. At most once a day, Crit runs omp update and opencode upgrade in the background while the workspace opens; agents start at once with the installed version. If an update fails, Crit shows the diagnostic and continues with the installed version.',
+    a: 'OMP, OpenCode and plain shells. On every startup, the window owning the saved workspace checks for updates in parallel. Crit waits for checks and any necessary installs before restoring or launching agents, so the first panes use the updated tools. OMP installs only newer builds; Crit checks OpenCode 1 release metadata first and never crosses a major version. Failed checks or updates show a diagnostic and startup continues with the installed version. Esc quits the startup screen without replacing the saved workspace.',
   },
   {
     q: 'What does Ask Crit send, and where?',
-    a: 'F1 goes through your authenticated OMP installation, currently with Haiku 5.5. Crit sends your request history plus project and worktree names and paths, never source files, with a 64 KiB cap on context plus conversation. No model runs while the launcher is idle, and each request has a 50-second local deadline. Prefer not to use a model at all? F2 lists the same actions.',
+    a: 'F1 goes through your authenticated OMP installation, currently with Haiku 5.5. Crit sends your request history plus project and worktree names and paths, never source files, with a 64 KiB cap on context plus conversation. No model runs while the launcher is idle, and each request has a 50-second local deadline. Prefer not to use a model at all? Press F1, then F2 for the same actions.',
   },
   {
     q: 'Can Ask Crit run shell commands?',
@@ -281,7 +286,7 @@ const guide = [
   },
   {
     q: 'What happens when I exit Crit?',
-    a: 'Exiting stops Crit’s agent and shell processes, not Docker stacks. The next launch restores saved projects, worktrees, splits and the exact OMP/OpenCode chats, including background sessions. Shells reopen fresh; running processes and unsent input do not survive. Closed tabs stay closed. Use crit --fresh to start a new saved workspace.',
+    a: 'Exiting stops Crit’s agent and shell processes and cancels its checking turns. Managed containers stop when the queue drains; code and volumes remain. The next launch restores saved projects, worktrees, splits and OMP/OpenCode chats, including background sessions, without starting a runtime. Shells reopen fresh; running processes and unsent input do not survive. Closed tabs stay closed. Use crit --fresh to start a new saved workspace.',
   },
   {
     q: 'Do I need Kitty?',
@@ -318,11 +323,11 @@ const steps = [
 const prerequisites = [
   ['Rust toolchain with Cargo, and Git', 'to build from source'],
   ['OMP and/or OpenCode', 'when you use them; Ask Crit needs an authenticated OMP installation'],
-  ['Docker Compose', 'optional, only for per-worktree stacks'],
+  ['Docker Compose', 'optional, only for the shared project checking runtime'],
   ['Kitty', 'optional, only for the shortcut integration'],
 ];
 ---
-<PreviewLayout title="Fieldnotes" theme="fieldnotes" description="Crit gives every branch its own worktree, tab and agent, with a shell one keystroke away. Field notes on a worktree-first terminal for OMP, OpenCode and your shell.">
+<PreviewLayout title="Fieldnotes" theme="fieldnotes" description="Crit gives every branch its own worktree, tab and agent, with a shell available from the split menu. Field notes on a worktree-first terminal for OMP, OpenCode and your shell.">
   <div class="fn" id="top">
     <header class="fn-masthead fn-wrap">
       <a class="fn-brand" href="#top">
@@ -340,7 +345,7 @@ const prerequisites = [
         <p class="fn-kicker"><span>№ 02 · Field notes</span><span>A terminal for OMP, OpenCode &amp; your shell</span></p>
         <div class="fn-hero-main">
           <h1 id="hero-title" class="fn-h1">A little room to <em>branch out.</em></h1>
-          <p class="fn-deck">Crit is a worktree-first terminal workspace. Each branch gets its own checkout, its own tab and its own agent session, and the shell stays one keystroke away. It is the room around the tools you already run, not another editor and not another agent.</p>
+          <p class="fn-deck">Crit is a worktree-first terminal workspace. Each branch gets its own checkout, its own tab and its own agent session, and a shell is available from the split menu. It is the room around the tools you already run, not another editor and not another agent.</p>
           <div class="fn-cta">
             <a class="fn-button" href="#install">Install from a checkout <span aria-hidden="true">↓</span></a>
             <a class="fn-link" href="#notes">Read the field notes</a>
@@ -349,9 +354,9 @@ const prerequisites = [
         <aside class="fn-hero-margin" aria-label="In brief">
           <ol class="fn-notes">
             <li><b>a.</b><span>Every branch gets a Git worktree of its own, and every worktree a tab.</span></li>
-            <li><b>b.</b><span>Ctrl+Shift+Enter opens a shell beside the agent, which keeps running. Ctrl+D closes one tier at a time, like Kitty.</span></li>
-            <li><b>c.</b><span>F1 asks in plain words through your authenticated OMP. F2 lists the same controls.</span></li>
-            <li><b>d.</b><span>Optional Docker Compose per worktree, with loopback ports allocated on the fly.</span></li>
+            <li><b>b.</b><span>The split menu’s Split terminal opens a shell beside the agent, which keeps running. Ctrl+D closes one tier at a time, like Kitty.</span></li>
+            <li><b>c.</b><span>F1 asks through OMP; F1 then F2 opens manual controls. F2 alone groups live sessions, worktrees and checking ownership across projects.</span></li>
+            <li><b>d.</b><span>Optional demand-started Compose checks: one project runtime, exclusive FIFO turns.</span></li>
           </ol>
         </aside>
       </section>
@@ -364,9 +369,9 @@ const prerequisites = [
           description="Illustrative Crit workspace: project crit with tabs main, feat/login-fixes and fix/flaky-ci, a second project portfolio, and two worktrees split side by side"
         />
         <ol class="fn-legend">
-          <li><span class="fn-legend-num">1</span><span>One compact tab per worktree, each a real checkout on disk. The status sits directly after the name: a spinner (<code>⠹</code>) while an agent works, a blinking <code>◆</code> waiting for your decision, <code>●</code> for a completed turn until you select its tab. Short names have no padding; long branch names scroll through a bounded slot like a departures board.</span></li>
-          <li><span class="fn-legend-num">2</span><span>An agent and a shell share the worktree. <kbd>Ctrl+Shift+Enter</kbd> opens the shell beside the agent; the agent keeps working.</span></li>
-          <li><span class="fn-legend-num">3</span><span>Two worktrees side by side. With Compose configured, each stack has its own project and loopback ports.</span></li>
+          <li><span class="fn-legend-num">1</span><span>One compact tab per worktree, each a real checkout on disk. A compact status column follows the name: a baseline-aligned braille spinner (<code>⢲</code>) while working, a blinking <code>◆</code> for a decision, and a green <code>✓</code> for an unread completed turn. Viewing the tab in the focused window clears its check automatically; a turn finishing while already visible is read immediately. Short names stay compact; long branch names scroll through a bounded slot.</span></li>
+          <li><span class="fn-legend-num">2</span><span>An agent and a shell share the worktree. <kbd>Ctrl+Shift+,</kbd>, then <b>Split terminal</b>, opens the shell beside the agent; the agent keeps working.</span></li>
+          <li><span class="fn-legend-num">3</span><span>Two coding worktrees side by side; one shared checking runtime. The login branch owns it while the CI branch waits in the FIFO queue.</span></li>
         </ol>
       </figure>
 
@@ -385,8 +390,9 @@ const prerequisites = [
           </figure>
         </div>
         <aside class="fn-margin" aria-label="Shortcuts for rooms">
-          <p><kbd>Ctrl+Shift+T</kbd><br />New tab: a worktree here, another project folder, or an open project.</p>
-          <p><kbd>Ctrl+Shift+,</kbd> <kbd>Ctrl+Shift+.</kbd><br />Split side by side, or top and bottom. Choose New worktree, Split terminal for a shell in the same folder, or Existing branch/worktree to pick a checkout or local branch.</p>
+          <p><kbd>Ctrl+Shift+T</kbd><br />Choose Home, open folder, new worktree, or existing worktree, then OMP / OpenCode / Terminal. Esc cancels; switching existing tabs keeps their sessions running.</p>
+          <p><kbd>Ctrl+Shift+,</kbd> <kbd>Ctrl+Shift+.</kbd><br />Split side by side, or top and bottom. Choose New worktree for a separate checkout or Split terminal for a shell in the same folder. <kbd>F2</kbd> opens and manages registered checkouts, not local branches without checkouts.</p>
+          <p><kbd>F2</kbd><br />See live agents and shells across all this window’s projects, including background tabs and folders outside Git. Sessions stay grouped by project when you switch tabs; click one to focus its existing process. Idle live sessions count; exited panes do not. This is an inventory, not sampled CPU/RAM usage.</p>
           <p><kbd>Ctrl+Shift+Q</kbd><br />Close only, close and delete the worktree, or cancel. No is selected by default.</p>
           <p>Worktrees live under <code>.crit-worktrees/</code> beside the repository, one directory per branch.</p>
           <p>The terminal owns the bottom row. Routine closes, F3 toggles, cleanup and creation successes are silent. Real errors, startup recovery warnings and explicitly requested environment status appear in centered dialogs; <kbd>Enter</kbd> or <kbd>Esc</kbd> dismisses them without resizing the panes.</p>
@@ -452,9 +458,9 @@ const prerequisites = [
         <div class="fn-num"><span class="fn-num-big">03</span><span class="fn-num-label">The shell</span></div>
         <div class="fn-main">
           <h2 id="shell-title" class="fn-h2">The shell is never far.</h2>
-          <p class="fn-lead">Agents are good company until you need to run one command yourself. Crit keeps a shell in every worktree, one keystroke from the agent working there.</p>
+          <p class="fn-lead">Agents are good company until you need to run one command yourself. Crit’s split menu opens a shell beside the agent in the same worktree.</p>
           <div class="fn-prose">
-            <p>Inside an OMP or OpenCode session, <kbd>Ctrl+Shift+Enter</kbd> opens that worktree’s shell beside the agent, which keeps running exactly where you left it. <kbd>Ctrl+D</kbd> is not remapped: it goes to whatever has focus, as in Kitty. OMP and OpenCode quit on it and their pane closes; in a shell it stays end of input. A pane whose program ends closes like a Kitty window: a split’s survivor takes the full width, an empty tab closes, the last tab closes Crit. An agent that fails stays on screen with its exit status.</p>
+            <p>Inside an OMP or OpenCode session, <kbd>Ctrl+Shift+,</kbd> or <kbd>Ctrl+Shift+.</kbd> opens the split menu. Choose <b>Split terminal</b> for a shell in the same worktree beside the agent, which keeps running exactly where you left it. <kbd>Ctrl+D</kbd> is not remapped: it goes to whatever has focus, as in Kitty. OMP and OpenCode quit on it and their pane closes; in a shell it stays end of input. A pane whose program ends closes like a Kitty window: a split’s survivor takes the full width, an empty tab closes, the last tab closes Crit. An agent that fails stays on screen with its exit status.</p>
           </div>
           <dl class="fn-ledger" aria-label="What Ctrl+D does">
             {ledger.map(([where, what]) => (
@@ -465,13 +471,13 @@ const prerequisites = [
             <FieldnotesWorkspace
               projects={[critProject('feat/login-fixes')]}
               panes={shellPanes}
-              description="Illustrative workspace after Ctrl+Shift+Enter: the shell session is selected while omp 1 is still working"
+              description="Illustrative workspace after Split terminal: the shell session is selected while omp 1 is still working"
             />
-            <figcaption><b>Fig. 2</b> · After <kbd>Ctrl+Shift+Enter</kbd>. The shell is selected; <code>omp 1 · working</code> carries on in the same worktree. Illustrative workspace.</figcaption>
+            <figcaption><b>Fig. 2</b> · After <b>Split terminal</b>. The shell is selected; <code>omp 1 · working</code> carries on in the same worktree. Illustrative workspace.</figcaption>
           </figure>
         </div>
         <aside class="fn-margin" aria-label="Session shortcuts">
-          <p><kbd>Ctrl+Shift+Enter</kbd><br />New OMP, OpenCode or shell session in this worktree.</p>
+          <p><kbd>Ctrl+Shift+,</kbd> or <kbd>Ctrl+Shift+.</kbd><br />Choose Split terminal for a shell beside the focused agent.</p>
           <p><kbd>Ctrl+Shift+[</kbd> <kbd>Ctrl+Shift+]</kbd><br />Previous / next session or split pane.</p>
           <p><kbd>Ctrl+Shift+1…9</kbd> <kbd>Ctrl+Shift+0</kbd><br />Focus session 1 to 10.</p>
           <p><kbd>F12</kbd><br />Toggle Crit shortcuts and native Kitty shortcuts. Persistent, not a one-shot prefix.</p>
@@ -481,33 +487,39 @@ const prerequisites = [
       <section id="compose" class="fn-section" aria-labelledby="compose-title">
         <div class="fn-num"><span class="fn-num-big">04</span><span class="fn-num-label">Stacks</span></div>
         <div class="fn-main">
-          <h2 id="compose-title" class="fn-h2">Stacks that keep to <em>themselves.</em></h2>
-          <p class="fn-lead">If the repository ships a Compose file, Crit can bring up a stack per worktree, so two branches can each run a web and an api without arguing over port 8000.</p>
+          <h2 id="compose-title" class="fn-h2">One runtime. <em>Take turns.</em></h2>
+          <p class="fn-lead">Coding worktrees and agent sessions stay independent. Checking uses one project-owned Compose runtime, started only on demand, with exclusive interactive ownership in FIFO order.</p>
           <div class="fn-prose">
-            <p>Each worktree gets its own Compose project, networks, named volumes and build image, and its published ports are rebound to loopback addresses allocated on the fly. New worktrees start their stack automatically when it is configured; ask for “the preview” and Crit opens that worktree’s URL.</p>
-            <p>One honest caveat. Bind mounts keep the paths you configured, so a shared absolute directory is still shared. Use worktree-relative paths or named volumes for data that should stay apart. External networks, external volumes and host networking are refused. This is isolation for convenience, not a security boundary.</p>
+            <p>Creating, opening and restoring a checkout starts no runtime. Preview follows the active owner’s checkout, not the focused tab. F2 groups live sessions and check ownership across projects, with queued, starting, stopping, blocked and stopped states; live or uncertain checks without a local project tab remain visible. Manual turns stay pinned until explicit release; native <code>crit_check</code> automatic turns release on agent completion or abort.</p>
+            <p>Checks use the mutable owner checkout and observe HEAD; this is not an automatic check pass. There is no auto-merge, reset, extra validation worktree or LLM coordinator. Existing or manually started same-repository stacks block checking until an explicit safe handoff—never a silent stop.</p>
+            <p>Bind mounts still share whatever they point at. External networks, external volumes and host networking are refused. This is local development convenience, not a security boundary.</p>
           </div>
           <div class="fn-twin">
             <figure class="fn-fig">
               <pre class="fn-code" tabindex="0"><code><span class="fn-code-comment"># crit.toml, optional, in the repository</span>
+[checks]
+cpus = 2.0
+memory_mib = 2048
+
 [compose]
 files = ["compose.yaml"]
 
 [compose.links.web]
 API_URL = "api:8000"</code></pre>
-              <figcaption>Links inject that worktree’s <code>http://127.0.0.1:PORT</code> into <code>web</code>’s runtime environment after <code>api</code> starts. Use your app’s actual variable name; build-time URLs are configured in the app itself.</figcaption>
+              <figcaption><code>[compose].files</code> selects Compose inputs. Links inject the selected owner’s <code>http://127.0.0.1:PORT</code> into <code>web</code>’s runtime environment after <code>api</code> starts. Use your app’s variable name; build-time URLs remain app configuration.</figcaption>
             </figure>
-            <dl class="fn-ledger fn-ledger-mono" aria-label="crit env commands">
-              {envCommands.map(([command, meaning]) => (
+            <dl class="fn-ledger fn-ledger-mono" aria-label="crit check commands">
+              {checkCommands.map(([command, meaning]) => (
                 <div class="fn-ledger-row"><dt><code>{command}</code></dt><dd>{meaning}</dd></div>
               ))}
             </dl>
           </div>
         </div>
         <aside class="fn-margin" aria-label="Notes on stacks">
-          <p>Stopping a stack retains its volumes. Closing a tab never touches Docker.</p>
-          <p>Exiting stops agent and shell processes, not Docker stacks. Saved chats and workspace layout reopen next launch.</p>
-          <p>Compose projects are named <code>crit-&lt;worktree id&gt;</code>, derived from the checkout’s path, so stacks never collide across worktrees.</p>
+          <p>Release manual turns in a finally block. Close, cancel, pane/window death and crash cleanup end abandoned turns and owned checking commands. Queue drain leaves zero managed containers, preserving code and volumes.</p>
+          <p>If every coordinator is externally killed, status is blocked—not stopped. The next acquire or request reconciles owned resources under the lifecycle lock before another turn can start.</p>
+          <p><code>[checks].cpus</code>: half available CPUs by default, clamped to 1–4; overrides 0.1–64. <code>memory_mib</code>: half physical RAM, clamped to 1024–8192 MiB; overrides 128–262144.</p>
+          <p>Budgets cover aggregate running services, retaining stricter configured per-service limits. Docker’s build daemon is not capped.</p>
         </aside>
       </section>
 
@@ -827,6 +839,7 @@ API_URL = "api:8000"</code></pre>
   .fn-ledger dt { margin: 0; font-family: var(--font-mono); font-size: 12px; letter-spacing: .02em; color: var(--fn-ink); }
   .fn-ledger dd { margin: 0; font-size: 15px; line-height: 1.5; color: var(--fn-ink-2); }
   .fn-ledger-mono dt code { font-size: 12px; }
+  .fn-ledger-mono .fn-ledger-row { grid-template-columns: minmax(0, 1fr); gap: 4px; }
   .fn-twin { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 24px 40px; align-items: start; }
   .fn-twin .fn-fig { margin-top: 28px; }
   .fn-twin .fn-ledger { margin-top: 28px; }

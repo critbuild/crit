@@ -3,11 +3,10 @@ use std::io::{self, Write};
 
 pub const HELP: &str = "Crit shortcuts (same as Kitty's terminal/window actions)
   F12                    Toggle Crit / native Kitty shortcuts (persistent)
-  Ctrl+Shift+T            New tab: Home selected; Enter opens it without typing
+  Ctrl+Shift+T            New tab: destination, then OMP / OpenCode / Terminal
   Ctrl+Shift+Q            Close tab: Yes / Yes, delete worktree / No
   Ctrl+Tab / Ctrl+Shift+Right  Next tab (wraps into the next open project)
   Ctrl+Shift+Tab / Left   Previous tab
-  Ctrl+Shift+Enter        New OMP / OpenCode / shell session
   Ctrl+D                 Sent to the pane: quits OMP / OpenCode, EOF in a shell
   Ctrl+Shift+W            Close focused session
   Ctrl+Shift+[ / ]        Previous / next session or split pane
@@ -17,7 +16,7 @@ pub const HELP: &str = "Crit shortcuts (same as Kitty's terminal/window actions)
   Ctrl+Shift+L            Cycle full / vertical / horizontal layout
   F1                     Ask Crit in natural language (Haiku 5.5)
   F1 then F2             Manual controls: Up/Down and Enter, no AI needed
-  F2                     Toggle the worktree pane (click a row to open, 🗑 to delete)
+  F2                     Toggle global resources (projects, live sessions, worktrees, checks)
   F3                     Toggle the agent CPU and memory limit (default 50%, persistent)
   F10                    Exit Crit (confirmation required)
 
@@ -27,17 +26,30 @@ last tab closes Crit. An agent that fails, or quits within a second of starting,
 stays open with its exit status (F1 to restart).
 Close-tab choices use Up/Down and Enter; No is selected by default. Esc cancels.
 Yes keeps the checkout; deletion requires a clean, unlocked, non-main worktree
-with its Docker environment stopped, and keeps the branch. Ordinary folders stay.
+with no active or blocked check runtime using it, and keeps the branch. Ordinary folders stay.
 Deletion shows progress or a persistent refusal; Enter goes back and Esc dismisses.
 Branch labels follow external Git switches and renames without restarting sessions.
-Split offers New worktree, Split terminal, and Existing branch/worktree.
+Split offers New worktree and Split terminal.
 New worktree asks for a branch name.
 Split terminal opens a shell in the same folder, including outside Git, whatever
 the focused pane runs. No branch or checkout is created. Closing a split session
 leaves its peer at full width.
-Existing branch/worktree opens a picker: choose a checkout or local branch with
-Up/Down and Enter; Esc goes back. Checkouts are reused; unchecked-out branches get
-their own worktree at their own commit. The first pane's branch/session stay put.
+F2 groups all this window's live agent/shell sessions and checking runtimes by
+project, independent of the selected tab. Idle live processes count; exited panes
+do not. Click a session to focus it without starting another; folders outside Git
+are included. The stable project order and scroll position survive tab switches.
+Registered checkouts retain open/focus and 🗑 delete controls; uncreated branches
+are not worktrees. Each project shows its check phase, owner and queue count (Q).
+Rows mark the owner phase and FIFO position (Q1 is next), even without an open tab.
+Live/uncertain checks without a local project tab remain visible. This is an
+inventory, not sampled CPU/RAM usage.
+One check environment serves each Git project, only while a check turn is owned.
+Opening a checkout does not start Docker. Agents request and release exclusive turns;
+F1 then F2 offers Request / Release / Rebuild check environment, Check status and Check logs.
+Preview follows the check owner, not the focused checkout. Blocked means startup or
+cleanup needs attention: Check status shows the error. Not requested describes Crit,
+not any external Docker stack. Closing a session cancels its turn; exiting cleans owned
+checks. Checkouts and data volumes remain, and unrelated Docker stacks are not stopped.
 Drag terminal text to select and copy it; Ctrl+Shift+C copies the selection again.
 Ctrl+Shift+V pastes through Kitty; Shift+Insert pastes its primary selection.
 Middle-click pastes the local desktop clipboard. Over SSH, use native terminal paste.
@@ -48,7 +60,7 @@ ordinary typing go to the focused terminal.
 Typing or pasting returns a scrolled terminal to its live output.
 Wheel scrolls history unless the app captures it; Shift+wheel scrolls Crit history.
 Click or drag the right-edge scrollbar; its bottom returns to live output.
-Drag either pane-edge grip (┤ / ├) or the divider to resize side-by-side panes.
+Drag the thin rail or its highlighted center to resize side-by-side panes.
 Split widths keep their proportion on window resize and restore with the project.
 Esc cancels a pending project open or worktree listing without switching tabs.
 Below 30x10, UI input pauses except Esc and F12; enlarge the terminal to resume.
@@ -68,7 +80,6 @@ pub enum Action {
     Quit,
     NewTab,
     CloseWorktree,
-    NewSession,
     CloseSession,
     NextWorktree,
     PreviousWorktree,
@@ -100,7 +111,6 @@ pub fn action(key: KeyEvent) -> Option<Action> {
         Tab | BackTab if ctrl && shift => Some(PreviousWorktree),
         Right if ctrl && shift => Some(NextWorktree),
         Left if ctrl && shift => Some(PreviousWorktree),
-        Enter if ctrl && shift => Some(NewSession),
         Char(c) if ctrl && shift => match c.to_ascii_lowercase() {
             't' => Some(NewTab),
             'q' => Some(CloseWorktree),

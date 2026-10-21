@@ -291,12 +291,6 @@ impl Store {
         })
     }
 
-    /// The private state directory this store owns. Other state that belongs to the window
-    /// owning the saved workspace, such as when the updaters last ran, is kept here too.
-    pub fn directory(&self) -> &Path {
-        &self.directory
-    }
-
     /// A load error never modifies snapshot bytes. The caller must disable saving
     /// after failed recovery rather than overwrite the unreadable snapshot.
     pub fn load(&self) -> Result<Option<Snapshot>> {

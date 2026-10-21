@@ -37,17 +37,19 @@ def main() -> None:
     replay = work / "workload.bin"
     replay.write_bytes(SAMPLE.read_bytes() * REPEAT)
     root = work / "run"
-    for name in ("home", "state/crit", "sandbox", "repo"):
+    for name in ("home", "state/crit", "sandbox", "repo", "bin"):
         (root / name).mkdir(parents=True, mode=0o700, exist_ok=True)
     subprocess.run(["git", "init", "-q", str(root / "repo")], check=True)
-    # Crit never runs the real updaters from this throwaway state directory.
-    (root / "state/crit/updates.stamp").touch(mode=0o600)
+    # Keep the real agents and their updaters off PATH in the throwaway workspace.
+    for name in ("git", "cat", "touch"):
+        (root / "bin" / name).symlink_to(shutil.which(name))
     # XDG_RUNTIME_DIR stays the user's: Crit's socket goes in a folder of its own there, and a
     # throwaway one this deep would be too long a path for a socket.
     env = dict(
         os.environ,
         HOME=str(root / "home"),
         XDG_STATE_HOME=str(root / "state"),
+        PATH=str(root / "bin"),
         CRIT_SANDBOX=str(root / "sandbox"),
         TERM="xterm-256color",
         SHELL="/bin/sh",

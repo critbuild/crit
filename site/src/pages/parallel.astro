@@ -14,11 +14,11 @@ const sections = [
 const heroFacts = [
   { href: '#lanes', number: '01', title: 'A worktree per branch', body: 'Its own checkout, tab and sessions.' },
   { href: '#shell', number: '02', title: 'Ctrl+D closes one tier', body: 'The agent, then the split, then the tab, like Kitty.' },
-  { href: '#stacks', number: '03', title: 'Stacks, if you want them', body: 'Docker Compose per worktree, on its own loopback ports.' },
+  { href: '#stacks', number: '03', title: 'Checks take turns', body: 'One demand-started Compose runtime per project, with a FIFO queue.' },
 ];
 
 const laneKeys = [
-  ['Ctrl+Shift+T', 'New tab: a worktree, another project, or a switch'],
+  ['Ctrl+Shift+T', 'Choose Home, folder, or worktree, then OMP / OpenCode / Terminal'],
   ['Ctrl+Tab', 'Next tab, on into the next open project'],
   ['Ctrl+Shift+,', 'Split side by side'],
   ['Ctrl+Shift+.', 'Split top and bottom'],
@@ -28,7 +28,7 @@ const laneKeys = [
 const ctrlD = [
   ['In OMP or OpenCode', 'Reaches the agent, which quits on it. Its pane closes; a split’s other half goes full width.'],
   ['In a shell', 'End of input, exactly as before. The shell ends and its pane closes the same way.'],
-  ['In the last session of a tab', 'The tab closes; the checkout and its Docker stack stay. The last tab closes Crit.'],
+  ['In the last session of a tab', 'The tab closes; its checkout stays. Closing the owning pane cancels its checking turn. The last tab closes Crit.'],
   ['In native mode (F12)', 'Passed straight through to the focused terminal, as every key is.'],
 ];
 
@@ -48,11 +48,11 @@ const manualControls = [
   'Split side by side',
   'Split top and bottom',
   'Full width',
-  'Start isolated environment',
-  'Stop environment (retain data)',
-  'Restart environment',
-  'Refresh environment status',
-  'Environment logs',
+  'Request checking turn',
+  'Release / cancel checking turn',
+  'Restart checking runtime',
+  'Checking status / queue',
+  'Checking logs',
   'Open preview endpoint',
   'Close worktree tab',
   'Close agent / shell session',
@@ -62,28 +62,35 @@ const manualControls = [
 ];
 
 const stacks = [
-  { branch: 'feat/csv-export', tone: 'lime', project: 'crit-5e1c…', ports: [['web', '32771', '3000'], ['api', '32772', '8000']] },
-  { branch: 'fix/date-parsing', tone: 'sky', project: 'crit-a90b…', ports: [['web', '32779', '3000'], ['api', '32780', '8000']] },
+  { branch: 'feat/csv-export · owner', tone: 'lime', state: 'running · shared runtime', ports: [['web', '32771', '3000'], ['api', '32772', '8000']] },
+  { branch: 'fix/date-parsing · queued #1', tone: 'sky', state: 'waiting · no containers', ports: [] },
 ];
-const critToml = `[compose]
+const critToml = `[checks]
+cpus = 2.0
+memory_mib = 2048
+
+[compose]
 files = ["compose.yaml"]
 
 [compose.links.web]
 API_URL = "api:8000"`;
-const envCommands = [
-  ['crit env up', 'Start this worktree’s stack'],
-  ['crit env down', 'Stop it; volumes are kept'],
-  ['crit env restart', 'Restart it'],
-  ['crit env status', 'Services, health and published ports, as JSON'],
-  ['crit env logs', 'Follow the stack’s logs'],
+const checkCommands = [
+  ['crit check acquire', 'Wait for healthy services; automatic turn'],
+  ['crit check request', 'Queue a manual turn without waiting'],
+  ['crit check exec -- cargo test', 'Stream a host command in the owned checkout'],
+  ['crit check release', 'Release ownership; keep code and volumes'],
+  ['crit check cancel', 'Cancel ownership or a queued request'],
+  ['crit check status', 'Owner, queue, endpoints and errors'],
+  ['crit check restart', 'Rebuild the owner’s turn without yielding'],
+  ['crit check logs', 'Follow the shared runtime’s logs'],
 ];
 
 interface LifecycleRow { event: string; keys?: string[]; command?: string; result: string }
 const lifecycle: LifecycleRow[] = [
   { event: 'Close a tab', keys: ['Ctrl+Shift+Q'], result: 'Choose Yes to close only, Yes, delete worktree to remove its checkout too, or No to cancel. No is selected by default; close-only keeps the checkout and agent chat history.' },
   { event: 'Remove a worktree', keys: ['F1', 'F2'], result: 'Also available in the close-tab popup. Deletion refuses dirty, locked, or main worktrees and running Docker environments; the branch is kept. The popup shows progress or the refusal reason, and the tab closes only on success.' },
-  { event: 'Exit Crit', keys: ['F10'], result: 'After you confirm, Crit stops the agent and shell processes it started. Checkouts and Compose stacks stay exactly as they are.' },
-  { event: 'Launch again', command: 'crit', result: 'Projects, worktrees, splits, focused panes and selected sessions reopen. Every saved OMP and OpenCode chat resumes exactly, background tabs included; shells start fresh in their worktrees.' },
+  { event: 'Exit Crit', keys: ['F10'], result: 'After you confirm, Crit stops its agent and shell processes and cancels its checking turns. Managed containers stop when the queue drains; code and volumes stay.' },
+  { event: 'Launch again', command: 'crit', result: 'Projects, worktrees, splits, focused panes and selected sessions reopen. Saved OMP and OpenCode chats resume, background tabs included; shells start fresh. Restoration never starts the checking runtime.' },
   { event: 'Start clean', command: 'crit --fresh', result: 'Skips restoration and starts a new saved workspace.' },
 ];
 
@@ -113,7 +120,7 @@ const steps = [
 const needs = [
   ['Rust with Cargo, and Git', 'To build Crit and to make worktrees.'],
   ['OMP or OpenCode', 'For agent sessions. Ask Crit needs an authenticated OMP.'],
-  ['Docker Compose', 'Optional, for a stack per worktree.'],
+  ['Docker Compose', 'Optional, for the project’s shared checking runtime.'],
   ['Kitty', 'Optional, for the shortcut integration.'],
 ];
 ---
@@ -196,7 +203,7 @@ const needs = [
           <ul class="pl-notes">
             <li><h3>From the focused HEAD</h3><p>New worktrees start from the checkout in front of you, unless you name another base.</p></li>
             <li><h3>Beside the repository</h3><p>Checkouts live under <code>.crit-worktrees/</code> next to the repository, one directory per branch.</p></li>
-            <li><h3>One checkout at a time</h3><p>Opening a Git folder opens that checkout only, never every branch at once.</p></li>
+            <li><h3>Choose the program second</h3><p>Choose a folder or branch first, including an existing worktree, then OMP, OpenCode or Terminal. Creating, opening and restoring checkouts never starts containers.</p></li>
             <li><h3>Switching keeps things running</h3><p>Move between tabs and projects; their agent and shell sessions stay alive while you do.</p></li>
           </ul>
           <ul class="pl-keys" aria-label="Lane shortcuts">
@@ -211,7 +218,7 @@ const needs = [
             <p class="pl-num" aria-hidden="true">02</p>
             <p class="pl-kicker">The shell</p>
             <h2 id="shell-title" class="pl-h2">One key closes one tier. The rest keeps going.</h2>
-            <p class="pl-lead">Ctrl+D goes to whatever has focus, as in Kitty. OMP and OpenCode quit on it and their pane closes; a split’s survivor takes the full width; an empty tab closes. A shell beside the agent is Ctrl+Shift+Enter away, and the agent keeps running while you use it. An agent that fails stays on screen with its exit status, so a crash is never silently closed.</p>
+            <p class="pl-lead">Ctrl+D goes to whatever has focus, as in Kitty. OMP and OpenCode quit on it and their pane closes; a split’s survivor takes the full width; an empty tab closes. Open the split menu with Ctrl+Shift+, or Ctrl+Shift+. and choose Split terminal for a shell beside the agent, which keeps running while you use it. An agent that fails stays on screen with its exit status, so a crash is never silently closed.</p>
           </header>
           <div class="pl-shell-grid">
             <div class="pl-caps-art">
@@ -228,7 +235,7 @@ const needs = [
               <dl class="pl-ledger">
                 {ctrlD.map(([where, what]) => <div><dt>{where}</dt><dd>{what}</dd></div>)}
               </dl>
-              <p class="pl-shell-back">Moving around is its own move: <kbd>Ctrl+Shift+Enter</kbd> opens a session, <kbd>Ctrl+Shift+[</kbd> and <kbd>Ctrl+Shift+]</kbd> step through sessions, and <kbd>Ctrl+Shift+1</kbd> to <kbd>9</kbd> jump straight to one.</p>
+              <p class="pl-shell-back">Moving around is its own move: the split menu’s <b>Split terminal</b> opens a shell, <kbd>Ctrl+Shift+[</kbd> and <kbd>Ctrl+Shift+]</kbd> step through sessions, and <kbd>Ctrl+Shift+1</kbd> to <kbd>9</kbd> jump straight to one.</p>
             </div>
           </div>
         </div>
@@ -240,7 +247,7 @@ const needs = [
             <p class="pl-num" aria-hidden="true">03</p>
             <p class="pl-kicker">Ask Crit</p>
             <h2 id="ask-title" class="pl-h2">Say it. Or steer it.</h2>
-            <p class="pl-lead">F1 opens Ask Crit, a small launcher that turns a sentence into one of Crit’s own actions. F2 lists the same actions to pick by hand. Either way, nothing destructive happens without a yes.</p>
+            <p class="pl-lead">F1 opens Ask Crit, a small launcher that turns a sentence into one of Crit’s own actions. Press F2 inside it to pick those actions by hand; F2 alone groups live sessions, worktrees and check ownership across all this window’s projects. Nothing destructive happens without a yes.</p>
           </header>
           <div class="pl-modes">
             <article class="pl-mode pl-mode-f1" aria-labelledby="f1-title">
@@ -277,23 +284,20 @@ const needs = [
           <header class="pl-head">
             <p class="pl-num" aria-hidden="true">04</p>
             <p class="pl-kicker">Stacks · optional</p>
-            <h2 id="stacks-title" class="pl-h2">One compose file. A stack per lane.</h2>
-            <p class="pl-lead">If the repository has a Compose file, every worktree can run its own stack, and new worktrees start theirs automatically once it’s configured. Two branches can both run web and api without fighting over a host port.</p>
+            <h2 id="stacks-title" class="pl-h2">Parallel coding. Exclusive checks.</h2>
+            <p class="pl-lead">One project-owned Compose runtime serves interactive checking turns in FIFO order. Agents and shells keep coding independently in their own worktrees; only an explicit checking request starts containers. Preview follows the active owner’s checkout, not the focused tab.</p>
           </header>
           <div class="pl-stacks">
             <div class="pl-stack-main">
               <figure class="pl-stack-fig">
-                <figcaption>Illustrative. Docker allocates the loopback ports when each stack starts; these numbers are examples.</figcaption>
-                <p class="pl-stack-source"><code>compose.yaml</code><span>One file in the repository, a separate Compose project for each worktree.</span></p>
+                <figcaption>Illustrative owner and FIFO queue. Only the owner has services; Docker allocates its loopback ports at startup.</figcaption>
+                <p class="pl-stack-source"><code>compose.yaml</code><span>One shared project runtime, serving one checkout at a time.</span></p>
                 <div class="pl-stack-cols">
                   {stacks.map((stack) => (
                     <div class="pl-stack" data-tone={stack.tone}>
                       <p class="pl-stack-head"><span class="pl-stack-dot" aria-hidden="true"></span>{stack.branch}</p>
                       <dl>
-                        <div><dt>Project</dt><dd>{stack.project}</dd></div>
-                        <div><dt>Network</dt><dd>{stack.project}_default</dd></div>
-                        <div><dt>Volume</dt><dd>{stack.project}_pgdata</dd></div>
-                        <div><dt>Build image</dt><dd>{stack.project}:build-…</dd></div>
+                        <div><dt>Runtime</dt><dd>{stack.state}</dd></div>
                         {stack.ports.map(([service, host, container]) => (
                           <div><dt>{service}</dt><dd><span class="pl-nowrap">127.0.0.1:<b>{host}</b></span> <span class="pl-nowrap">→ {container}</span></dd></div>
                         ))}
@@ -307,20 +311,24 @@ const needs = [
             <div class="pl-stack-side">
               <div class="pl-caveat">
                 <h3>Not a security sandbox.</h3>
-                <p>It keeps local stacks apart for convenience. Bind mounts keep the paths you configured, so a shared absolute directory is still shared; use worktree-relative paths or named volumes for data that should stay separate. External networks, external volumes and host networking are refused.</p>
+                <p>Bind mounts still share whatever they point at. External networks, external volumes and host networking are refused. Existing or manually started same-repository stacks block checking until an explicit safe handoff; Crit never silently stops them.</p>
               </div>
               <figure class="pl-config">
                 <pre><code>{critToml}</code></pre>
-                <figcaption>Optional <code>crit.toml</code> in the repository. The link injects this worktree’s <code>http://127.0.0.1:PORT</code> for api into web’s runtime environment after api starts. Use your app’s actual variable name; build-time frontend URLs are configured in the app itself.</figcaption>
+                <figcaption>Optional repository <code>crit.toml</code>. <code>[compose].files</code> selects Compose inputs. Links inject the selected owner’s <code>http://127.0.0.1:PORT</code> for api into web’s runtime environment after api starts. Build-time frontend URLs remain app configuration.</figcaption>
               </figure>
               <div>
-                <h3 class="pl-mini">Per worktree, from its folder</h3>
+                <h3 class="pl-mini">From a project checkout</h3>
                 <dl class="pl-env">
-                  {envCommands.map(([command, meaning]) => <div><dt>{command}</dt><dd>{meaning}</dd></div>)}
+                  {checkCommands.map(([command, meaning]) => <div><dt>{command}</dt><dd>{meaning}</dd></div>)}
                 </dl>
-                <p class="pl-env-note">Or ask Crit to “open the preview” for this worktree’s endpoint.</p>
+                <p class="pl-env-note">F2 groups live agents, shells and checking runtimes across projects, independent of the selected tab. Idle live sessions and folders outside Git are included; exited panes are not. Click a session to focus its existing process. Live or uncertain checks without a local tab stay visible. This is an inventory, not sampled CPU/RAM usage. Manual turns stay pinned until release; native <code>crit_check</code> automatic turns release on agent completion or abort. Release manual turns in a finally block.</p>
               </div>
             </div>
+          </div>
+          <div class="pl-life-notes">
+            <p><code>[checks].cpus</code> defaults to half the available CPUs, clamped to 1–4; <code>memory_mib</code> defaults to half physical RAM, clamped to 1024–8192 MiB. Overrides accept 0.1–64 CPUs and 128–262144 MiB. These are aggregate running-service budgets; stricter configured per-service limits remain. The Docker build daemon is not capped.</p>
+            <p>Checks use the owner’s mutable checkout and observe HEAD; neither observation nor acquiring a turn is an automatic check pass. Crit does not auto-merge, reset, make an extra validation worktree, or use an LLM coordinator.</p>
           </div>
         </div>
       </section>
@@ -331,7 +339,7 @@ const needs = [
             <p class="pl-num" aria-hidden="true">05</p>
             <p class="pl-kicker">Lifecycle</p>
             <h2 id="lifecycle-title" class="pl-h2">Processes stop. The workspace comes back.</h2>
-            <p class="pl-lead">Crit owns the processes it starts, so exiting stops them. Checkouts stay on disk, Compose stacks keep running, and the next launch reopens your projects, splits and exact OMP and OpenCode chats.</p>
+            <p class="pl-lead">Crit owns the processes it starts. Close, cancel, pane/window death and crash cleanup end abandoned turns and owned checking commands. When the FIFO queue drains, zero managed containers remain. Code, volumes and saved chats stay.</p>
           </header>
           <ol class="pl-life">
             {lifecycle.map((row, index) => (
@@ -346,7 +354,7 @@ const needs = [
             ))}
           </ol>
           <div class="pl-life-notes">
-            <p>Crit isn’t a background daemon, and there’s no tmux-style reattach. Running processes, unsent input and scrollback don’t come back; the saved workspace and chats reopen in new processes. Compose stacks are the deliberate exception: they keep running until you stop them, for example with <code>crit env down</code>.</p>
+            <p>Crit isn’t a background session daemon, and there’s no tmux-style reattach. Running processes, unsent input and scrollback don’t come back; the saved workspace and chats reopen in new processes, without starting containers. Unmanaged stacks are never silently stopped.</p>
             <p>The saved workspace is owner-private metadata in <code>$XDG_STATE_HOME/crit/workspace.json</code>, by default <code>~/.local/state/crit/workspace.json</code>. Chat contents stay in the agents’ own stores.</p>
           </div>
         </div>
@@ -390,7 +398,7 @@ const needs = [
                   </ul>
                   <h3 class="pl-mini">Good to know</h3>
                   <ul>
-                    <li>At most once a day, Crit runs <code>omp update</code> and <code>opencode upgrade</code> in the background while the workspace opens; agents start at once with the installed version. If an update fails, Crit shows why and carries on.</li>
+                    <li>Every startup, the window owning the saved workspace checks for updates in parallel and waits for any necessary installs before restoring or launching agents. The first panes use the updated tools. OMP installs only newer builds; Crit checks OpenCode 1 release metadata before <code>opencode upgrade VERSION</code>, skipping current versions and major-version changes. Failed checks or updates show a diagnostic and startup continues with the installed version.</li>
                     <li><code>crit --help</code> carries the full notes on projects, restore, Ask Crit and Docker.</li>
                   </ul>
                 </div>
@@ -682,6 +690,7 @@ const needs = [
   .pl-life-result { grid-column: 2; max-width: 40rem; margin: 0; color: var(--pl-on-ink-2); font-size: 1.08rem; line-height: 1.55; }
   .pl-life-notes { display: grid; gap: 18px 40px; margin-top: 34px; color: var(--pl-on-ink-2); }
   .pl-life-notes p { max-width: 44rem; margin: 0; }
+  .pl-on-paper2 .pl-life-notes { color: var(--pl-ink-2); }
 
   /* 06 install */
   .pl-install { padding: clamp(48px, 7vw, 104px) var(--pl-sheet-margin); }

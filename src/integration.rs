@@ -68,6 +68,7 @@ const ASSETS: &[(&str, &str)] = &[
         include_str!("../integrations/opencode-tui.js"),
     ),
     ("reporter.js", include_str!("../integrations/reporter.js")),
+    ("checks.js", include_str!("../integrations/checks.js")),
 ];
 
 impl IntegrationServer {
@@ -476,6 +477,14 @@ fn launch(
                 .to_owned(),
         ),
         ("CRIT_AGENT_PID".into(), String::new()),
+        ("CRIT_WINDOW_PID".into(), std::process::id().to_string()),
+        (
+            "CRIT_BIN".into(),
+            std::env::current_exe()?
+                .to_str()
+                .context("Crit executable path is not UTF-8")?
+                .to_owned(),
+        ),
     ];
     if let Some(Resume::Chat(identity)) = resume {
         env.push(("CRIT_RESUME_ID".into(), identity.into()));

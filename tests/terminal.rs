@@ -40,6 +40,12 @@ fn drive_until(
     }
 }
 
+fn agent_picker(contents: &str) -> bool {
+    ["OMP", "OpenCode", "Terminal"]
+        .iter()
+        .all(|program| contents.contains(program))
+}
+
 fn git_output(cwd: &std::path::Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .arg("-C")
@@ -111,26 +117,6 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
     std::fs::write(linked.join("tracked.txt"), "dirty linked contents\n").unwrap();
     std::fs::write(linked.join("untracked.txt"), "untracked linked contents\n").unwrap();
     let original_head = git_output(&repo, &["rev-parse", "HEAD"]);
-    let distinct_head = git_output(
-        &repo,
-        &[
-            "-c",
-            "user.name=Crit Test",
-            "-c",
-            "user.email=test@localhost",
-            "commit-tree",
-            "HEAD^{tree}",
-            "-p",
-            &original_head,
-            "-m",
-            "existing branch at a distinct commit",
-        ],
-    );
-    assert_ne!(distinct_head, original_head);
-    git_output(&repo, &["branch", "topic-existing", &distinct_head]);
-    for branch in ["picker-00", "picker-01"] {
-        git_output(&repo, &["branch", branch]);
-    }
     let sandbox = home.path().join("sandbox");
 
     // Never run the user's real agent updaters from a test.
@@ -333,7 +319,7 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
             assert_eq!(cwd.join(".git").exists(), had_git_metadata);
         }
         if direct_start && cwd == repo {
-            // The default new-tab action opens home without a path prompt.
+            // New tab chooses Home, then a program, without needing a path prompt.
             let in_home = |contents: &str| {
                 contents
                     .lines()
@@ -346,7 +332,11 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
                     .nth(1)
                     .is_some_and(|header| header.trim_start().starts_with("› main"))
             };
-            drive_until(&mut writer, &rx, &mut screen, b"\x1b[116;6u\r", in_home);
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[116;6u", |contents| {
+                contents.contains("Home (~)")
+            });
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[H\r", agent_picker);
+            drive_until(&mut writer, &rx, &mut screen, b"\x1b[F\r", in_home);
             let home_marker = format!(
                 "home-ready:{}",
                 home.path().canonicalize().unwrap().display()
@@ -363,7 +353,13 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
             // Choosing home again opens another tab with a fresh session; the first tab
             // keeps its state.
             drive_until(&mut writer, &rx, &mut screen, b"\x1b[9;6u", in_repo);
-            drive_until(&mut writer, &rx, &mut screen, b"\x1b[116;6u\r", in_home);
+            drive_until(
+                &mut writer,
+                &rx,
+                &mut screen,
+                b"\x1b[116;6u\x1b[H\r\x1b[F\r",
+                in_home,
+            );
             drive_until(
                 &mut writer,
                 &rx,
@@ -390,7 +386,7 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
                 &mut writer,
                 &rx,
                 &mut screen,
-                b"\x1bOP\x1bOQ\x1b[H\x1b[B\x1b[B\x1b[B\rmain\r",
+                b"\x1bOP\x1bOQ\x1b[H\x1b[B\x1b[B\x1b[B\rmain\r\x1b[F\r",
                 |contents| contents.contains("Enter / Esc dismiss"),
             );
             drive_until(&mut writer, &rx, &mut screen, b"\x1b", |contents| {
@@ -407,79 +403,9 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
                 |contents| contents.contains("first-prepared"),
             );
             let original_state = home.path().join("original-pane-state");
-            let target_state = home.path().join("existing-pane-state");
+            let target_state = home.path().join("existing-checkout-state");
             let linked_status = git_output(&linked, &["status", "--porcelain"]);
             let trees_before_existing = git_output(&repo, &["worktree", "list", "--porcelain"]);
-            assert!(
-                !screen
-                    .screen()
-                    .contents()
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .contains("feature/other"),
-                "linked checkout must be unopened before the picker is used",
-            );
-            drive_until(&mut writer, &rx, &mut screen, b"\x1b[44;6u", |contents| {
-                contents.contains("Existing branch/worktree")
-            });
-            drive_until(
-                &mut writer,
-                &rx,
-                &mut screen,
-                b"\x1b[B\x1b[B\r",
-                |contents| contents.contains("› feature/other"),
-            );
-
-            // A short viewport must scroll the nested list, not lose its controls.
-            pair.master
-                .resize(PtySize {
-                    rows: 10,
-                    cols: 30,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .unwrap();
-            screen.screen_mut().set_size(10, 30);
-            drive_until(&mut writer, &rx, &mut screen, b"", |contents| {
-                contents.contains("› feature/other")
-                    && contents.contains("Enter")
-                    && contents.contains("Esc")
-            });
-            for (key, selected) in [
-                (b"\x1b[B".as_slice(), "picker-00"),
-                (b"\x1b[B".as_slice(), "picker-01"),
-                (b"\x1b[A".as_slice(), "picker-00"),
-            ] {
-                let selected = format!("› {selected}");
-                drive_until(&mut writer, &rx, &mut screen, key, |contents| {
-                    contents.contains(&selected)
-                        && contents.contains("Enter")
-                        && contents.contains("Esc")
-                });
-            }
-            drive_until(&mut writer, &rx, &mut screen, b"\x1b", |contents| {
-                contents.contains("› Existing branch")
-            });
-            drive_until(&mut writer, &rx, &mut screen, b"\r", |contents| {
-                contents.contains("› feature/other")
-            });
-            pair.master
-                .resize(PtySize {
-                    rows: 24,
-                    cols: 100,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .unwrap();
-            screen.screen_mut().set_size(24, 100);
-            drive_until(&mut writer, &rx, &mut screen, b"\r", |contents| {
-                contents.lines().nth(1).is_some_and(|header| {
-                    header.trim_start().starts_with("› main")
-                        && header.contains("│")
-                        && header.contains("feature/other")
-                }) && !contents.contains("↑↓ choose")
-            });
             let record_original = format!(
                 "printf '%s\\n%s\\n%s\\n' \"$FIRST_PANE_TOKEN\" \"$(git branch --show-current)\" \"$(git rev-parse HEAD)\" > '{}'; printf 'reuse-%s\\n' original\r",
                 original_state.display()
@@ -495,17 +421,87 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
                 std::fs::read_to_string(&original_state).unwrap(),
                 format!("kept\nmain\n{original_head}\n"),
             );
-            let record_target = format!(
-                "\x1b[93;6uprintf '%s\\n%s\\n%s\\n' \"$PWD\" \"$(git branch --show-current)\" \"$(git rev-parse HEAD)\" > '{}'; printf 'reuse-%s\\n' target\r",
-                target_state.display()
+
+            // F2 opens registered checkouts through real mouse clicks. Clicking an
+            // already-open checkout focuses its existing session instead of replacing it.
+            assert!(
+                !screen
+                    .screen()
+                    .contents()
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .contains("feature/other"),
+                "linked checkout must be unopened before F2 is used",
             );
-            drive_until(
-                &mut writer,
-                &rx,
-                &mut screen,
-                record_target.as_bytes(),
-                |contents| contents.contains("reuse-target"),
-            );
+            drive_until(&mut writer, &rx, &mut screen, b"\x1bOQ", |contents| {
+                contents.contains("feature/other")
+            });
+            for (opening, (branch, marker, command)) in [
+                (
+                    "feature/other",
+                    "reuse-target",
+                    format!(
+                        "LINKED_TOKEN=retained; printf '%s\\n%s\\n%s\\n' \"$PWD\" \"$(git branch --show-current)\" \"$(git rev-parse HEAD)\" > '{}'; printf 'reuse-%s\\n' target\r",
+                        target_state.display()
+                    ),
+                ),
+                (
+                    "main",
+                    "original-session:kept",
+                    "printf 'original-%s:%s\\n' session \"$FIRST_PANE_TOKEN\"\r".into(),
+                ),
+                (
+                    "feature/other",
+                    "linked-session:retained",
+                    "printf 'linked-%s:%s\\n' session \"$LINKED_TOKEN\"\r".into(),
+                ),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let row = (2..24)
+                    .find(|&row| {
+                        let label: String = (68..97)
+                            .filter_map(|column| screen.screen().cell(row, column))
+                            .map(|cell| cell.contents())
+                            .collect();
+                        label.contains(branch)
+                    })
+                    .map(|row| row + 1)
+                    .expect("registered checkout must have a mouse row in F2");
+                let click = format!("\x1b[<0;75;{row}M\x1b[<0;75;{row}m");
+                let focused = |contents: &str| {
+                    contents.lines().nth(1).is_some_and(|header| {
+                        header.trim_start().starts_with(&format!("› {branch}"))
+                    })
+                };
+                if opening == 0 {
+                    drive_until(
+                        &mut writer,
+                        &rx,
+                        &mut screen,
+                        click.as_bytes(),
+                        agent_picker,
+                    );
+                    drive_until(&mut writer, &rx, &mut screen, b"\x1b[F\r", focused);
+                } else {
+                    drive_until(
+                        &mut writer,
+                        &rx,
+                        &mut screen,
+                        click.as_bytes(),
+                        focused,
+                    );
+                }
+                drive_until(
+                    &mut writer,
+                    &rx,
+                    &mut screen,
+                    command.as_bytes(),
+                    |contents| contents.contains(marker),
+                );
+            }
             assert_eq!(
                 std::fs::read_to_string(&target_state).unwrap(),
                 format!("{}\nfeature/other\n{original_head}\n", linked.display()),
@@ -513,7 +509,7 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
             assert_eq!(
                 git_output(&repo, &["worktree", "list", "--porcelain"]),
                 trees_before_existing,
-                "selecting a linked checkout must not create another checkout",
+                "opening or focusing a registered checkout must not create another checkout",
             );
             assert_eq!(
                 git_output(&linked, &["status", "--porcelain"]),
@@ -527,6 +523,9 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
                 std::fs::read_to_string(linked.join("untracked.txt")).unwrap(),
                 "untracked linked contents\n",
             );
+            drive_until(&mut writer, &rx, &mut screen, b"\x1bOQ", |contents| {
+                !contents.contains("Worktrees")
+            });
             drive_until(&mut writer, &rx, &mut screen, b"\x1b[113;6u", |contents| {
                 contents.contains("Yes, delete worktree")
             });
@@ -543,92 +542,20 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
                 linked.is_dir(),
                 "closing the tab must retain the dirty checkout"
             );
-
-            // Checkouts precede local unchecked-out branches, sorted by branch name.
-            drive_until(&mut writer, &rx, &mut screen, b"\x1b[44;6u", |contents| {
-                contents.contains("Existing branch/worktree")
-            });
-            drive_until(
-                &mut writer,
-                &rx,
-                &mut screen,
-                b"\x1b[B\x1b[B\r",
-                |contents| contents.contains("› feature/other"),
-            );
-            drive_until(
-                &mut writer,
-                &rx,
-                &mut screen,
-                b"\x1b[B\x1b[B\x1b[B",
-                |contents| {
-                    contents.contains("› topic-existing") && contents.contains("create worktree")
-                },
-            );
-            drive_until(&mut writer, &rx, &mut screen, b"\r", |contents| {
-                contents.lines().nth(1).is_some_and(|header| {
-                    header.trim_start().starts_with("› main")
-                        && header.contains("│")
-                        && header.contains("topic-existing")
-                }) && !contents.contains("↑↓ choose")
-            });
-            let record_original = record_original.replace("reuse-%s", "create-%s");
-            drive_until(
-                &mut writer,
-                &rx,
-                &mut screen,
-                record_original.as_bytes(),
-                |contents| contents.contains("create-original"),
-            );
-            assert_eq!(
-                std::fs::read_to_string(&original_state).unwrap(),
-                format!("kept\nmain\n{original_head}\n"),
-            );
-            let record_target = record_target.replace("reuse-%s", "create-%s");
-            drive_until(
-                &mut writer,
-                &rx,
-                &mut screen,
-                record_target.as_bytes(),
-                |contents| contents.contains("create-target"),
-            );
-            let state = std::fs::read_to_string(&target_state).unwrap();
-            let fields: Vec<_> = state.lines().collect();
-            assert_eq!(fields.len(), 3);
-            let created = std::path::Path::new(fields[0]);
-            assert!(created.is_dir());
-            assert_ne!(created, repo);
-            assert_ne!(created, linked);
-            assert_eq!(fields[1], "topic-existing");
-            assert_eq!(fields[2], distinct_head);
-            assert_eq!(git_output(&repo, &["rev-parse", "HEAD"]), original_head);
-            assert_eq!(git_output(&repo, &["branch", "--show-current"]), "main");
-            drive_until(&mut writer, &rx, &mut screen, b"\x1b[113;6u", |contents| {
-                contents.contains("Yes, delete worktree")
-            });
-            drive_until(&mut writer, &rx, &mut screen, b"\x1b[H\r", |contents| {
-                in_repo(contents)
-                    && !contents
-                        .lines()
-                        .next()
-                        .unwrap_or_default()
-                        .contains("topic-existing")
-                    && !contents.contains("Yes, delete worktree")
-            });
-            assert!(
-                created.is_dir(),
-                "closing the tab must retain the branch checkout"
-            );
             drive_until(&mut writer, &rx, &mut screen, b"\x1b[44;6u", |contents| {
                 contents.contains("Split terminal")
             });
+            drive_until(&mut writer, &rx, &mut screen, b"\r", |contents| {
+                contents.contains("new worktree in split") && !agent_picker(contents)
+            });
             drive_until(
                 &mut writer,
                 &rx,
                 &mut screen,
-                b"\rintegration-split\r",
+                b"integration-split\r\x1b[F\r",
                 |contents| {
                     contents.lines().nth(1).is_some_and(|header| {
-                        header.contains("│") && header.contains("› integration-split")
+                        header.contains("main") && header.contains("integration-split")
                     })
                 },
             );
@@ -640,19 +567,28 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
                 |contents| {
                     contents.lines().nth(1).is_some_and(|header| {
                         header.trim_start().starts_with("› integration-split")
-                            && !header.contains("│")
                     })
                 },
             );
-            for _ in 0..9 {
-                writer.write_all(b"\x1b[13;6u\x1b[B\x1b[B\r").unwrap();
+            for number in 2..=10 {
+                drive_until(&mut writer, &rx, &mut screen, b"\x1bOP\x1bOQ", |contents| {
+                    contents.contains("manual controls")
+                });
+                drive_until(
+                    &mut writer,
+                    &rx,
+                    &mut screen,
+                    b"\x1b[H\x1b[B\x1b[B\x1b[B\x1b[B\r",
+                    agent_picker,
+                );
+                let selected = format!("[shell {number}");
+                drive_until(&mut writer, &rx, &mut screen, b"\x1b[F\r", |contents| {
+                    contents
+                        .lines()
+                        .nth(1)
+                        .is_some_and(|row| row.contains(&selected))
+                });
             }
-            drive_until(&mut writer, &rx, &mut screen, b"", |contents| {
-                contents
-                    .lines()
-                    .nth(1)
-                    .is_some_and(|header| header.contains("[shell 10"))
-            });
             pair.master
                 .resize(PtySize {
                     rows: 9,
@@ -749,7 +685,7 @@ fn interactive_startup_offers_terminal_and_preserves_explicit_shell_project_sele
             assert!(split.is_dir(), "close-only deleted the checkout");
 
             // Reopen the retained checkout, then explicitly delete it.
-            let reopen = format!("\x1b[116;6u\x1b[B\r{}\r", split.display());
+            let reopen = format!("\x1b[116;6u\x1b[H\x1b[B\r{}\r\x1b[F\r", split.display());
             drive_until(
                 &mut writer,
                 &rx,
@@ -907,6 +843,88 @@ fn seed_snapshot(home: &std::path::Path, bytes: &[u8]) {
 }
 
 #[test]
+fn open_folder_selects_location_before_program_and_launches_there() {
+    let home = tempfile::tempdir().unwrap();
+    let home = home.path().canonicalize().unwrap();
+    let original = home.join("original-project");
+    let absolute = home.join("chosen folder");
+    let relative = home.join("relative folder");
+    for path in [&original, &absolute, &relative] {
+        std::fs::create_dir(path).unwrap();
+    }
+    seed_snapshot(
+        &home,
+        &serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "projects": [{
+                "workspaces": [{
+                    "path": original,
+                    "source": null,
+                    "sessions": [{"kind": "shell", "resume": null}],
+                    "selected": 0
+                }],
+                "active": 0,
+                "secondary": null,
+                "focus_secondary": false,
+                "layout": "full",
+                "split_ratio": 5000
+            }],
+            "active_project": 0,
+            "native_keys": false,
+            "agent_cpu_limited": false,
+            "agent_cpu_percent": 50
+        }))
+        .unwrap(),
+    );
+    // Restore a shell, but keep the default agent OMP: choosing Terminal must not start it.
+    let mut crit = Crit::start(&home, &original, &[], &[]);
+    let folder_picker = |screen: &str| screen.contains("enter any folder path:");
+    let terminal = |screen: &str| {
+        screen.contains("CRIT_TEST> ")
+            && !folder_picker(screen)
+            && !agent_picker(screen)
+            && !screen.contains("new tab")
+            && !screen.contains("opening")
+    };
+    let open_folder = |crit: &mut Crit, new_tab: bool| {
+        if new_tab {
+            crit.drive(b"\x1b[116;6u", |screen| screen.contains("new tab"));
+            crit.drive(b"\x1b[B\r", folder_picker);
+        } else {
+            crit.drive(b"\x1bOP\x1bOQ\r", folder_picker);
+        }
+    };
+    crit.drive(b"", terminal);
+    crit.drive(
+        b"ORDER_KEEP=still-here; printf 'order-%s\\n' initialized\r",
+        |screen| screen.contains("order-initialized"),
+    );
+    open_folder(&mut crit, true);
+    crit.drive(b"\x1b", terminal);
+    open_folder(&mut crit, true);
+    crit.drive(format!("{}\r", absolute.display()).as_bytes(), agent_picker);
+    crit.drive(b"\x1b", terminal);
+    let kept = format!("folder-kept:still-here:{}", original.display());
+    crit.drive(
+        b"printf 'folder-kept:%s:%s\\n' \"$ORDER_KEEP\" \"$PWD\"\r",
+        |screen| screen.contains(&kept),
+    );
+
+    for (new_tab, input, destination) in [
+        (true, absolute.to_str().unwrap(), &absolute),
+        (false, "../relative folder", &relative),
+    ] {
+        open_folder(&mut crit, new_tab);
+        crit.drive(format!("{input}\r").as_bytes(), agent_picker);
+        crit.drive(b"\x1b[F\r", terminal);
+        let expected = format!("folder-opened:{}", destination.display());
+        crit.drive(b"printf 'folder-opened:%s\\n' \"$PWD\"\r", |screen| {
+            screen.contains(&expected)
+        });
+    }
+}
+
+#[test]
 fn restored_workspace_still_opens_explicit_repo() {
     let home = tempfile::tempdir().unwrap();
     let home_path = home.path().canonicalize().unwrap();
@@ -1013,6 +1031,96 @@ fn updater_error_requires_enter_before_shell_input_resumes() {
 }
 
 #[test]
+fn startup_updates_finish_before_fresh_and_restored_agents_open_their_executable() {
+    use std::os::unix::fs::PermissionsExt;
+    let old = r#"#!/bin/sh
+case "$1" in
+  --version) echo 2.0.0; exit 0;;
+  db) printf '[]'; exit 0;;
+  update|upgrade)
+    : > "$HOME/updater-started"
+    remaining=500
+    while [ ! -e "$HOME/install-go" ]; do
+      [ "$remaining" -gt 0 ] || exit 9
+      remaining=$((remaining - 1))
+      /bin/sleep 0.01
+    done
+    /bin/mv "$HOME/new-agent" "$0"
+    exit 0;;
+  *)
+    : > "$HOME/old-agent-started"
+    printf 'AGENT-VERSION=old\n'
+    exec /bin/sleep 30;;
+esac
+"#;
+    let new = r#"#!/bin/sh
+case "$1" in
+  --version) echo 2.0.1; exit 0;;
+  db) printf '[]'; exit 0;;
+esac
+: > "$HOME/new-agent-started"
+printf 'AGENT-VERSION=updated\n'
+exec /bin/sleep 30
+"#;
+    for kind in ["omp", "opencode"] {
+        for restore in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let home_path = home.path().canonicalize().unwrap();
+            std::fs::write(home_path.join("new-agent"), new).unwrap();
+            std::fs::set_permissions(
+                home_path.join("new-agent"),
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            if restore {
+                seed_snapshot(
+                    &home_path,
+                    &serde_json::to_vec(&serde_json::json!({
+                        "version": 1,
+                        "projects": [{
+                            "workspaces": [{
+                                "path": home_path,
+                                "source": null,
+                                "sessions": [{"kind": kind, "resume": null}],
+                                "selected": 0
+                            }],
+                            "active": 0,
+                            "secondary": null,
+                            "focus_secondary": false,
+                            "layout": "full",
+                            "split_ratio": 5000
+                        }],
+                        "active_project": 0,
+                        "native_keys": false
+                    }))
+                    .unwrap(),
+                );
+            }
+            let direct = ["--fresh", "--agent", kind];
+            let args = if restore { &[][..] } else { &direct[..] };
+            let mut crit = Crit::start(&home_path, &home_path, args, &[(kind, old)]);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !home_path.join("updater-started").exists() {
+                assert!(Instant::now() < deadline, "{kind}, restore={restore}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                !home_path.join("old-agent-started").exists(),
+                "{kind} started before its update, restore={restore}"
+            );
+            assert!(!home_path.join("new-agent-started").exists());
+            std::fs::write(home_path.join("install-go"), "").unwrap();
+            crit.drive(b"", |screen| screen.contains("AGENT-VERSION=updated"));
+            assert!(home_path.join("new-agent-started").exists());
+            assert!(
+                !home_path.join("old-agent-started").exists(),
+                "{kind} used the old executable, restore={restore}"
+            );
+        }
+    }
+}
+
+#[test]
 fn bottom_row_stays_usable_without_resize_after_f3_and_tab_close() {
     let home = tempfile::tempdir().unwrap();
     let home_path = home.path().canonicalize().unwrap();
@@ -1049,7 +1157,7 @@ fn bottom_row_stays_usable_without_resize_after_f3_and_tab_close() {
                 .is_some_and(|row| row.contains(&format!("bottom-{marker}")))
         });
     }
-    crit.drive(b"\x1b[116;6u\r", |screen| {
+    crit.drive(b"\x1b[116;6u\x1b[H\r\x1b[F\r", |screen| {
         screen
             .lines()
             .nth(1)
@@ -1127,7 +1235,7 @@ fn restore_checks_every_opencode_chat_with_one_query() {
     )
     .unwrap();
     let opencode = format!(
-        "#!/bin/sh\ncase \"$1\" in\n  db) echo \"$*\" >> '{}'; printf '%s' '{rows}';;\n  upgrade) exit 0;;\n  *) exec /bin/sleep 30;;\nesac\n",
+        "#!/bin/sh\ncase \"$1\" in\n  db) echo \"$*\" >> '{}'; printf '%s' '{rows}';;\n  --version) echo 999.0.0;;\n  upgrade) exit 0;;\n  *) exec /bin/sleep 30;;\nesac\n",
         log.display()
     );
     let mut crit = Crit::start(&home_path, &home_path, &[], &[("opencode", &opencode)]);

@@ -3,6 +3,7 @@
 // explicit Unknown/Exited, no session discovery or compatibility hooks.
 // @ts-nocheck
 import { createReporter } from "./reporter.js";
+import { createCheckClient, CHECK_INSTRUCTIONS, CHECK_DESCRIPTION } from "./checks.js";
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 
@@ -11,6 +12,28 @@ export default function (pi) {
   if (process.env.OMPCODE === "1") return;
   const reporter = createReporter();
   if (!reporter) return;
+  const checks = createCheckClient();
+  if (checks) {
+    pi.registerTool({
+      name: "crit_check",
+      label: "Crit check",
+      loadMode: "essential",
+      description: CHECK_DESCRIPTION,
+      parameters: pi.zod.object({ action: pi.zod.enum(["acquire", "release", "status"]) }),
+      async execute(_id, { action }, signal, onUpdate, ctx) {
+        if (!root(ctx)) throw new Error("crit_check belongs to the pane's root session");
+        const text = await checks.execute(action, {
+          cwd: ctx.cwd, signal,
+          progress: (text) => onUpdate?.({ content: [{ type: "text", text }], details: {} }),
+        });
+        return { content: [{ type: "text", text }], details: {} };
+      },
+    });
+    pi.on("before_agent_start", (event, ctx) => {
+      if (!root(ctx)) return;
+      return { systemPrompt: [...event.systemPrompt, CHECK_INSTRUCTIONS] };
+    });
+  }
 
   let active;
   let blocked = 0;
@@ -55,8 +78,9 @@ export default function (pi) {
     return reporter.report(active === true ? "working" : active === false ? "idle" : "unknown", undefined, current, identity);
   }
 
-  function initialize(_event, ctx) {
+  async function initialize(_event, ctx) {
     if (!root(ctx, true)) return;
+    await checks?.finish(ctx.cwd);
     epoch += 1;
     cancelIdle();
     blocked = 0;
@@ -105,8 +129,9 @@ export default function (pi) {
     if (!blocked) blockedMessage = undefined;
     void publish(ctx);
   });
-  pi.on("agent_end", (event, ctx) => {
+  pi.on("agent_end", async (event, ctx) => {
     if (!root(ctx)) return;
+    if (event.willContinue !== true) await checks?.finish(ctx.cwd);
     if (active !== true || event.willContinue === true) return publish(ctx);
     cancelIdle();
     active = false;
@@ -123,6 +148,7 @@ export default function (pi) {
   pi.on("session_shutdown", async (_event, ctx) => {
     if (!root(ctx)) return;
     cancelIdle();
+    await checks?.finish(ctx.cwd);
     // Preserve a valid identity during teardown, but capture a draft/session
     // that became durable since the last normal lifecycle event.
     const file = ctx.sessionManager?.getSessionFile?.();

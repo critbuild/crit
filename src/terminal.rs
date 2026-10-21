@@ -10,7 +10,12 @@ use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEve
 use parking_lot::Mutex;
 use portable_pty::{CommandBuilder, MasterPty, PtySize};
 use std::{
+    ffi::OsString,
     io::{Read, Write},
+    os::{
+        fd::{AsRawFd, FromRawFd, OwnedFd},
+        unix::process::CommandExt,
+    },
     path::Path,
     sync::{
         Arc, LazyLock,
@@ -56,7 +61,7 @@ pub struct Session {
     pub id: u64,
     pub kind: String,
     pub state: AgentState,
-    /// A completed turn not yet acknowledged by selecting its tab. Not persisted.
+    /// A completed turn not yet viewed in its tab while the window is focused. Not persisted.
     pub completed: bool,
     pub message: Option<String>,
     pub resume: Option<String>,
@@ -67,7 +72,8 @@ pub struct Session {
     output: Arc<AtomicBool>,
     master: Box<dyn MasterPty + Send>,
     input: SyncSender<Input>,
-    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    /// Pins the supervisor even after its PID has been recycled.
+    supervisor: OwnedFd,
     pid: Option<u32>,
     size: (u16, u16),
     /// The app's open synchronized update, shared with the parser's callbacks.
@@ -109,13 +115,44 @@ impl Session {
         } else {
             integration::command(kind, id, socket, resume, scratch.as_ref())?
         };
-        // Agent panes, with everything they start, run under the agent CPU limit; shells and
-        // log followers never do.
+        // Place the supervisor before it forks, so both it and all pane descendants inherit
+        // the scope/priority. The existing gate execs it without changing its PID.
+        let window = std::process::id();
+        let executable = format!("/proc/{window}/exe");
+        let mut supervised = vec![
+            "__pane".into(),
+            "--parent".into(),
+            window.to_string(),
+            "--parent-start".into(),
+            process_start(window)?.to_string(),
+            "--".into(),
+            program,
+        ];
+        supervised.extend(args);
+        #[cfg(test)]
+        let pane_test_args = serde_json::to_string(&supervised[1..])?;
+        // Keep libtest's own banner out of the pane; the fixture restores the PTY
+        // descriptors before starting the real supervised program.
+        #[cfg(test)]
+        let (launcher, supervised) = (
+            "/bin/sh".to_owned(),
+            vec![
+                "-c".into(),
+                "exec 3>&1; exec >/dev/null 2>&1; exec \"$@\"".into(),
+                "crit-pane-test".into(),
+                executable.clone(),
+                "--exact".into(),
+                "terminal::tests::supervisor_process_fixture".into(),
+                "--nocapture".into(),
+            ],
+        );
+        #[cfg(not(test))]
+        let launcher = executable.clone();
         let (program, args, gate) = match limiter {
             Some(limiter) if matches!(kind, "omp" | "opencode") => {
-                limiter.prepare(id, program, args, cwd)
+                limiter.prepare(id, launcher.clone(), supervised, cwd)
             }
-            _ => (program, args, None),
+            _ => (launcher, supervised, None),
         };
         let rows = rows.max(2);
         let cols = cols.max(2);
@@ -162,6 +199,14 @@ impl Session {
         for (key, value) in extra_env {
             builder.env(key, value);
         }
+        builder.env("CRIT_WINDOW_PID", window.to_string());
+        builder.env("CRIT_SESSION", id.to_string());
+        builder.env("CRIT_BIN", executable);
+        #[cfg(test)]
+        {
+            builder.env("CRIT_PANE_TEST_ARGS", pane_test_args);
+            builder.env("CRIT_PANE_TEST_TTY", "1");
+        }
         // These only need the master; taking them first means a failure here
         // cannot leave a started child behind.
         let writer = pair.master.take_writer()?;
@@ -178,7 +223,13 @@ impl Session {
             spawned.with_context(|| format!("launching {program} in {}", cwd.display()))?;
         drop(pair.slave);
         let pid = child.process_id();
-        let killer = child.clone_killer();
+        let supervisor = match pid.and_then(|pid| pidfd(pid).ok()) {
+            Some(fd) => fd,
+            None => {
+                kill_and_reap(pid);
+                bail!("opening pane supervisor pidfd");
+            }
+        };
         let (input, queue) = std::sync::mpsc::sync_channel(INPUT_QUEUE);
         let responses = Responses::new(input.clone());
         let sync = responses.sync.clone();
@@ -298,7 +349,7 @@ impl Session {
             output,
             master: pair.master,
             input,
-            killer,
+            supervisor,
             pid,
             size: (rows, cols),
             sync,
@@ -472,7 +523,7 @@ impl Session {
         self.quiet_since.store(clock(), Ordering::Release);
     }
 
-    /// The pane's own process, which leads its process group.
+    /// The pane's subreaper supervisor/session leader (not the actual agent PID).
     pub fn pid(&self) -> Option<u32> {
         self.pid
     }
@@ -601,81 +652,392 @@ fn write_mouse(
     }
 }
 
-impl Drop for Session {
-    fn drop(&mut self) {
-        if !self.alive.load(Ordering::Acquire) {
-            return;
+/// Linux start ticks pin identities across process-ID reuse.
+pub fn process_start(pid: u32) -> Result<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+    stat.rsplit_once(')')
+        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
+        .context("invalid process stat")?
+        .parse()
+        .context("invalid process start time")
+}
+
+fn pidfd(pid: u32) -> Result<OwnedFd> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) } as i32;
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn signal_fd(fd: &OwnedFd, signal: i32) {
+    unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        );
+    }
+}
+
+fn wait_readable(fd: &OwnedFd, timeout: i32) -> std::io::Result<()> {
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        if unsafe { libc::poll(&mut poll, 1, timeout) } >= 0 {
+            return Ok(());
         }
-        // Only signal process groups belonging to this PTY's own session.
-        let foreground = self.master.process_group_leader();
-        if let Some(pid) = self.pid {
-            signal_pty_groups(pid, foreground, libc::SIGHUP);
-        }
-        let _ = self.killer.kill();
-        // SIGHUP is only a request, and a child that ignores it would outlive its
-        // pane. Escalate from a detached thread so closing never waits; gating on
-        // `alive` spares processes that already released the PTY.
-        if let Some(pid) = self.pid {
-            let alive = self.alive.clone();
-            if let Ok(reaper) = std::thread::Builder::new()
-                .name(format!("pty-reap-{}", self.id))
-                .spawn(move || {
-                    let deadline = Instant::now() + Duration::from_secs(2);
-                    while alive.load(Ordering::Acquire) {
-                        if Instant::now() >= deadline {
-                            signal_pty_groups(pid, foreground, libc::SIGKILL);
-                            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-                            break;
-                        }
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                })
-            {
-                let mut reapers = REAPERS.lock();
-                // Dropping a finished handle detaches it, so long sessions don't pile up.
-                reapers.retain(|reaper| !reaper.is_finished());
-                reapers.push(reaper);
-            }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EINTR) {
+            return Err(error);
         }
     }
 }
 
-/// The SIGKILL escalation threads of dropped sessions, for `join_reapers`.
+/// Signal immediate children only. This single-threaded subreaper never waits
+/// concurrently with this scan, so those PIDs cannot be reused. As each ancestor
+/// dies, even session-detached descendants become immediate children; SIGCHLD
+/// wakes the cleanup loop to signal and reap the next generation. Never walk a
+/// racy numeric-PID ancestry chain into an unrelated, reused process.
+fn signal_descendants(parent: u32, signal: i32) {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{parent}/task")) else {
+        return;
+    };
+    for task in tasks.flatten() {
+        let Ok(children) = std::fs::read_to_string(task.path().join("children")) else {
+            continue;
+        };
+        for child in children
+            .split_whitespace()
+            .filter_map(|pid| pid.parse::<u32>().ok())
+        {
+            let Ok(start) = process_start(child) else {
+                continue;
+            };
+            let Ok(fd) = pidfd(child) else { continue };
+            // A PID that disappeared and was reused since reading children is not ours.
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{child}/stat")) else {
+                continue;
+            };
+            let owned = stat.rsplit_once(')').is_some_and(|(_, fields)| {
+                fields
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|p| p.parse::<u32>().ok())
+                    == Some(parent)
+            });
+            if !owned || process_start(child).ok() != Some(start) {
+                continue;
+            }
+            if signal == libc::SIGKILL {
+                // Even newly adopted descendants get a TERM request before KILL.
+                signal_fd(&fd, libc::SIGTERM);
+            }
+            signal_fd(&fd, signal);
+        }
+    }
+}
+
+/// Private, single-threaded pane/check-exec worker. The only extra process is this
+/// subreaper. Its parent pidfd and signalfd block in poll: no idle wakeups.
+///
+/// `__pane --parent PID [--parent-start TICKS] -- PROGRAM ARGS...`
+/// Non-direct parents must supply start ticks; direct parent identity is checked
+/// before and after pidfd_open. Exact OsString command boundaries are preserved.
+pub fn supervise(args: &[OsString]) -> Result<()> {
+    let mut index = 0;
+    let mut parent = None;
+    let mut start = None;
+    while index < args.len() && args[index] != "--" {
+        let option = &args[index];
+        index += 1;
+        let value = args.get(index).context("missing pane option value")?;
+        if option == "--parent" {
+            parent = Some(
+                value
+                    .to_str()
+                    .context("invalid parent PID")?
+                    .parse::<u32>()?,
+            );
+        } else if option == "--parent-start" {
+            start = Some(
+                value
+                    .to_str()
+                    .context("invalid parent start")?
+                    .parse::<u64>()?,
+            );
+        } else {
+            bail!("unknown pane supervisor option {option:?}");
+        }
+        index += 1;
+    }
+    let parent = parent
+        .filter(|pid| *pid > 1)
+        .context("missing pane parent")?;
+    let command = args
+        .get(index + 1..)
+        .filter(|args| !args.is_empty())
+        .context("missing pane command after --")?;
+    let direct = unsafe { libc::getppid() } as u32;
+    if start.is_none() && direct != parent {
+        bail!("non-direct pane parent requires --parent-start");
+    }
+    let expected = start.unwrap_or(process_start(parent)?);
+    let parent_fd = pidfd(parent)?;
+    if process_start(parent)? != expected
+        || (start.is_none() && unsafe { libc::getppid() } as u32 != parent)
+    {
+        bail!("pane parent changed before supervision");
+    }
+    unsafe {
+        if libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    let mut old_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    unsafe {
+        libc::sigemptyset(&mut mask);
+        for signal in [
+            libc::SIGCHLD,
+            libc::SIGTERM,
+            libc::SIGHUP,
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGTTOU,
+            libc::SIGTSTP,
+        ] {
+            libc::sigaddset(&mut mask, signal);
+        }
+        if libc::sigprocmask(libc::SIG_BLOCK, &mask, &mut old_mask) != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    // A caller may ignore HUP/CHLD. Block first, then restore dispositions so
+    // signalfd receives termination and children remain waitable.
+    #[cfg(not(test))]
+    unsafe {
+        for signal in [
+            libc::SIGCHLD,
+            libc::SIGTERM,
+            libc::SIGHUP,
+            libc::SIGINT,
+            libc::SIGQUIT,
+        ] {
+            libc::signal(signal, libc::SIG_DFL);
+        }
+    }
+    let signals = unsafe { libc::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK) };
+    if signals < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let signals = unsafe { OwnedFd::from_raw_fd(signals) };
+    let executable = std::env::var_os("CRIT_BIN")
+        .unwrap_or_else(|| format!("/proc/{}/exe", std::process::id()).into());
+    // Nested check-exec supervisors retain the original pane lease identity.
+    // Pane launches strip inherited CRIT_* first, so they always use this worker.
+    let pane =
+        std::env::var_os("CRIT_PANE_PID").unwrap_or_else(|| std::process::id().to_string().into());
+    // This worker has no threads. Fork is necessary to set the real agent PID in
+    // its environment without a shell wrapper or an extra process.
+    let leader = unsafe { libc::fork() };
+    if leader < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if leader == 0 {
+        unsafe {
+            libc::setpgid(0, 0);
+            if libc::isatty(libc::STDIN_FILENO) == 1 {
+                libc::tcsetpgrp(libc::STDIN_FILENO, libc::getpid());
+            }
+            for signal in [
+                libc::SIGCHLD,
+                libc::SIGTERM,
+                libc::SIGHUP,
+                libc::SIGINT,
+                libc::SIGQUIT,
+                libc::SIGTTOU,
+                libc::SIGTTIN,
+                libc::SIGTSTP,
+            ] {
+                libc::sigdelset(&mut old_mask, signal);
+            }
+            for signal in [
+                libc::SIGCHLD,
+                libc::SIGTERM,
+                libc::SIGHUP,
+                libc::SIGINT,
+                libc::SIGQUIT,
+                libc::SIGTTOU,
+                libc::SIGTTIN,
+                libc::SIGTSTP,
+            ] {
+                libc::signal(signal, libc::SIG_DFL);
+            }
+            libc::sigprocmask(libc::SIG_SETMASK, &old_mask, std::ptr::null_mut());
+        }
+        drop(parent_fd);
+        drop(signals);
+        let error = std::process::Command::new(&command[0])
+            .args(&command[1..])
+            .env("CRIT_AGENT_PID", std::process::id().to_string())
+            .env("CRIT_PANE_PID", pane)
+            .env("CRIT_BIN", executable)
+            .exec();
+        eprintln!("crit: launching {:?}: {error}", command[0]);
+        unsafe { libc::_exit(127) };
+    }
+    let me = std::process::id();
+    let mut status = None;
+    let mut closing = None;
+    let mut killed = false;
+    let mut interrupted = None;
+    loop {
+        // Reap all adopted orphans too. Leader exit starts cleanup, never an early
+        // return: detached grandchildren are adopted here even after setsid().
+        let mut children = true;
+        loop {
+            let mut child_status = 0;
+            let child = unsafe { libc::waitpid(-1, &mut child_status, libc::WNOHANG) };
+            if child > 0 {
+                if child == leader {
+                    status = Some(child_status);
+                }
+            } else {
+                if child < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD)
+                {
+                    children = false;
+                }
+                break;
+            }
+        }
+        if status.is_some() && closing.is_none() {
+            closing = Some(Instant::now());
+        }
+        if !children {
+            break;
+        }
+        if let Some(since) = closing {
+            if !killed && since.elapsed() >= Duration::from_secs(2) {
+                killed = true;
+            }
+            signal_descendants(me, if killed { libc::SIGKILL } else { libc::SIGTERM });
+        }
+        let timeout = closing.filter(|_| !killed).map_or(-1, |since| {
+            Duration::from_secs(2)
+                .saturating_sub(since.elapsed())
+                .as_millis()
+                .min(i32::MAX as u128) as i32
+        });
+        let mut fds = [
+            libc::pollfd {
+                fd: if closing.is_some() {
+                    -1
+                } else {
+                    parent_fd.as_raw_fd()
+                },
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: signals.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) };
+        if result < 0 {
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            closing.get_or_insert_with(Instant::now);
+        }
+        if fds[0].revents != 0 {
+            interrupted.get_or_insert(libc::SIGTERM);
+            closing.get_or_insert_with(Instant::now);
+        }
+        let mut info = unsafe { std::mem::zeroed::<libc::signalfd_siginfo>() };
+        while unsafe {
+            libc::read(
+                signals.as_raw_fd(),
+                (&mut info as *mut libc::signalfd_siginfo).cast(),
+                std::mem::size_of_val(&info),
+            )
+        } > 0
+        {
+            let signal = info.ssi_signo as i32;
+            if matches!(
+                signal,
+                libc::SIGTERM | libc::SIGHUP | libc::SIGINT | libc::SIGQUIT
+            ) {
+                interrupted.get_or_insert(signal);
+                closing.get_or_insert_with(Instant::now);
+                signal_descendants(me, signal);
+            }
+        }
+    }
+    // Preserve real wait status, including signal termination, for portable-pty
+    // and check exec. Signals received during forced close remain signals too.
+    let status = status.unwrap_or(0);
+    let signal = interrupted.or_else(|| libc::WIFSIGNALED(status).then(|| libc::WTERMSIG(status)));
+    if let Some(signal) = signal {
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::sigemptyset(&mut mask);
+            libc::sigaddset(&mut mask, signal);
+            libc::sigprocmask(libc::SIG_UNBLOCK, &mask, std::ptr::null_mut());
+            libc::raise(signal);
+            libc::_exit(128 + signal);
+        }
+    }
+    std::process::exit(libc::WEXITSTATUS(status));
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        // A pidfd can never signal an unrelated process after PID reuse. The supervisor,
+        // not the window, owns all descendant cleanup, including after its leader exits.
+        signal_fd(&self.supervisor, libc::SIGTERM);
+        if let Ok(fd) = self.supervisor.try_clone()
+            && let Ok(reaper) = std::thread::Builder::new()
+                .name(format!("pty-reap-{}", self.id))
+                .spawn(move || {
+                    let _ = wait_readable(&fd, -1);
+                })
+        {
+            let mut reapers = REAPERS.lock();
+            reapers.retain(|reaper| !reaper.is_finished());
+            reapers.push(reaper);
+        }
+    }
+}
+
 static REAPERS: Mutex<Vec<std::thread::JoinHandle<()>>> = Mutex::new(Vec::new());
 
-/// Waits for the escalation threads, which take at most about 2 s. Crit calls this just
-/// before it exits: a thread cut short by the exit would leave a child that ignores SIGHUP
-/// running after Crit is gone.
+/// Wait for supervisors to finish descendant cleanup before an orderly window exit.
 pub fn join_reapers() {
-    // Take the handles first, so the lock is not held while joining.
-    let reapers = std::mem::take(&mut *REAPERS.lock());
-    for reaper in reapers {
+    for reaper in std::mem::take(&mut *REAPERS.lock()) {
         let _ = reaper.join();
     }
 }
 
-/// Signal the PTY's foreground group and the child's own group, but only groups
-/// that belong to the child's session.
-fn signal_pty_groups(pid: u32, foreground: Option<libc::pid_t>, signal: libc::c_int) {
-    unsafe {
-        if let Some(foreground) = foreground
-            && foreground > 0
-            && libc::getsid(foreground) == pid as i32
-        {
-            libc::kill(-foreground, signal);
-        }
-        if libc::getpgid(pid as i32) == pid as i32 {
-            libc::kill(-(pid as i32), signal);
-        }
-    }
-}
-
-/// Kill and collect a child that no waiter thread will ever reap.
+/// An abandoned child is still ours and unreaped: its PID cannot have been reused.
 fn kill_and_reap(pid: Option<u32>) {
     if let Some(pid) = pid {
         unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
-            libc::waitpid(pid as i32, std::ptr::null_mut(), 0);
+            libc::kill(pid as i32, libc::SIGTERM);
+            loop {
+                if libc::waitpid(pid as i32, std::ptr::null_mut(), 0) >= 0
+                    || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                {
+                    break;
+                }
+            }
         }
     }
 }
@@ -884,6 +1246,181 @@ impl vt100::Callbacks for Responses {
 mod tests {
     use super::*;
     use crate::limits;
+    // The unit-test harness has its own main thread. Relay process-directed
+    // termination to the fixture thread, whose signalfd blocks and consumes it.
+    static FIXTURE_THREAD: AtomicU64 = AtomicU64::new(0);
+    extern "C" fn fixture_signal(signal: i32) {
+        unsafe {
+            libc::pthread_kill(
+                FIXTURE_THREAD.load(Ordering::Relaxed) as libc::pthread_t,
+                signal,
+            );
+        }
+    }
+
+    #[test]
+    fn supervisor_process_fixture() {
+        let Ok(args) = std::env::var("CRIT_PANE_TEST_ARGS") else {
+            return;
+        };
+        if std::env::var_os("CRIT_PANE_TEST_TTY").is_some() {
+            unsafe {
+                assert!(libc::dup2(3, libc::STDOUT_FILENO) >= 0);
+                assert!(libc::dup2(3, libc::STDERR_FILENO) >= 0);
+                libc::close(3);
+            }
+        }
+        FIXTURE_THREAD.store(unsafe { libc::pthread_self() } as u64, Ordering::Relaxed);
+        unsafe {
+            for signal in [
+                libc::SIGCHLD,
+                libc::SIGTERM,
+                libc::SIGHUP,
+                libc::SIGINT,
+                libc::SIGQUIT,
+            ] {
+                libc::signal(signal, fixture_signal as *const () as libc::sighandler_t);
+            }
+        }
+        let args: Vec<String> = serde_json::from_str(&args).unwrap();
+        supervise(&args.into_iter().map(OsString::from).collect::<Vec<_>>()).unwrap();
+    }
+
+    fn fixture_command(parent: u32, script: &str, file: &Path) -> std::process::Command {
+        let args = vec![
+            "--parent".to_owned(),
+            parent.to_string(),
+            "--parent-start".to_owned(),
+            process_start(parent).unwrap().to_string(),
+            "--".to_owned(),
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            "pane-fixture".to_owned(),
+            file.to_string_lossy().into_owned(),
+        ];
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "terminal::tests::supervisor_process_fixture",
+                "--nocapture",
+            ])
+            .env("CRIT_PANE_TEST_ARGS", serde_json::to_string(&args).unwrap())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command
+    }
+
+    fn await_fixture_pid(file: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(pid) = std::fs::read_to_string(file)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok())
+            {
+                return pid;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "descendant fixture did not start"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn await_fixture_exit(child: &mut std::process::Child) -> std::process::ExitStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            if Instant::now() >= deadline {
+                // Kill the supervised command, not the subreaper, on test failure.
+                signal_descendants(child.id(), libc::SIGKILL);
+                panic!("supervisor failed to finish descendant cleanup");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    const DETACHED_IGNORING_CHILD: &str = r#"setsid /bin/sh -c 'trap "" HUP TERM; echo $$ > "$1"; while :; do sleep 60; done' pane-detached "$1" &
+           while [ ! -s "$1" ]; do sleep 0.01; done;"#;
+
+    #[test]
+    fn leader_exit_reaps_detached_signal_ignoring_grandchildren() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("child");
+        let mut unrelated = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let script = format!("{DETACHED_IGNORING_CHILD} exit 37");
+        let mut supervisor = fixture_command(std::process::id(), &script, &file)
+            .spawn()
+            .unwrap();
+        let descendant = await_fixture_pid(&file);
+        let status = await_fixture_exit(&mut supervisor);
+        assert_eq!(
+            status.code(),
+            Some(37),
+            "leader exit status must survive cleanup"
+        );
+        assert!(
+            process_start(descendant).is_err(),
+            "detached child must be reaped"
+        );
+        let untouched = unrelated.try_wait().unwrap().is_none();
+        let _ = unrelated.kill();
+        let _ = unrelated.wait();
+        assert!(
+            untouched,
+            "cleanup must not signal an unrelated sibling process"
+        );
+    }
+
+    #[test]
+    fn supervisor_term_reaps_ignored_signals_and_detached_sessions() {
+        use std::os::unix::process::ExitStatusExt;
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("child");
+        let script = format!("{DETACHED_IGNORING_CHILD} trap '' HUP TERM; wait");
+        let mut supervisor = fixture_command(std::process::id(), &script, &file)
+            .spawn()
+            .unwrap();
+        let descendant = await_fixture_pid(&file);
+        signal_fd(&pidfd(supervisor.id()).unwrap(), libc::SIGTERM);
+        let status = await_fixture_exit(&mut supervisor);
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert!(
+            process_start(descendant).is_err(),
+            "TERM-ignoring child must be reaped"
+        );
+    }
+
+    #[test]
+    fn killed_parent_triggers_cleanup_without_terminal_hangup() {
+        use std::os::unix::process::ExitStatusExt;
+        let temp = tempfile::tempdir().unwrap();
+        let file = temp.path().join("child");
+        let mut parent = std::process::Command::new("/bin/sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let script = format!("{DETACHED_IGNORING_CHILD} trap '' HUP TERM; wait");
+        let mut supervisor = fixture_command(parent.id(), &script, &file)
+            .spawn()
+            .unwrap();
+        let descendant = await_fixture_pid(&file);
+        parent.kill().unwrap();
+        parent.wait().unwrap();
+        let status = await_fixture_exit(&mut supervisor);
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        assert!(
+            process_start(descendant).is_err(),
+            "parent death must reap detached child"
+        );
+    }
 
     fn response_parser() -> (Parser, Receiver<Input>) {
         let (input, queue) = std::sync::mpsc::sync_channel(INPUT_QUEUE);
@@ -1581,7 +2118,8 @@ mod tests {
                 .unwrap();
             Duration::from_micros(micros)
         };
-        let (before, started) = (usage(), Instant::now());
+        // Include both accounting reads in the interval; a busy host can delay them.
+        let (started, before) = (Instant::now(), usage());
         std::thread::sleep(window);
         (usage() - before).as_secs_f64() / started.elapsed().as_secs_f64()
     }

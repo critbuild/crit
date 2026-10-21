@@ -1,4 +1,5 @@
 mod app;
+mod checks;
 mod clipboard;
 mod compose;
 mod event;
@@ -27,8 +28,9 @@ USAGE
   crit worktree list [--repo PATH]
   crit worktree create BRANCH [--base REF] [--repo PATH]
   crit worktree remove PATH [--repo PATH]
-  crit env up|down|restart|status|logs [--repo PATH]
-  crit env up|restart --source PATH [--repo PATH]
+  crit check acquire|request|release|cancel|status|restart|logs [--repo PATH]
+  crit check release --automatic [--repo PATH]
+  crit check exec [--repo PATH] -- PROGRAM [ARGS...]
   crit setup kitty|agents|all
   crit keys
   crit sandbox [status|clean [--all]]
@@ -40,14 +42,16 @@ ends, or Ctrl+Shift+W closes a pane, the pane closes like a Kitty window: a
 split's other pane goes full width, an emptied tab closes, and the last tab
 closes Crit. An agent that fails, or quits within a second of starting, stays
 open with its exit status (F1 to restart).
-Ctrl+Shift+T then Enter opens a new home tab. The menu also offers other
-folders and worktrees; switch projects from the tab bar, F1, or F1 then F2.
-F2 opens a worktree pane on the right: click a branch to open or focus its tab,
-click 🗑 to delete the checkout (confirmation required), × or F2 closes it.
+Ctrl+Shift+T chooses Home, open folder, new worktree, or existing worktree.
+Choose the folder, branch name, or registered checkout first, then OMP /
+OpenCode / Terminal. Nothing launches before the program choice. Esc cancels.
+Switch projects from the tab bar, F1, or F1 then F2.
+F2 opens global resources on the right: live sessions and checking runtimes
+grouped by project, independent of the selected tab. Click a session to focus
+it without restarting it; registered checkout rows retain open/delete controls.
 Ctrl+Shift+, or . opens a split picker:
 New worktree creates a separate checkout; Split terminal opens a shell in the
-same folder. Existing branch/worktree opens a destination picker.
-Ctrl+Shift+Enter opens a session.
+same folder. Open or manage existing checkouts with F2.
 F12 persistently toggles Crit/native Kitty shortcuts. Run `crit setup kitty` once
 to enable the window-scoped mappings.
 
@@ -92,18 +96,21 @@ APPEARANCE
   Selected sessions stay visible in the workspace header even when other
   session labels overflow.
   Worktree tabs fit their labels without padding short names. Longer labels
-  scroll through an 18-column slot. The status sits directly after the name:
-  a spinner while an agent works, a blinking ◆ when it waits for your decision,
-  ○ while it starts, and × when it has exited. ● marks a completed turn you
-  have not acknowledged; clicking or keyboard-selecting its tab clears it,
-  even if that tab is already selected. Idle shells do not show completion dots.
+  scroll through an 18-column slot. A compact status column follows the name:
+  a baseline-aligned braille spinner while working, a blinking ◆ for a
+  decision, ○ while starting, and × when exited. A green ✓ means an unread completed
+  turn, not merely idle. Viewing the tab in the focused window clears it
+  automatically; a turn finishing while already visible is read immediately.
+  Hidden tabs keep their check until viewed. Idle shells do not notify.
+  Shortcut labels stay muted; F2 highlights while the worktree pane is open.
+  Amber marks CPU limits turned off or native Kitty key routing.
   A thin scroll thumb appears in the right gutter when normal-screen history
   exists; its whole column is clickable and draggable to review history or
   return to live output at the bottom.
   Mouse-aware apps receive the wheel normally; Shift+wheel scrolls Crit's
   history instead. Typing or pasting returns to live output.
-  Side-by-side panes share one thin rail with a ┼ grip midway; drag the rail
-  or the column beside it without changing focus.
+  Side-by-side panes share a thin rail with a centered highlighted segment.
+  Drag the rail or the column beside it without changing focus.
   Each pane keeps a usable minimum width; the proportion follows window resizing
   and is saved per project. Narrow windows show one pane until both fit again.
   After a pane changes size, Crit waits for the app's repaint before drawing
@@ -134,7 +141,7 @@ AGENT CPU
   default the agent panes of a window share 50% of the machine's CPU (half of
   its cores) and 50% of its memory; --agent-cpu PERCENT (1-100) sets both
   shares and turns the limit on. F3 turns the limit off and on again, for
-  running agents too; the key hint shows the share, or OFF. The share and
+  running agents too; the key hint shows the share, or Off. The share and
   F3's choice are saved with the workspace, like F12; --fresh starts over
   with the default. In native Kitty mode F3 goes to the terminal like every
   key except F12.
@@ -165,7 +172,7 @@ AGENT CPU
   Without cgroup v2, a systemd user session, busctl, or a user
   manager that can limit CPU, agents run at a lower priority (nice 10) while
   the limit is on instead, those started while it is on as SCHED_BATCH with
-  the 1 ms timer slack too; the key hint shows LOW, and a startup warning
+  the 1 ms timer slack too; the key hint shows Low, and a startup warning
   says why. No process can raise that priority again, so turning the limit
   off then applies only to agents started afterwards.
 
@@ -224,20 +231,29 @@ AGENT RUNTIME
   these.
 
 UPDATES
-  At most once a day, Crit runs omp update and opencode upgrade together, in
-  the background while the workspace opens. Only the window that owns the
-  saved workspace (see RESTORE) runs them; other windows never do. The last
-  run's time is kept in updates.stamp beside workspace.json; delete it to
-  update at the next launch. Nothing waits for the updaters: agents start at
-  once with the installed version, and updater banners stay out of the UI. If
-  an update fails, Crit shows an error dialog and keeps using the
-  installed version. A tool that is not installed is not a failure. An update
-  that finishes during a session applies to panes started afterwards and to
-  the next launch. Quitting Crit leaves an update still running to finish,
-  but every update has 10 minutes, even after Crit quits: one still running
-  then is stopped with everything it started (and killed 30 seconds later
-  if it keeps running), and a running Crit reports that it timed out. The
-  limit needs coreutils timeout; without it, updates are not limited.
+  Every startup, the window owning the saved workspace (see RESTORE) checks
+  OMP and OpenCode in parallel on the animated blue-scan startup screen.
+  Separate rows show each tool checking, ready, not installed, or using its
+  installed version after a failure. Other windows never run the checks.
+  Crit waits for the checks and any necessary installs before restoring or
+  launching agents, so those panes use the updated executables immediately.
+  There is no daily throttle. OMP's native updater checks release metadata
+  and installs only a newer build, respecting its stable/canary setting.
+  For OpenCode 1, Crit checks the official npm release metadata first and
+  runs opencode upgrade VERSION only for a newer version of the same major.
+  An npm-installed OpenCode's version is read from its package manifest,
+  without starting its runtime; other installs use --version. Timestamped
+  preview builds follow their own npm tag. Other majors and custom builds
+  keep their native upgrade check rather than guessing their release channel.
+  OpenCode metadata requests have 15 seconds. Updater banners stay out of the
+  UI. A failed check or update shows an error dialog and startup continues
+  with the installed version. A missing tool is not a failure.
+  Esc quits the startup screen without replacing the saved workspace; an
+  installer already running is left to finish. Every updater has 10 minutes,
+  even after Crit quits: one still running then is stopped with
+  everything it started (and killed 30 seconds later if it keeps running).
+  A running Crit reports that it timed out. The process deadlines need
+  coreutils timeout; without it, child processes are not limited.
 
 PROJECTS
   Run crit from any folder, including a Git checkout, to choose New terminal
@@ -247,6 +263,10 @@ PROJECTS
   requested agent or shell. With a saved workspace, that folder opens as an
   extra tab after the restore. No Git initialization is required, including
   for research.
+  Interactive new tabs choose a destination option, then OMP, OpenCode or
+  Terminal; --agent may preselect that choice but does not skip it.
+  Opening an already-running tab keeps its sessions; an unopened checkout
+  selected from F2 asks which agent or shell to launch.
   Crit passes --allow-home to OMP so a home-folder workspace stays in home,
   rather than being automatically relocated to /tmp.
   The picker finds Git projects near the launch folder and under your home.
@@ -277,48 +297,52 @@ PROJECTS
   cannot reopen canceled dialogs or replace newer ones. Failed worktree creation
   restores its input only while its original workspace is focused and no newer
   dialog is open.
-  The split picker offers New worktree, Split terminal, and Existing branch/worktree.
-  New worktree asks for a branch name and leaves the first pane's branch alone.
+  The split picker offers New worktree and Split terminal.
+  New worktree asks for a branch, then a program, and leaves the first pane alone.
   Split terminal starts a shell in the same folder, whatever the focused pane
   runs, without creating a branch, worktree, or Docker environment: a terminal
   beside the agent. Ctrl+D in the agent then leaves the terminal at full
   width. It also works in non-Git folders. Mouse clicks or Ctrl+Shift+[ / ]
   switch panes. Ctrl+Shift+W closes the focused session; its peer stays running.
-  Existing branch/worktree lists other registered checkouts and local branches
-  without checkouts. Up/Down selects; Enter opens; Esc returns to the split menu.
-  Existing checkouts keep their files and sessions. An unchecked-out branch gets
-  its own worktree at that branch's commit. The original pane keeps its branch,
-  session, and focus. Esc hides the opening popup; the checkout then opens as a tab.
+  F2 lists registered checkouts, not local branches without checkouts. Click a
+  checkout to open its tab or focus it if already open; use 🗑 to delete it.
   Returning a split to full width keeps the focused session. Saved terminal
   splits reopen both sessions in the same workspace, with their focus and ratio.
   Saved projects, worktrees, splits, focused panes and selected sessions reopen.
 
-WORKTREE PANE
-  F2 toggles a pane on the right that lists this project's worktrees; the hint
-  at the right end of the tab bar names the key. Click a branch to open its tab,
-  or to focus the tab that is already open. Click × in the header, or press F2
-  again, to close it. The pane is mouse-only, so keyboard focus stays in your
-  terminal session and you can keep typing with it open. In native Kitty mode
-  F2 goes to the terminal like every key except F12, and Ask Crit keeps F2 for
-  manual controls.
+RESOURCES AND WORKTREES (F2)
+  F2 toggles a global pane on the right, independent of the selected project
+  or tab. All live agent and shell sessions in this window are grouped by
+  project and worktree, in project opening order. Idle processes still count;
+  exited panes do not. Terminal-only folders are included.
+  Click a session to focus its existing process, a project to return to it,
+  or a registered checkout to open/focus its tab. Click × or press F2 to close
+  the pane. Keyboard focus stays in the terminal while it is open.
+  In native Kitty mode F2 goes to the terminal like every key except F12;
+  Ask Crit keeps F2 for manual controls.
   Windows narrower than 60 columns hide the pane and give the terminal its full
   width; it returns when the window is wide enough. While it shows, the
   terminal (and any split) lays out in the remaining width. It belongs to the
   window and is not saved.
-  The list is live: every second Crit checks the repository's Git files for
-  changes and re-reads the worktree list when they changed (and at least every
-  30 seconds), so branches and worktrees created, switched or removed elsewhere
-  appear without reopening it.
+  The list is live: session changes appear with the next frame. Git metadata
+  for every open project is checked each second (every 10 seconds unfocused)
+  and refreshed when changed, with a 30-second safety refresh.
   Each row shows the branch (detached HEAD when there is none) and markers:
   ● a tab is open, main, locked, missing (checkout deleted outside Git; it
   cannot be opened). The focused tab's row is highlighted. Long lists scroll
   with the wheel over the pane, with ↑ n more / ↓ n more marking hidden rows.
+  Each project's check summary names its phase, owner branch and queue count,
+  including live/uncertain check projects without a local open tab. Owner and
+  Q1/Q2 markers follow registered worktrees even without open tabs.
+  Starting/stopping are transitions; blocked means cleanup or startup needs
+  attention. Check environment status shows its error. Not requested describes
+  Crit's ownership, not the state of any external Docker stack.
+  This is a live process/runtime inventory, not sampled CPU or RAM telemetry.
   🗑 at the end of a row asks for confirmation, then deletes the checkout under
   the same rules as Close tab, Yes, delete worktree: it must be clean, unlocked
-  and not the main checkout, with its Docker environment stopped. The branch
+  and not the main checkout, with no active/uncertain checking use. The branch
   stays, ignored files go with the checkout, and an open tab closes. Dimmed 🗑
   cells (main, locked) only explain why that checkout cannot be deleted.
-  A project outside Git shows \"Not a Git project.\" in the pane instead.
 
 RESTORE
   Crit checkpoints workspace changes and exact OMP/OpenCode chat references in
@@ -349,55 +373,59 @@ RESTORE
   Only one Crit window owns the snapshot. Additional windows do not restore or
   overwrite it while the owner is running, and display that limitation.
 
-DOCKER
-  New worktrees automatically start their Compose stack when configured.
+CHECKING RUNTIME
+  Opening, creating or restoring a worktree never starts containers.
   Required Git-ignored local Compose configuration, .env and service env_file
-  inputs are copied from the source checkout as private, independent files.
-  Existing target files are preserved; shared links and path escapes are refused.
-  A preparation failure leaves the new checkout usable. Fix its local files and
-  start its environment again to retry from the remembered source checkout.
-  If that checkout no longer exists, Crit forgets it and uses the files already
-  in place.
-  For a checkout created before this support, explicitly supply its source:
-    crit env up --repo /path/to/worktree --source /path/to/source-checkout
-  Each worktree gets its own project, networks, named volumes, build image,
-  and dynamically allocated loopback host ports. Ask \"open the preview\".
-  Explicitly requested environment status appears in a centered result dialog;
-  Enter or Esc dismisses it. Successful start, stop and restart actions are silent.
-  External networks/volumes and host networking are refused. Bind mounts
-  retain their configured paths: use worktree-relative paths or named volumes,
-  not a shared absolute writable directory, for independent data.
+  inputs are copied from the source as private files; existing targets remain.
+  One project-owned Compose runtime serves exclusive FIFO checking turns.
+  `crit check acquire` waits for healthy services; `request` queues a manual turn.
+  Preview follows the active owner, not the focused tab. `status` shows owner,
+  queue, endpoints and errors without starting a coordinator or containers.
+  `crit check exec -- PROGRAM ARGS` streams an owned host command in that checkout.
+  Release in finally: `crit check release`. `cancel` also removes queued requests.
+  `restart` rebuilds the current owner's turn without yielding its position.
+  Agent turn completion releases automatic turns; manual requests stay pinned
+  until release or pane/window closure. Owner death and cancellation clean up
+  before the next grant. Drained queues stop containers and coordinator workers;
+  named data volumes remain. Restoration never revives checking turns.
+  Native OMP/OpenCode tools expose crit_check actions acquire/release/status.
+  A turn observes the checkout's HEAD; it does not freeze mutable files, mark
+  tests passed, commit, merge, reset main, or create another validation checkout.
+  Existing unmanaged/legacy stacks block startup; Crit never silently stops them.
+  External networks/volumes, host networking and shared writable bind mounts
+  are refused. Dynamic host ports bind loopback only.
+  If all coordinators are externally killed, status reports blocked, not stopped.
+  The next acquire/request reconciles owned resources under the lifecycle lock
+  before granting another turn; uncertain cleanup never permits overlap.
 
-  Optional crit.toml in the repository:
+  Optional crit.toml:
+    [checks]
+    cpus = 2.0
+    memory_mib = 2048
     [compose]
     files = [\"compose.yaml\"]
     [compose.links.web]
     API_URL = \"api:8000\"
-  This injects that worktree's http://127.0.0.1:PORT into web's runtime
-  environment after api starts. Use your app's actual variable name.
-  Build-time frontend URLs must be configured in the app/build separately.
+  Default aggregate running-service budget: half available CPUs, clamped to
+  1–4 CPUs, and half physical RAM, clamped to 1024–8192 MiB. Overrides accept
+  cpus 0.1–64 and memory_mib 128–262144. Stricter service limits remain.
+  Docker build-daemon resource use is not capped by this budget.
+  Links inject the dependency's http://127.0.0.1:PORT into runtime environment;
+  build-time frontend URLs must be configured in the app/build separately.
 
 LIFECYCLE
 
 Ctrl+Shift+Q offers Yes (close only), Yes, delete worktree, and No.
 Use Up/Down and Enter; No is selected by default. Esc cancels.
-Close-only retains the checkout and Docker stack. Explicit deletion closes the
-tab only after removing a clean, unlocked, non-main worktree; its branch stays.
-Git-ignored files inside it (build output, .env, bind-mounted data) are deleted
-with it; named Docker volumes are kept. Directories you cannot write, often
-created by containers, block deletion instead of leaving a half-deleted checkout.
-Stop its Docker environment first. If Docker cannot be reached, the checkout is
-still removed and an error dialog names the stack to clean up. Ordinary folders are
-never deleted.
-Deletion shows a progress popup; Esc hides it. Successful deletion is silent.
-A refusal shows an error dialog and leaves the tab and checkout intact;
-Enter or Esc dismisses the error. Docker state is
-checked again at deletion, so stopping the stack outside Crit does not require
-reopening the tab. A checkout whose environment Crit never started needs no Docker.
-Docker down retains volumes.
-Crit owns its agent processes; exiting stops them, not Docker stacks. The next
-launch restores the saved workspace and supported chats, not the old processes.
-Agent hooks are launch-scoped, not global plugins. Crit is not a background daemon.
+Close-only retains the checkout and releases that pane's checking requests.
+Explicit deletion removes only a clean, unlocked, non-main checkout; its branch
+stays. Active or uncertain runtime ownership blocks deletion. Git-ignored files
+inside the checkout are deleted with it; named Docker volumes are kept.
+Ordinary folders are never deleted. Deletion shows progress; Esc hides it.
+A refusal leaves the tab and checkout intact and shows an error dialog.
+Crit owns its pane and checking command descendants and stops them on close.
+The next launch restores saved workspace and supported chats, not old processes
+or checking turns. Agent hooks are launch-scoped, not global plugins.
 ";
 
 fn main() {
@@ -427,6 +455,15 @@ fn agent_cpu_percent(value: OsString) -> Result<u8> {
 }
 
 fn run() -> Result<()> {
+    let raw: Vec<OsString> = std::env::args_os().skip(1).collect();
+    match raw.first().and_then(|arg| arg.to_str()) {
+        Some("__checks") => return checks::internal(&raw[1..]),
+        Some("__pane") => return terminal::supervise(&raw[1..]),
+        Some("check") => {
+            return checks::cli(&raw[1..], &std::env::current_dir().unwrap_or_default());
+        }
+        _ => {}
+    }
     let mut args = std::env::args_os().skip(1);
     let mut positionals: Vec<OsString> = Vec::new();
     let mut repo = None;
@@ -436,7 +473,6 @@ fn run() -> Result<()> {
     let mut direct_start = false;
     let mut fresh = false;
     let mut agent_cpu = None;
-    let mut source = None;
     let mut all = false;
     while let Some(arg) = args.next() {
         // A non-UTF-8 argument cannot be an option, so it is a positional (a path).
@@ -476,11 +512,6 @@ fn run() -> Result<()> {
                 )?)
             }
             Some("--fresh") => fresh = true,
-            Some("--source") => {
-                source = Some(PathBuf::from(
-                    args.next().context("--source requires a checkout path")?,
-                ))
-            }
             Some("--all") => all = true,
             Some("--no-kitty") => use_kitty = false,
             Some(option) if option.starts_with('-') => {
@@ -505,16 +536,6 @@ fn run() -> Result<()> {
     }
     if agent_cpu.is_some() && !positionals.is_empty() {
         bail!("--agent-cpu is only available when opening Crit");
-    }
-    if source.is_some()
-        && !(positionals
-            .first()
-            .is_some_and(|command| command.to_str() == Some("env"))
-            && positionals
-                .get(1)
-                .is_some_and(|operation| matches!(operation.to_str(), Some("up" | "restart"))))
-    {
-        bail!("--source is only available with crit env up|restart");
     }
     if all
         && !(positionals
@@ -573,8 +594,11 @@ fn run() -> Result<()> {
                     println!("{}", tree.path.display());
                     let source = selected_tree(&repository, &repo)?;
                     compose::prepare_local_files(&source, &tree).with_context(|| {
-                        format!("worktree was created at {}; local environment preparation failed (retry with crit env up --repo '{}' --source '{}')",
-                            tree.path.display(), tree.path.display(), source.path.display())
+                        format!(
+                            "worktree was created at {}; local file preparation failed: {}",
+                            tree.path.display(),
+                            source.path.display()
+                        )
                     })?;
                 }
                 Some("remove") if positionals.len() == 3 => {
@@ -585,23 +609,7 @@ fn run() -> Result<()> {
                         .into_iter()
                         .find(|t| t.path == path)
                         .context("path is not a worktree in this repository")?;
-                    // The same guard as deleting from the UI: a running stack blocks it, and
-                    // Docker being unreachable only warns.
-                    match compose::existing_status(&tree) {
-                        Ok(Some(environment)) if !environment.services.is_empty() => bail!(
-                            "stop this worktree's Docker environment first: crit env down --repo {}",
-                            tree.path.display()
-                        ),
-                        Ok(_) => {}
-                        Err(error) => {
-                            let reason = format!("{error:#}");
-                            eprintln!(
-                                "crit: Docker could not be checked ({}); if this worktree's stack still exists, run: docker compose -p crit-{} down",
-                                reason.trim_end(),
-                                tree.id
-                            );
-                        }
-                    }
+                    let _checks_guard = checks::removal_guard(&tree.path)?;
                     worktree::remove(&repository, &tree)?;
                     println!("Removed checkout {}; branch retained.", path.display());
                     // Its scratch has nothing left to serve. One that stays only warns: the
@@ -617,34 +625,6 @@ fn run() -> Result<()> {
                 }
                 _ => bail!("use crit worktree list|create BRANCH|remove PATH [--repo PATH]"),
             }
-            Ok(())
-        }
-        Some("env") if positionals.len() == 2 => {
-            let repo = repo()?;
-            let repository = worktree::discover(&repo)?;
-            let tree = selected_tree(&repository, &repo)?;
-            if let Some(source) = source {
-                let source_repository = worktree::discover(&source)?;
-                let source = selected_tree(&source_repository, &source)?;
-                compose::prepare_local_files(&source, &tree)?;
-            }
-            let environment = match positionals[1].to_str() {
-                Some("up") => compose::up(&tree)?,
-                Some("down") => compose::down(&tree)?,
-                Some("restart") => compose::restart(&tree)?,
-                Some("status") => compose::status(&tree)?,
-                Some("logs") => {
-                    let status = std::process::Command::new("docker")
-                        .args(compose::logs_args(&tree)?)
-                        .status()?;
-                    if !status.success() {
-                        bail!("docker logs exited with {status}");
-                    }
-                    return Ok(());
-                }
-                _ => bail!("use crit env up|down|restart|status|logs [--repo PATH]"),
-            };
-            println!("{}", serde_json::to_string_pretty(&environment)?);
             Ok(())
         }
         Some("sandbox") => {

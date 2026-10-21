@@ -56,6 +56,30 @@ type Links = BTreeMap<String, BTreeMap<String, Link>>;
 struct Settings {
     files: Option<Vec<PathBuf>>,
     links: Links,
+    budget: Budget,
+}
+
+#[derive(Clone, Copy)]
+struct Budget {
+    cpus: f64,
+    memory_mib: u64,
+}
+
+impl Default for Budget {
+    fn default() -> Self {
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        let pages = unsafe { libc::sysconf(libc::_SC_PHYS_PAGES) };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let memory = if pages > 0 && page_size > 0 {
+            (pages as u64).saturating_mul(page_size as u64) / (1024 * 1024)
+        } else {
+            4096
+        };
+        Self {
+            cpus: (cores as f64 / 2.0).clamp(1.0, 4.0),
+            memory_mib: (memory / 2).clamp(1024, 8192),
+        }
+    }
 }
 
 struct Manifest {
@@ -74,8 +98,38 @@ fn settings(worktree: &Worktree) -> Result<Settings> {
     };
     let document: toml::Value =
         toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+    let mut budget = Budget::default();
+    if let Some(checks) = document.get("checks") {
+        let checks = checks
+            .as_table()
+            .context("crit.toml [checks] must be a table")?;
+        if let Some(cpus) = checks.get("cpus") {
+            budget.cpus = cpus
+                .as_float()
+                .or_else(|| cpus.as_integer().map(|n| n as f64))
+                .context("checks.cpus must be a number")?;
+            ensure!(
+                budget.cpus.is_finite() && (0.1..=64.0).contains(&budget.cpus),
+                "checks.cpus must be between 0.1 and 64"
+            );
+        }
+        if let Some(memory) = checks.get("memory_mib") {
+            let memory = memory
+                .as_integer()
+                .context("checks.memory_mib must be an integer")?;
+            ensure!(
+                (128..=262144).contains(&memory),
+                "checks.memory_mib must be between 128 and 262144"
+            );
+            budget.memory_mib = memory as u64;
+        }
+    }
     let Some(compose) = document.get("compose") else {
-        return Ok(Settings::default());
+        return Ok(Settings {
+            files: None,
+            links: Links::new(),
+            budget,
+        });
     };
     let compose = compose
         .as_table()
@@ -148,7 +202,11 @@ fn settings(worktree: &Worktree) -> Result<Settings> {
             links.insert(target.clone(), variables_out);
         }
     }
-    Ok(Settings { files, links })
+    Ok(Settings {
+        files,
+        links,
+        budget,
+    })
 }
 
 pub fn has_config(worktree: &Worktree) -> bool {
@@ -198,36 +256,89 @@ fn compose_files(worktree: &Worktree, settings: &Settings) -> Result<Vec<PathBuf
                 "Compose configuration is not a file: {}",
                 path.display()
             );
-            // Preserve the supplied file's directory even if the file is a symlink.
-            // Relative contexts and binds belong to this checkout, not the link target.
+            // Relative contexts and binds use this checkout's supplied directory.
+            // Preparation and runtime resolution reject symlinked input files.
             Ok(path)
         })
         .collect()
 }
 
-fn manifest(worktree: &Worktree) -> Result<Manifest> {
-    ensure!(
-        !worktree.id.is_empty()
-            && worktree.id.len() <= 64
-            && worktree
-                .id
-                .bytes()
-                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'),
-        "invalid worktree environment id: {:?}",
-        worktree.id
-    );
+fn state_root() -> Result<PathBuf> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .context("XDG_STATE_HOME or HOME is required to store Compose environments")?;
-    Ok(Manifest {
-        project: format!("crit-{}", worktree.id),
-        path: state
-            .join("crit/environments")
-            .join(&worktree.id)
-            .join("compose.json"),
-    })
+        .context("XDG_STATE_HOME or HOME is required to store checking manifests")?;
+    let root = state.join("crit/check-compose");
+    fs::create_dir_all(&root)?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    Ok(root)
+}
+
+fn identity(repository: &Path) -> String {
+    format!(
+        "crit-project-{:x}",
+        Sha256::digest(repository.as_os_str().as_encoded_bytes())
+    )
+}
+
+fn manifest(worktree: &Worktree) -> Result<Manifest> {
+    let root = state_root()?;
+    if worktree.path.is_dir()
+        && let Ok(repository) = crate::worktree::discover(&worktree.path)
+    {
+        let project = identity(&repository.common_dir);
+        return Ok(Manifest {
+            path: root.join(&project).join("compose.json"),
+            project,
+        });
+    }
+    // The checkout can disappear after startup. The private, durable manifest is
+    // the authority for locating its runtime, never a legacy worktree id.
+    let path = crate::worktree::canonical_path(&worktree.path)?;
+    for entry in fs::read_dir(&root)? {
+        let file = entry?.path().join("compose.json");
+        if !file.is_file() {
+            continue;
+        }
+        let config = load_manifest(&file)?;
+        if config.pointer("/x-crit/worktree").and_then(Value::as_str) == path.to_str() {
+            let repository = config
+                .pointer("/x-crit/repository")
+                .and_then(Value::as_str)
+                .context("persisted checking manifest has no repository")?;
+            let project = identity(Path::new(repository));
+            ensure!(
+                file == root.join(&project).join("compose.json"),
+                "invalid manifest identity"
+            );
+            return Ok(Manifest {
+                path: file,
+                project,
+            });
+        }
+    }
+    bail!(
+        "no persisted checking runtime for {}",
+        worktree.path.display()
+    )
+}
+
+pub fn project_id(worktree: &Worktree) -> Result<String> {
+    Ok(manifest(worktree)?.project)
+}
+
+pub fn project_lock_path(worktree: &Worktree) -> Result<PathBuf> {
+    let manifest = manifest(worktree)?;
+    let directory = manifest
+        .path
+        .parent()
+        .context("manifest directory missing")?;
+    fs::create_dir_all(directory)?;
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    Ok(directory.join("project.lock"))
 }
 
 fn docker(worktree: &Worktree, project: &str) -> Command {
@@ -239,10 +350,7 @@ fn docker(worktree: &Worktree, project: &str) -> Command {
 }
 
 fn checked(command: &mut Command, operation: &str) -> Result<Output> {
-    let output = command
-        .output()
-        .with_context(|| format!("{operation}: could not run Docker Compose"))?;
-    succeeded(output, operation)
+    output_within(command, operation, Duration::from_secs(30))
 }
 
 fn succeeded(output: Output, operation: &str) -> Result<Output> {
@@ -266,17 +374,54 @@ fn output_within(command: &mut Command, operation: &str, deadline: Duration) -> 
     use std::io::Read;
     use std::os::unix::process::CommandExt;
     use std::process::Stdio;
+    ensure!(
+        !deadline.is_zero(),
+        "{operation}: Docker command deadline expired"
+    );
 
-    fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            if let Some(mut pipe) = pipe {
-                let _ = pipe.read_to_end(&mut bytes);
+    // Nonblocking drains keep the deadline valid even when a plugin forks a
+    // descendant that inherits stdout. Never wait on unbounded reader threads.
+    fn drain(pipe: &mut impl Read, bytes: &mut Vec<u8>) -> Result<bool> {
+        let mut buffer = [0; 8192];
+        loop {
+            match pipe.read(&mut buffer) {
+                Ok(0) => return Ok(true),
+                Ok(count) => {
+                    ensure!(
+                        bytes.len() + count <= 16 * 1024 * 1024,
+                        "Docker output exceeded the 16 MiB command limit"
+                    );
+                    bytes.extend_from_slice(&buffer[..count]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return Ok(false),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
             }
-            bytes
-        })
+        }
     }
 
+    #[cfg(not(test))]
+    {
+        // This supervisor must outlive a killed operation/worker/guardian so
+        // detached Compose-plugin descendants cannot survive their owner.
+        let parent = std::process::id();
+        let mut supervised = Command::new(format!("/proc/{parent}/exe"));
+        supervised.args(["__pane", "--parent", &parent.to_string(), "--"]);
+        supervised
+            .arg(command.get_program())
+            .args(command.get_args());
+        if let Some(directory) = command.get_current_dir() {
+            supervised.current_dir(directory);
+        }
+        for (key, value) in command.get_envs() {
+            if let Some(value) = value {
+                supervised.env(key, value);
+            } else {
+                supervised.env_remove(key);
+            }
+        }
+        *command = supervised;
+    }
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -284,31 +429,81 @@ fn output_within(command: &mut Command, operation: &str, deadline: Duration) -> 
         .process_group(0)
         .spawn()
         .with_context(|| format!("{operation}: could not run Docker Compose"))?;
-    let stdout = drain(child.stdout.take());
-    let stderr = drain(child.stderr.take());
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child
-            .try_wait()
-            .with_context(|| format!("{operation}: could not wait for Docker Compose"))?
-        {
-            break Some(status);
+    let mut stdout = child.stdout.take().context("Docker stdout missing")?;
+    let mut stderr = child.stderr.take().context("Docker stderr missing")?;
+    let result = (|| -> Result<(Vec<u8>, Vec<u8>)> {
+        for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            ensure!(
+                flags >= 0
+                    && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0,
+                "could not make Docker output nonblocking"
+            );
         }
-        if started.elapsed() >= deadline {
-            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
-            let _ = child.wait();
-            break None;
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let started = Instant::now();
+        loop {
+            let out_done = drain(&mut stdout, &mut out)?;
+            let err_done = drain(&mut stderr, &mut err)?;
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let waited = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child.id(),
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if waited < 0 {
+                return Err(std::io::Error::last_os_error()).context("wait for Docker command");
+            }
+            if unsafe { info.si_pid() } != 0 {
+                // Keep the leader unreaped until descendants are signalled:
+                // its process-group identity cannot be reused in this gap.
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                if out_done && err_done {
+                    return Ok((out, err));
+                }
+            }
+            ensure!(
+                started.elapsed() < deadline,
+                "{operation}: Docker did not answer within {}s",
+                deadline.as_secs_f64()
+            );
+            std::thread::sleep(Duration::from_millis(25));
         }
-        std::thread::sleep(Duration::from_millis(25));
-    };
-    let stdout = stdout.join().unwrap_or_default();
-    let stderr = stderr.join().unwrap_or_default();
-    let Some(status) = status else {
-        bail!(
-            "{operation}: Docker did not answer within {}s",
-            deadline.as_secs_f64()
-        );
-    };
+    })();
+    #[cfg(not(test))]
+    if result.is_err() {
+        // Let __pane terminate and reap its separately grouped descendants
+        // before escalating. Killing the supervisor first would orphan them.
+        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        let closing = Instant::now();
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let waited = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    child.id(),
+                    &mut info,
+                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                )
+            };
+            if waited < 0
+                || unsafe { info.si_pid() } != 0
+                || closing.elapsed() >= Duration::from_secs(4)
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+    unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+    let status = child
+        .wait()
+        .with_context(|| format!("{operation}: reap Docker command"))?;
+    let (stdout, stderr) = result?;
     succeeded(
         Output {
             status,
@@ -320,7 +515,7 @@ fn output_within(command: &mut Command, operation: &str, deadline: Duration) -> 
 }
 
 /// Prepare ignored Compose inputs using an explicit checkout of the same repository.
-/// This is an environment operation: failure does not invalidate a created worktree.
+/// Preparation never starts a runtime; failure does not invalidate a created worktree.
 /// Retrying is safe; existing regular target files are never overwritten.
 pub fn prepare_local_files(source: &Worktree, target: &Worktree) -> Result<()> {
     let source_repository = crate::worktree::discover(&source.path)?;
@@ -609,6 +804,14 @@ fn config_command(worktree: &Worktree, files: &[PathBuf], project: &str) -> Resu
 
 fn resolved(worktree: &Worktree, settings: &Settings, manifest: &Manifest) -> Result<Value> {
     let files = compose_files(worktree, settings)?;
+    for file in &files {
+        let relative = local_relative(&worktree.path, file)?;
+        ensure!(
+            secure_file(&worktree.path, &relative, false)?.is_some(),
+            "Compose input disappeared: {}",
+            file.display()
+        );
+    }
     let directory = files[0]
         .parent()
         .context("Compose file has no parent directory")?;
@@ -617,8 +820,285 @@ fn resolved(worktree: &Worktree, settings: &Settings, manifest: &Manifest) -> Re
     let mut config: Value = serde_json::from_slice(&output.stdout)
         .context("Docker Compose returned invalid config JSON")?;
     isolate(&mut config, &manifest.project, directory)?;
+    govern(&mut config, worktree, settings.budget)?;
     validate_links(&config, &settings.links)?;
     Ok(config)
+}
+
+fn memory_bytes(value: &Value) -> Result<u64> {
+    if let Some(bytes) = value.as_u64() {
+        return Ok(bytes);
+    }
+    let text = value
+        .as_str()
+        .context("memory limit must be bytes or a unit string")?
+        .to_ascii_lowercase();
+    let split = text
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(text.len());
+    let bytes: f64 = text[..split].parse().context("invalid memory limit")?;
+    let multiplier = match text[split..].trim() {
+        "" | "b" => 1,
+        "k" | "kb" | "kib" => 1024,
+        "m" | "mb" | "mib" => 1024 * 1024,
+        "g" | "gb" | "gib" => 1024 * 1024 * 1024,
+        _ => bail!("unsupported memory limit {text:?}"),
+    };
+    let bytes = bytes * multiplier as f64;
+    ensure!(
+        bytes.is_finite() && bytes >= 0.0 && bytes < u64::MAX as f64,
+        "memory limit overflow"
+    );
+    Ok(bytes.floor() as u64)
+}
+
+fn cpu_limit(value: &Value) -> Result<f64> {
+    let cpus = value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|s| s.parse().ok()))
+        .context("CPU limit must be a number")?;
+    ensure!(cpus.is_finite() && cpus >= 0.0, "invalid CPU limit");
+    Ok(cpus)
+}
+
+fn owner_context(value: &Value, checkout: &Path) -> Result<()> {
+    let context = value.as_str().context("build context must be a string")?;
+    if context.contains("://")
+        || context.starts_with("git@")
+        || context.starts_with("service:")
+        || context.starts_with("docker-image:")
+    {
+        return Ok(());
+    }
+    owner_path(Path::new(context), checkout)
+}
+
+fn owner_path(path: &Path, checkout: &Path) -> Result<()> {
+    let path = crate::worktree::canonical_path(path)?;
+    ensure!(
+        path.starts_with(checkout),
+        "build input {} is outside the checking owner's checkout {}; use an input from this owner",
+        path.display(),
+        checkout.display()
+    );
+    Ok(())
+}
+
+/// Runtime budget is set by [checks] cpus (0.1..=64) and memory_mib
+/// (128..=262144). Defaults: half the available CPUs clamped to 1..=4,
+/// and half physical RAM clamped to 1024..=8192 MiB (RAM discovery
+/// fallback: 4096 MiB, giving a 2048 MiB budget). One equal share per service, never above stricter
+/// explicit service limits. This does not budget the Docker build daemon.
+fn govern(config: &mut Value, worktree: &Worktree, budget: Budget) -> Result<()> {
+    let discovered = crate::worktree::discover(&worktree.path)?;
+    let registered = crate::worktree::list(&discovered)?;
+    let repository = discovered.common_dir;
+    let checkout = fs::canonicalize(&worktree.path)?;
+    let labels = serde_json::json!({
+        "io.crit.managed": "2",
+        "io.crit.repository": repository.to_str().context("repository path is not UTF-8")?,
+        "io.crit.worktree": checkout.to_str().context("checkout path is not UTF-8")?
+    });
+    config["x-crit"] = serde_json::json!({
+        "repository": repository, "worktree": checkout,
+        "cpus": budget.cpus, "memory_mib": budget.memory_mib
+    });
+    if config.get("networks").is_none() {
+        config["networks"] = serde_json::json!({"default": {}});
+    }
+    for kind in ["networks", "volumes", "configs", "secrets"] {
+        if let Some(resources) = config.get_mut(kind) {
+            for (name, resource) in object_mut(resources, kind)? {
+                if resource.is_null() {
+                    *resource = serde_json::json!({});
+                }
+                let resource = object_mut(resource, kind)?;
+                ensure!(
+                    resource
+                        .get("external")
+                        .is_none_or(|v| v.is_null() || v == &Value::Bool(false)),
+                    "external {kind}.{name} cannot be owned"
+                );
+                resource.remove("external");
+                if kind == "networks" || kind == "volumes" {
+                    let existing = resource
+                        .entry("labels")
+                        .or_insert_with(|| serde_json::json!({}));
+                    object_mut(existing, "resource labels")?
+                        .extend(labels.as_object().unwrap().clone());
+                }
+                // Data survives handoffs, isolated by checkout, never removed.
+                if kind == "volumes" {
+                    resource.insert(
+                        "name".into(),
+                        Value::String(format!(
+                            "{}_wt-{:x}_{name}",
+                            identity(&repository),
+                            Sha256::digest(checkout.as_os_str().as_encoded_bytes())
+                        )),
+                    );
+                }
+            }
+        }
+    }
+    let services = object_mut(
+        config.get_mut("services").context("missing services")?,
+        "services",
+    )?;
+    ensure!(!services.is_empty(), "checking runtime has no services");
+    let cpu_share =
+        (budget.cpus * 1_000_000_000.0 / services.len() as f64).floor() / 1_000_000_000.0;
+    let memory_share = budget.memory_mib * 1024 * 1024 / services.len() as u64;
+    ensure!(
+        memory_share >= 6 * 1024 * 1024,
+        "checking memory budget is too small for all services"
+    );
+    for (name, service) in services {
+        let service = object_mut(service, name)?;
+        service.remove("profiles");
+        service.insert("restart".into(), Value::String("no".into()));
+        service.insert("scale".into(), Value::from(1));
+        if let Some(build) = service.get("build") {
+            if build.is_string() {
+                owner_context(build, &checkout)?;
+            } else {
+                if let Some(context) = build.get("context") {
+                    owner_context(context, &checkout)?;
+                }
+                if let Some(dockerfile) = build.get("dockerfile").and_then(Value::as_str) {
+                    if Path::new(dockerfile).is_absolute() {
+                        owner_path(Path::new(dockerfile), &checkout)?;
+                    } else if let Some(context) = build.get("context").and_then(Value::as_str)
+                        && Path::new(context).is_absolute()
+                    {
+                        owner_path(&Path::new(context).join(dockerfile), &checkout)?;
+                    }
+                }
+                if let Some(contexts) = build.get("additional_contexts").and_then(Value::as_object)
+                {
+                    for context in contexts.values() {
+                        owner_context(context, &checkout)?;
+                    }
+                }
+            }
+        }
+        if let Some(volumes) = service.get("volumes").and_then(Value::as_array) {
+            for volume in volumes {
+                if volume.get("type").and_then(Value::as_str) == Some("bind")
+                    && let Some(source) = volume.get("source").and_then(Value::as_str)
+                {
+                    let source = crate::worktree::canonical_path(Path::new(source))?;
+                    ensure!(
+                        source.starts_with(&checkout)
+                            || !registered.iter().any(|tree| source.starts_with(&tree.path)),
+                        "service {name} binds another checkout at {}; use this owner's checkout {}",
+                        source.display(),
+                        checkout.display()
+                    );
+                }
+            }
+        }
+        ensure!(
+            service.get("privileged") != Some(&Value::Bool(true)),
+            "privileged service {name} cannot be owned safely"
+        );
+        ensure!(
+            service
+                .get("external_links")
+                .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty)),
+            "service {name} uses external container links"
+        );
+        if let Some(volumes) = service.get("volumes_from").and_then(Value::as_array) {
+            ensure!(
+                volumes
+                    .iter()
+                    .all(|v| v.as_str().is_some_and(|v| !v.starts_with("container:"))),
+                "service {name} mounts volumes from an unowned container"
+            );
+        }
+        if let Some(mode) = service.get("network_mode").and_then(Value::as_str) {
+            ensure!(
+                mode == "none" || mode.starts_with("service:"),
+                "service {name} uses unowned network_mode {mode}"
+            );
+        }
+        for key in ["pid", "ipc"] {
+            if let Some(mode) = service.get(key).and_then(Value::as_str) {
+                ensure!(
+                    mode != "host" && !mode.starts_with("container:"),
+                    "service {name} uses unowned {key}"
+                );
+            }
+        }
+        let mut cpus = cpu_share;
+        let mut memory = memory_share;
+        if let Some(value) = service.get("cpus") {
+            let explicit = cpu_limit(value)?;
+            if explicit > 0.0 {
+                cpus = cpus.min(explicit);
+            }
+        }
+        if let Some(quota) = service.get("cpu_quota").and_then(Value::as_i64)
+            && quota > 0
+        {
+            let period = service
+                .get("cpu_period")
+                .and_then(Value::as_u64)
+                .unwrap_or(100_000);
+            ensure!(period > 0, "service {name} has a zero CPU period");
+            cpus = cpus.min(quota as f64 / period as f64);
+        }
+        // Represent the stricter effective quota once: Compose rejects quota
+        // and cpus fields when they describe different effective limits.
+        service.remove("cpu_quota");
+        service.remove("cpu_period");
+        if let Some(value) = service.get("mem_limit") {
+            let explicit = memory_bytes(value)?;
+            if explicit > 0 {
+                memory = memory.min(explicit);
+            }
+        }
+        let deploy = service
+            .entry("deploy")
+            .or_insert_with(|| serde_json::json!({}));
+        let deploy = object_mut(deploy, "deploy")?;
+        deploy.insert("replicas".into(), Value::from(1));
+        deploy.insert(
+            "restart_policy".into(),
+            serde_json::json!({"condition": "none"}),
+        );
+        let resources = deploy
+            .entry("resources")
+            .or_insert_with(|| serde_json::json!({}));
+        let resources = object_mut(resources, "deploy.resources")?;
+        let limits = resources
+            .entry("limits")
+            .or_insert_with(|| serde_json::json!({}));
+        let limits = object_mut(limits, "deploy.resources.limits")?;
+        if let Some(value) = limits.get("cpus") {
+            let explicit = cpu_limit(value)?;
+            if explicit > 0.0 {
+                cpus = cpus.min(explicit);
+            }
+        }
+        if let Some(value) = limits.get("memory") {
+            let explicit = memory_bytes(value)?;
+            if explicit > 0 {
+                memory = memory.min(explicit);
+            }
+        }
+        limits.insert("cpus".into(), Value::from(cpus));
+        // The Compose input schema requires a byte-value string here, even
+        // though `compose config --format json` normalizes memory to a number.
+        limits.insert("memory".into(), Value::String(memory.to_string()));
+        service.insert("cpus".into(), Value::from(cpus));
+        service.insert("mem_limit".into(), Value::from(memory));
+        let existing = service
+            .entry("labels")
+            .or_insert_with(|| serde_json::json!({}));
+        object_mut(existing, "service labels")?.extend(labels.as_object().unwrap().clone());
+    }
+    Ok(())
 }
 
 fn object_mut<'a>(value: &'a mut Value, description: &str) -> Result<&'a mut Map<String, Value>> {
@@ -764,8 +1244,8 @@ fn isolate(config: &mut Value, project: &str, directory: &Path) -> Result<()> {
                     }
                 }
             }
-            // Explicit build image names must not make two worktrees reuse or
-            // overwrite one another's build outputs.
+            // Keep owner builds off user-managed image tags. A complete build
+            // before startup replaces these project-local tags on every handoff.
             let image = built_image(name);
             service.insert("image".to_owned(), Value::String(image));
         } else if let Some(image) = service
@@ -985,6 +1465,7 @@ fn save(manifest: &Manifest, config: &Value) -> Result<()> {
         file.sync_all()?;
         fs::rename(&temporary, &manifest.path)
             .with_context(|| format!("persist {}", manifest.path.display()))?;
+        fs::File::open(directory)?.sync_all()?;
         Ok(())
     })();
     if result.is_err() {
@@ -993,20 +1474,15 @@ fn save(manifest: &Manifest, config: &Value) -> Result<()> {
     result
 }
 
-fn ensure_manifest(worktree: &Worktree) -> Result<Manifest> {
-    let manifest = manifest(worktree)?;
-    if !manifest.path.try_exists()? {
-        let settings = settings(worktree)?;
-        let config = resolved(worktree, &settings, &manifest)?;
-        save(&manifest, &config)?;
-    }
-    Ok(manifest)
-}
-
-fn command(worktree: &Worktree, manifest: &Manifest) -> Command {
-    let mut command = docker(worktree, &manifest.project);
+fn command(_worktree: &Worktree, manifest: &Manifest) -> Command {
+    let mut command = Command::new("docker");
+    let directory = manifest.path.parent().expect("manifest parent");
+    command
+        .current_dir(directory)
+        .env_remove("COMPOSE_FILE")
+        .env_remove("COMPOSE_PROFILES");
     command.args(["compose", "--project-name", &manifest.project]);
-    command.arg("--project-directory").arg(&worktree.path);
+    command.arg("--project-directory").arg(directory);
     command.arg("--file").arg(&manifest.path);
     command
 }
@@ -1167,106 +1643,393 @@ fn wire(
     Ok(())
 }
 
-pub fn up(worktree: &Worktree) -> Result<Environment> {
+fn inventory(kind: &str, filter: Option<&str>, deadline: Instant) -> Result<Vec<Value>> {
+    let mut list = Command::new("docker");
+    list.args([kind, "ls", "--quiet", "--no-trunc"]);
+    if kind == "container" {
+        list.arg("--all");
+    }
+    if let Some(filter) = filter {
+        list.args(["--filter", filter]);
+    }
+    let remaining = || {
+        deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(30))
+    };
+    let output = output_within(&mut list, "inventory Docker resources", remaining())?;
+    let text = std::str::from_utf8(&output.stdout)?;
+    let ids: Vec<_> = text.split_whitespace().collect();
+    let mut resources = Vec::new();
+    for batch in ids.chunks(64) {
+        let output = output_within(
+            Command::new("docker").args([kind, "inspect"]).args(batch),
+            "inspect Docker ownership",
+            remaining(),
+        )?;
+        resources.extend(serde_json::from_slice::<Vec<Value>>(&output.stdout)?);
+    }
+    Ok(resources)
+}
+
+fn labels(resource: &Value) -> Option<&Map<String, Value>> {
+    resource
+        .pointer("/Config/Labels")
+        .or_else(|| resource.get("Labels"))
+        .and_then(Value::as_object)
+}
+
+fn label<'a>(resource: &'a Value, key: &str) -> Option<&'a str> {
+    labels(resource)?.get(key)?.as_str()
+}
+
+fn load_manifest(path: &Path) -> Result<Value> {
+    let mut config: Value = serde_json::from_slice(
+        &fs::read(path).with_context(|| format!("read checking manifest {}", path.display()))?,
+    )?;
+    // Metadata is read by Crit, not Compose. Undo only the interpolation escape
+    // added by Escaped; the actual Compose fields must remain escaped on disk.
+    for key in ["repository", "worktree"] {
+        if let Some(value) = config.get_mut("x-crit").and_then(|meta| meta.get_mut(key))
+            && let Some(text) = value.as_str()
+        {
+            *value = Value::String(text.replace("$$", "$"));
+        }
+    }
+    Ok(config)
+}
+
+fn persisted(manifest: &Manifest) -> Result<Value> {
+    let config = load_manifest(&manifest.path)?;
+    let repository = config
+        .pointer("/x-crit/repository")
+        .and_then(Value::as_str)
+        .context("manifest is not a new Crit managed runtime")?;
+    ensure!(
+        identity(Path::new(repository)) == manifest.project,
+        "manifest repository identity mismatch"
+    );
+    ensure!(
+        config
+            .pointer("/x-crit/worktree")
+            .and_then(Value::as_str)
+            .is_some(),
+        "manifest owner is missing"
+    );
+    Ok(config)
+}
+
+fn verified(resource: &Value, manifest: &Manifest, config: &Value) -> bool {
+    label(resource, "io.crit.managed") == Some("2")
+        && label(resource, "io.crit.repository")
+            == config.pointer("/x-crit/repository").and_then(Value::as_str)
+        && label(resource, "io.crit.worktree")
+            == config.pointer("/x-crit/worktree").and_then(Value::as_str)
+        && label(resource, "com.docker.compose.project") == Some(manifest.project.as_str())
+}
+
+/// Caller must hold project_lock_path exclusively through recovery and startup.
+pub fn preflight(worktree: &Worktree) -> Result<()> {
+    let repository = crate::worktree::discover(&worktree.path)?;
+    let project = identity(&repository.common_dir);
+    let trees = crate::worktree::list(&repository)?;
+    let legacy: BTreeSet<_> = trees
+        .iter()
+        .map(|tree| format!("crit-{}", tree.id))
+        .collect();
     let manifest = manifest(worktree)?;
+    let config = if manifest.path.is_file() {
+        Some(persisted(&manifest)?)
+    } else {
+        None
+    };
+    let mut conflicts = Vec::new();
+    for resource in inventory("container", None, Instant::now() + Duration::from_secs(30))? {
+        let compose = label(&resource, "com.docker.compose.project").unwrap_or("");
+        let same_path = |text: &str| -> bool {
+            let path = Path::new(text);
+            trees.iter().any(|tree| path.starts_with(&tree.path))
+                || crate::worktree::discover(path)
+                    .is_ok_and(|repo| repo.common_dir == repository.common_dir)
+        };
+        let path_label = ["com.docker.compose.project.working_dir", "io.crit.worktree"]
+            .iter()
+            .any(|key| label(&resource, key).is_some_and(same_path));
+        let files =
+            label(&resource, "com.docker.compose.project.config_files").is_some_and(|files| {
+                files.split(',').any(|file| {
+                    same_path(
+                        Path::new(file)
+                            .parent()
+                            .unwrap_or(Path::new(file))
+                            .to_str()
+                            .unwrap_or(""),
+                    )
+                })
+            });
+        let mounts = resource
+            .get("Mounts")
+            .and_then(Value::as_array)
+            .is_some_and(|mounts| {
+                mounts.iter().any(|mount| {
+                    mount
+                        .get("Source")
+                        .and_then(Value::as_str)
+                        .is_some_and(same_path)
+                })
+            });
+        let same = compose == project
+            || legacy.contains(compose)
+            || path_label
+            || files
+            || mounts
+            || label(&resource, "io.crit.repository") == repository.common_dir.to_str();
+        if same
+            && !config
+                .as_ref()
+                .is_some_and(|config| verified(&resource, &manifest, config))
+        {
+            conflicts.push(format!(
+                "{} (project {compose:?}, id {})",
+                resource.get("Name").and_then(Value::as_str).unwrap_or("?"),
+                resource.get("Id").and_then(Value::as_str).unwrap_or("?")
+            ));
+        }
+    }
+    ensure!(
+        conflicts.is_empty(),
+        "same-repository legacy/unmanaged Docker stack blocks checking: {}. Stop/migrate these resources explicitly; Crit will not stop them.",
+        conflicts.join(", ")
+    );
+    Ok(())
+}
+
+fn cleanup(manifest: &Manifest) -> Result<()> {
+    let config = persisted(manifest)?;
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let filter = format!("label=com.docker.compose.project={}", manifest.project);
+    let mut unverified = Vec::new();
+    for kind in ["container", "network"] {
+        let resources = inventory(kind, Some(&filter), deadline)?;
+        // Do not abandon authenticated containers merely because an unknown
+        // resource shares their project name. Remove only the proven subset,
+        // then keep the project blocked until the conflict is explicitly fixed.
+        for resource in &resources {
+            if !verified(resource, manifest, &config) {
+                unverified.push(format!(
+                    "{kind} {}",
+                    resource.get("Id").and_then(Value::as_str).unwrap_or("?")
+                ));
+            }
+        }
+        for resource in resources
+            .into_iter()
+            .filter(|resource| verified(resource, manifest, &config))
+        {
+            let id = resource
+                .get("Id")
+                .and_then(Value::as_str)
+                .context("resource has no id")?;
+            if kind == "container" {
+                output_within(
+                    Command::new("docker").args(["container", "stop", "--time", "10", id]),
+                    "stop verified checking container",
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_secs(30)),
+                )?;
+            }
+            let mut command = Command::new("docker");
+            command.args([kind, "rm"]);
+            output_within(
+                command.arg(id),
+                "remove verified checking resource",
+                deadline
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(30)),
+            )?;
+        }
+        ensure!(
+            !inventory(kind, Some(&filter), deadline)?
+                .iter()
+                .any(|resource| verified(resource, manifest, &config)),
+            "checking cleanup left managed {kind} resources for {}",
+            manifest.project
+        );
+    }
+    ensure!(
+        unverified.is_empty(),
+        "project {} contains unverified resources (not stopped): {}. Resolve explicitly before requesting another turn.",
+        manifest.project,
+        unverified.join(", ")
+    );
+    Ok(())
+}
+
+/// Removes only resources authenticated against the durable managed manifest.
+/// Named and anonymous data volumes are intentionally never removed.
+pub fn recover(worktree: &Worktree) -> Result<()> {
+    let manifest = manifest(worktree)?;
+    if manifest.path.is_file() {
+        cleanup(&manifest)?;
+    }
+    Ok(())
+}
+
+pub fn up(worktree: &Worktree) -> Result<Environment> {
+    preflight(worktree)?;
+    let manifest = manifest(worktree)?;
+    // Finish old ownership before replacing its manifest or building new code.
+    if manifest.path.is_file() {
+        cleanup(&manifest)?;
+    }
     let settings = settings(worktree)?;
     let mut config = resolved(worktree, &settings, &manifest)?;
     let order = validate_links(&config, &settings.links)?;
     save(&manifest, &config)?;
-    for name in order {
-        if !settings.links.contains_key(&name)
-            && !settings
-                .links
-                .values()
-                .any(|variables| variables.values().any(|link| link.source == name))
-        {
-            // Native dependencies are started by Compose, including its health
-            // and completion conditions, rather than as redundant explicit ups.
-            continue;
-        }
-        if let Some(variables) = settings
-            .links
-            .get(&name)
-            .filter(|variables| !variables.is_empty())
-        {
-            let environment = read_status(worktree, &manifest)?;
-            wire(&mut config, &name, variables, &environment)?;
-            save(&manifest, &config)?;
-        }
-        checked(
-            command(worktree, &manifest).args(["up", "--detach", "--", &name]),
-            &format!("start Compose service {name}"),
+    let started = Instant::now();
+    let start = (|| -> Result<Environment> {
+        let remaining = || Duration::from_secs(600).saturating_sub(started.elapsed());
+        output_within(
+            command(worktree, &manifest).arg("build"),
+            "build checking images",
+            remaining(),
         )?;
+        for name in order {
+            if !settings.links.contains_key(&name)
+                && !settings
+                    .links
+                    .values()
+                    .any(|variables| variables.values().any(|link| link.source == name))
+            {
+                continue;
+            }
+            if let Some(variables) = settings.links.get(&name).filter(|v| !v.is_empty()) {
+                wire(
+                    &mut config,
+                    &name,
+                    variables,
+                    &read_status(worktree, &manifest)?,
+                )?;
+                save(&manifest, &config)?;
+            }
+            output_within(
+                command(worktree, &manifest).args([
+                    "up",
+                    "--detach",
+                    "--no-build",
+                    "--no-recreate",
+                    "--wait",
+                    "--wait-timeout",
+                    "120",
+                    "--",
+                    &name,
+                ]),
+                &format!("start checking service {name}"),
+                remaining(),
+            )?;
+        }
+        output_within(
+            command(worktree, &manifest).args([
+                "up",
+                "--detach",
+                "--no-build",
+                "--wait",
+                "--wait-timeout",
+                "120",
+            ]),
+            "start healthy checking runtime",
+            remaining(),
+        )?;
+        let environment = read_status(worktree, &manifest)?;
+        let completed: BTreeSet<_> = services(&config)?
+            .values()
+            .filter_map(|service| service.get("depends_on").and_then(Value::as_object))
+            .flat_map(|dependencies| dependencies.iter())
+            .filter(|(_, dependency)| {
+                dependency.get("condition").and_then(Value::as_str)
+                    == Some("service_completed_successfully")
+            })
+            .map(|(name, _)| name.as_str())
+            .collect();
+        for name in services(&config)?.keys() {
+            ensure!(
+                environment
+                    .services
+                    .iter()
+                    .any(|service| service.name == *name
+                        && ((service.state == "running"
+                            && (service.health.is_empty() || service.health == "healthy"))
+                            || (completed.contains(name.as_str())
+                                && service.state == "exited"
+                                && service.exit_code == 0))),
+                "checking service {name} did not remain running/healthy or finish its required one-shot successfully"
+            );
+        }
+        Ok(environment)
+    })();
+    match start {
+        Ok(environment) => Ok(environment),
+        Err(error) => match cleanup(&manifest) {
+            Ok(()) => Err(error),
+            Err(cleanup) => Err(anyhow::anyhow!(
+                "{error:#}; partial startup cleanup failed: {cleanup:#}"
+            )),
+        },
     }
-    checked(
-        command(worktree, &manifest).args(["up", "--detach"]),
-        "start Compose environment",
-    )?;
-    read_status(worktree, &manifest)
 }
 
 pub fn status(worktree: &Worktree) -> Result<Environment> {
-    read_status(worktree, &ensure_manifest(worktree)?)
-}
-
-/// Status of an environment Crit has started, without running Docker for one it has not:
-/// `up` saves the manifest before it starts any container, so no manifest means none exist.
-pub fn existing_status(worktree: &Worktree) -> Result<Option<Environment>> {
     let manifest = manifest(worktree)?;
-    if !manifest.path.try_exists()? {
-        return Ok(None);
+    if !manifest.path.is_file() {
+        return Ok(Environment {
+            project: manifest.project,
+            services: Vec::new(),
+        });
     }
-    read_status(worktree, &manifest).map(Some)
+    persisted(&manifest)?;
+    read_status(worktree, &manifest)
 }
 
 pub fn down(worktree: &Worktree) -> Result<Environment> {
-    let manifest = ensure_manifest(worktree)?;
-    // No --volumes, --rmi, --remove-orphans, or prune: project data survives down.
-    checked(
-        command(worktree, &manifest).arg("down"),
-        "stop Compose environment",
-    )?;
-    read_status(worktree, &manifest)
-}
-
-pub fn restart(worktree: &Worktree) -> Result<Environment> {
-    let manifest = ensure_manifest(worktree)?;
-    checked(
-        command(worktree, &manifest).arg("restart"),
-        "restart Compose environment",
-    )?;
-    // Restarted containers get new ephemeral host ports; `up` re-wires link targets.
-    if !settings(worktree)?.links.is_empty() {
-        return up(worktree);
+    let manifest = manifest(worktree)?;
+    if manifest.path.is_file() {
+        cleanup(&manifest)?;
     }
-    read_status(worktree, &manifest)
+    Ok(Environment {
+        project: manifest.project,
+        services: Vec::new(),
+    })
 }
 
 pub fn logs_args(worktree: &Worktree) -> Result<Vec<String>> {
     let manifest = manifest(worktree)?;
     ensure!(
-        manifest.path.try_exists()?,
-        "This worktree's Docker environment has not been started yet; start or refresh it first."
+        manifest.path.is_file(),
+        "checking runtime has not been started"
     );
+    persisted(&manifest)?;
     Ok(vec![
-        "compose".to_owned(),
-        "--project-name".to_owned(),
+        "compose".into(),
+        "--project-name".into(),
         manifest.project,
-        "--project-directory".to_owned(),
-        worktree
+        "--project-directory".into(),
+        manifest
             .path
+            .parent()
+            .context("manifest directory missing")?
             .to_str()
-            .context("worktree path is not UTF-8")?
-            .to_owned(),
-        "--file".to_owned(),
+            .context("manifest path is not UTF-8")?
+            .into(),
+        "--file".into(),
         manifest
             .path
             .to_str()
-            .context("generated manifest path is not UTF-8")?
-            .to_owned(),
-        "logs".to_owned(),
-        "--follow".to_owned(),
-        "--no-color".to_owned(),
+            .context("manifest path is not UTF-8")?
+            .into(),
+        "logs".into(),
+        "--follow".into(),
+        "--no-color".into(),
     ])
 }
 
@@ -1749,51 +2512,164 @@ mod tests {
     }
 
     #[test]
-    fn existing_status_without_manifest_skips_docker() {
-        let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("compose.yaml"), "services: {}\n").unwrap();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        // A fresh id has no manifest in the state directory.
-        let worktree = Worktree {
-            id: format!("existing-status-{}-{nanos}", std::process::id()),
-            path: directory.path().to_owned(),
-            branch: "main".to_owned(),
-            head: String::new(),
-            is_main: false,
-            locked: false,
-            bare: false,
-            prunable: false,
-        };
-        assert!(has_config(&worktree));
-        // `status` would resolve the Compose file through Docker and write a manifest first.
-        assert!(existing_status(&worktree).unwrap().is_none());
-        assert!(!manifest(&worktree).unwrap().path.exists());
+    fn repository_identity_and_stopped_status_are_shared_without_docker() {
+        let (_directory, source, target) = local_fixture();
+        assert_eq!(project_id(&source).unwrap(), project_id(&target).unwrap());
+        assert_eq!(
+            project_lock_path(&source).unwrap(),
+            project_lock_path(&target).unwrap()
+        );
+        assert!(status(&source).unwrap().services.is_empty());
+        assert!(status(&target).unwrap().services.is_empty());
+        assert!(!manifest(&source).unwrap().path.exists());
+        assert!(
+            logs_args(&target)
+                .unwrap_err()
+                .to_string()
+                .contains("not been started")
+        );
     }
 
     #[test]
-    fn logs_need_a_started_environment() {
-        let directory = tempfile::tempdir().unwrap();
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        // A fresh id has no manifest in the state directory.
-        let worktree = Worktree {
-            id: format!("logs-need-start-{}-{nanos}", std::process::id()),
-            path: directory.path().to_owned(),
-            branch: "main".to_owned(),
-            head: String::new(),
-            is_main: false,
-            locked: false,
-            bare: false,
-            prunable: false,
+    fn ownership_budget_and_volume_identity_follow_complete_checkout() {
+        let (_directory, source, target) = local_fixture();
+        let original = json!({"services": {
+            "api": {"image": "api", "restart": "always", "cpus": 0.25,
+                "deploy": {"replicas": 10, "resources": {"limits": {"memory": "64m"}}}},
+            "web": {"image": "web", "profiles": ["optional"]}
+        }, "volumes": {"data": {}}});
+        let mut first = original.clone();
+        govern(
+            &mut first,
+            &source,
+            Budget {
+                cpus: 2.0,
+                memory_mib: 512,
+            },
+        )
+        .unwrap();
+        assert_eq!(first["services"]["api"]["cpus"], 0.25);
+        assert_eq!(first["services"]["web"]["cpus"], 1.0);
+        assert_eq!(first["services"]["api"]["mem_limit"], 64 * 1024 * 1024);
+        assert_eq!(first["services"]["web"]["mem_limit"], 256 * 1024 * 1024);
+        assert_eq!(
+            first["services"]["api"]["deploy"]["resources"]["limits"]["memory"],
+            "67108864"
+        );
+        assert_eq!(
+            first["services"]["web"]["deploy"]["resources"]["limits"]["memory"],
+            "268435456"
+        );
+        assert_eq!(first["services"]["api"]["restart"], "no");
+        assert_eq!(first["services"]["api"]["deploy"]["replicas"], 1);
+        assert!(first["services"]["web"].get("profiles").is_none());
+        assert_eq!(first["services"]["api"]["labels"]["io.crit.managed"], "2");
+        let mut second = original;
+        govern(
+            &mut second,
+            &target,
+            Budget {
+                cpus: 2.0,
+                memory_mib: 512,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            first["x-crit"]["repository"],
+            second["x-crit"]["repository"]
+        );
+        assert_ne!(first["x-crit"]["worktree"], second["x-crit"]["worktree"]);
+        assert_ne!(
+            first["volumes"]["data"]["name"],
+            second["volumes"]["data"]["name"]
+        );
+    }
+
+    #[test]
+    fn runtime_rejects_code_from_another_checkout() {
+        let (_directory, source, target) = local_fixture();
+        assert!(owner_context(&json!(target.path), &target.path).is_ok());
+        assert!(owner_context(&json!(source.path), &target.path).is_err());
+        let mut build = json!({"services": {"api": {"build": {"context": source.path}}}});
+        assert!(govern(&mut build, &target, Budget::default()).is_err());
+        let mut bind = json!({"services": {"api": {"image": "api", "volumes": [
+            {"type": "bind", "source": source.path, "target": "/app"}
+        ]}}});
+        assert!(govern(&mut bind, &target, Budget::default()).is_err());
+    }
+
+    #[test]
+    fn persisted_teardown_metadata_does_not_need_checkout_or_interpolation() {
+        let (directory, source, target) = local_fixture();
+        let repository = crate::worktree::discover(&source.path).unwrap().common_dir;
+        let manifest = Manifest {
+            project: identity(&repository),
+            path: directory.path().join("durable/compose.json"),
         };
-        let error = logs_args(&worktree).unwrap_err().to_string();
-        assert!(error.contains("not been started"), "{error}");
-        assert!(!manifest(&worktree).unwrap().path.exists());
+        let config = json!({"x-crit": {
+            "repository": repository, "worktree": target.path
+        }, "services": {"api": {"environment": {"LITERAL": "$value"}}}});
+        save(&manifest, &config).unwrap();
+        fs::remove_dir_all(&target.path).unwrap();
+        assert_eq!(persisted(&manifest).unwrap()["x-crit"], config["x-crit"]);
+        assert_eq!(
+            command(&target, &manifest).get_current_dir(),
+            manifest.path.parent()
+        );
+        let dollars = Manifest {
+            project: identity(Path::new("/repo/$name/.git")),
+            path: directory.path().join("dollars/compose.json"),
+        };
+        save(
+            &dollars,
+            &json!({"x-crit": {"repository": "/repo/$name/.git", "worktree": "/repo/$$owner"}}),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted(&dollars).unwrap()["x-crit"]["worktree"],
+            "/repo/$$owner"
+        );
+    }
+
+    #[test]
+    fn teardown_requires_all_ownership_labels_not_just_project_name() {
+        let manifest = Manifest {
+            project: "fixture".into(),
+            path: PathBuf::new(),
+        };
+        let config = json!({"x-crit": {"repository": "/repo/.git", "worktree": "/repo/owner"}});
+        let mut resource = json!({"Config": {"Labels": {
+            "com.docker.compose.project": "fixture", "io.crit.managed": "2",
+            "io.crit.repository": "/repo/.git", "io.crit.worktree": "/repo/owner"
+        }}});
+        assert!(verified(&resource, &manifest, &config));
+        resource["Config"]["Labels"]["io.crit.worktree"] = json!("/repo/other");
+        assert!(!verified(&resource, &manifest, &config));
+        resource["Config"]["Labels"]
+            .as_object_mut()
+            .unwrap()
+            .remove("io.crit.managed");
+        assert!(!verified(&resource, &manifest, &config));
+    }
+
+    #[test]
+    fn checking_budget_configuration_is_bounded_and_independent_of_compose_table() {
+        let defaults = Budget::default();
+        assert!((1.0..=4.0).contains(&defaults.cpus));
+        assert!((1024..=8192).contains(&defaults.memory_mib));
+        let (_directory, source, _target) = local_fixture();
+        fs::write(
+            source.path.join("crit.toml"),
+            "[checks]\ncpus = 1.5\nmemory_mib = 768\n",
+        )
+        .unwrap();
+        let configured = settings(&source).unwrap();
+        assert_eq!(configured.budget.cpus, 1.5);
+        assert_eq!(configured.budget.memory_mib, 768);
+        fs::write(source.path.join("crit.toml"), "[checks]\ncpus = 65\n").unwrap();
+        assert!(settings(&source).is_err());
+        fs::write(source.path.join("crit.toml"), "[checks]\nmemory_mib = 1\n").unwrap();
+        assert!(settings(&source).is_err());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::{
-    app::{EnvironmentOp, IntentTarget, LayoutMode, Project},
-    compose::Environment,
+    app::{CheckOperation, IntentTarget, LayoutMode, Project},
+    checks::View,
     integration::AgentUpdate,
     intent::{Agent, Plan},
     sandbox::CleanReport,
@@ -63,22 +63,7 @@ pub enum Event {
         request: u64,
         project: PathBuf,
         result: Result<Vec<Worktree>, String>,
-    },
-    SplitTargets {
-        request: u64,
-        project: PathBuf,
-        layout: LayoutMode,
-        result: Result<Vec<crate::worktree::SplitTarget>, String>,
-    },
-    SplitOpened {
-        request: u64,
-        project: PathBuf,
-        layout: LayoutMode,
-        choices: Vec<crate::worktree::SplitTarget>,
-        selected: usize,
-        source: PathBuf,
-        preparation_error: Option<String>,
-        result: Result<(Worktree, bool), String>,
+        agent: Option<Agent>,
     },
     /// Background Git discovery: each repository that changed since its last listing and listed
     /// successfully, keyed by its common directory. Unchanged repositories and failures leave the
@@ -86,17 +71,17 @@ pub enum Event {
     Metadata(Vec<(PathBuf, Vec<Worktree>)>),
     Removed {
         tree: String,
-        /// `Ok` carries why Docker could not be checked, when it could not.
-        result: Result<Option<String>, String>,
+        result: Result<(), String>,
         /// Why the removed checkout's scratch could not be removed from the sandbox, when it
         /// could not: only a warning, as the checkout itself is gone.
         scratch: Option<String>,
     },
-    Environment {
+    ChecksChanged(Vec<View>),
+    CheckResult {
         tree: String,
-        operation: EnvironmentOp,
+        operation: CheckOperation,
         prepared: bool,
-        result: Result<Environment, String>,
+        result: Result<Option<View>, String>,
     },
     /// The agent CPU limit could not be applied: an asynchronous error for a dialog.
     CpuLimit(String),

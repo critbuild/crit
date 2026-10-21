@@ -2,6 +2,10 @@
 // (Apache-2.0). Crit uses this only for local `run`/Mini; the full TUI owns its
 // lifecycle through opencode-tui.js, including attached servers and selection.
 import { createReporter } from "./reporter.js";
+import { createCheckClient, CHECK_INSTRUCTIONS, CHECK_DESCRIPTION } from "./checks.js";
+import { homedir } from "node:os";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 
 function ownsLocalLifecycle() {
   const args = process.argv.slice(2);
@@ -26,13 +30,57 @@ const pinOwner = {
   // --append-system-prompt; OpenCode has no such flag, so every request's system prompt gets it.
   "experimental.chat.system.transform": async (_input, output) => {
     const note = process.env.CRIT_SANDBOX_NOTE;
+    if (process.env.CRIT_ENV === "1" && process.env.CRIT_BIN && !output.system.includes(CHECK_INSTRUCTIONS)) output.system.push(CHECK_INSTRUCTIONS);
     if (note && !output.system.includes(note)) output.system.push(note);
   },
 };
-async function server() {
-  if (claimed || !ownsLocalLifecycle()) return pinOwner;
+async function server(input) {
+  const checks = createCheckClient();
+  const base = { ...pinOwner };
+  let checkSession;
+  if (checks) {
+    // OpenCode installs its version-matched SDK in the global config directory
+    // before loading plugins. Crit's assets live elsewhere, so resolve from there.
+    // SDK exports are import-only; createRequire().resolve cannot resolve them.
+    const config = join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "opencode");
+    const { tool } = await import(import.meta.resolve("@opencode-ai/plugin/tool",
+      pathToFileURL(join(config, "package.json")).href));
+    base.tool = {
+      crit_check: tool({
+        description: CHECK_DESCRIPTION,
+        args: { action: tool.schema.enum(["acquire", "release", "status"]) },
+        async execute({ action }, ctx) {
+          const session = await input?.client?.session.get({ path: { id: ctx.sessionID } });
+          if (!session?.data || session.data.parentID) throw new Error("crit_check belongs to the pane's root session");
+          checkSession = ctx.sessionID;
+          return checks.execute(action, {
+            cwd: ctx.directory || input?.directory, signal: ctx.abort,
+            progress: (text) => ctx.metadata({ title: "Crit check", metadata: { progress: text } }),
+          });
+        },
+      }),
+    };
+    base["chat.message"] = async ({ sessionID }) => {
+      const result = await input?.client?.session.get({ path: { id: sessionID } });
+      if (result?.data && !result.data.parentID) {
+        if (sessionID !== checkSession && checkSession) await checks.finish(input?.directory);
+        checkSession = sessionID;
+      }
+    };
+    base.event = async ({ event }) => {
+      const data = event?.properties ?? {};
+      const id = data.sessionID ?? data.info?.id;
+      if (event.type === "server.instance.disposed" ||
+          (id === checkSession && (["session.idle", "session.error", "session.deleted"].includes(event.type) ||
+            (event.type === "session.status" && data.status?.type === "idle")))) {
+        await checks.finish(input?.directory);
+      }
+    };
+    base.dispose = () => checks.finish(input?.directory);
+  }
+  if (claimed || !ownsLocalLifecycle()) return base;
   const reporter = createReporter();
-  if (!reporter) return pinOwner;
+  if (!reporter) return base;
   claimed = true;
   let selected = process.env.CRIT_RESUME_ID || undefined;
   let state = "unknown";
@@ -58,8 +106,9 @@ async function server() {
   }
   await publish();
   return {
-    ...pinOwner,
+    ...base,
     "chat.message": async ({ sessionID }) => {
+      await base["chat.message"]?.({ sessionID });
       if (!sessionID || parents.has(sessionID)) return;
       if (selected !== sessionID) { epoch += 1; blockers.clear(); }
       selected = sessionID;
@@ -68,6 +117,7 @@ async function server() {
       await publish();
     },
     event: async ({ event }) => {
+      await base.event?.({ event });
       const data = event?.properties ?? {};
       if (data.info?.id && data.info.parentID) parents.set(data.info.id, data.info.parentID);
       const id = data.sessionID ?? data.info?.id;

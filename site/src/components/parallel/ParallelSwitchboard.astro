@@ -89,7 +89,7 @@ const layouts = [
   { id: 'horizontal', label: 'Top & bottom', key: 'Ctrl+Shift+.' },
 ];
 
-const MARK: Record<State, string> = { working: '⠹', input: '◆', idle: '●' };
+const MARK: Record<State, string> = { working: '⢲', input: '◆', idle: '' };
 const STATE_WORD: Record<State, string> = { working: 'working', input: 'waiting for input', idle: 'idle' };
 const STATE_TEXT: Record<State, string> = { working: 'is working', input: 'is waiting for input', idle: 'is idle' };
 const GLYPH: Partial<Record<Line['kind'], string>> = { cmd: '$', prompt: '$', agent: '›', busy: '•', ask: '?' };
@@ -145,11 +145,11 @@ const clientLanes = lanes.map(({ id, branch, sessions }) => ({
       </fieldset>
 
       <div class="sb-set" role="group" aria-labelledby="sb-keys-title">
-        <p class="sb-legend" id="sb-keys-title">Session keys</p>
+        <p class="sb-legend" id="sb-keys-title">Session controls</p>
         <div class="sb-keys">
           <button type="button" class="sb-key" data-key="shell" aria-disabled="false">
-            <span class="sb-caps"><kbd>Ctrl</kbd><span aria-hidden="true">+</span><kbd>Shift</kbd><span aria-hidden="true">+</span><kbd>Enter</kbd></span>
-            <span>Shell beside the agent; the agent keeps running</span>
+            <span class="sb-caps" data-shell-action>Focus shell</span>
+            <span data-shell-description>Select the open shell; the agent keeps running</span>
           </button>
           <button type="button" class="sb-key" data-key="first" aria-disabled="true">
             <span class="sb-caps"><kbd>Ctrl</kbd><span aria-hidden="true">+</span><kbd>Shift</kbd><span aria-hidden="true">+</span><kbd>1</kbd></span>
@@ -509,6 +509,14 @@ const clientLanes = lanes.map(({ id, branch, sessions }) => ({
       for (const radio of layoutRadios) radio.checked = radio.value === layout;
       const current = selected(focused);
       shellKey?.setAttribute('aria-disabled', String(focused.sessions[current].kind === 'shell'));
+      const shell = focused.sessions.findIndex((session) => session.kind === 'shell');
+      const shellOpen = isOpen(focused, shell);
+      const shellAction = shellKey?.querySelector<HTMLElement>('[data-shell-action]');
+      const shellDescription = shellKey?.querySelector<HTMLElement>('[data-shell-description]');
+      if (shellAction) shellAction.textContent = shellOpen ? 'Focus shell' : 'New shell session';
+      if (shellDescription) shellDescription.textContent = shellOpen
+        ? 'Select the open shell; the agent keeps running'
+        : 'Open a shell session in this worktree; the agent keeps running';
       firstKey?.setAttribute('aria-disabled', String(current === 0));
       syncScroll();
     };
@@ -538,7 +546,7 @@ const clientLanes = lanes.map(({ id, branch, sessions }) => ({
         const agent = entry.sessions.findIndex((candidate) => candidate.kind !== 'shell');
         announce(
           agent === -1
-            ? `${entry.branch} only has a shell. Ctrl+Shift+Enter would open another session here; Ctrl+D in the shell is end of input and closes it.`
+            ? `${entry.branch} only has a shell. In Crit, F1 then F2 opens manual controls; choose New agent / shell session, then Terminal to add one. Ctrl+D closes the focused shell.`
             : `${label(entry, from)} is already selected. Ctrl+Shift+1 returns to ${label(entry, agent)}; Ctrl+D in the shell is end of input and closes it.`,
         );
         return;
@@ -548,7 +556,7 @@ const clientLanes = lanes.map(({ id, branch, sessions }) => ({
       if (!wasOpen) opened.add(`${entry.id}:${shell}`);
       active.set(entry.id, shell);
       render();
-      announce(`Ctrl+Shift+Enter ${wasOpen ? 'selected' : 'opened'} ${label(entry, shell)} in ${entry.branch}, and ${label(entry, from)} ${STILL_TEXT[session.state]}.`);
+      announce(`${wasOpen ? 'Selected' : 'Opened'} ${label(entry, shell)} in ${entry.branch}, and ${label(entry, from)} ${STILL_TEXT[session.state]}. ${wasOpen ? 'In Crit, Ctrl+Shift+[ and Ctrl+Shift+] switch between existing sessions.' : 'In Crit, F1 then F2 opens manual controls; choose New agent / shell session, then Terminal.'}`);
     });
 
     firstKey?.addEventListener('click', () => {

@@ -23,7 +23,7 @@ interface Props {
   split?: 'vertical' | 'horizontal';
   description: string;
 }
-const MARK: Record<State, string> = { working: '⠹', idle: '●', input: '◆', exited: '×' };
+const MARK: Record<State, string> = { working: '⢲', idle: '', input: '◆', exited: '×' };
 const { projects, panes, split = 'vertical', description } = Astro.props;
 ---
 <div class="ws" data-split={split} role="group" aria-label={description}>

@@ -1,23 +1,33 @@
 use anyhow::{Context, Result};
+use semver::Version;
 use std::{
     env,
     ffi::CString,
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io::{self, Read, Seek, SeekFrom},
     os::unix::{
         ffi::OsStrExt,
-        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
         process::{CommandExt, ExitStatusExt},
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    time::{Duration, Instant, SystemTime},
+    sync::mpsc,
+    time::{Duration, Instant},
 };
 
-const TOOLS: [(&str, &str, &str); 2] = [
+pub const TOOLS: [(&str, &str, &str); 2] = [
     ("OMP", "omp", "update"),
     ("OpenCode", "opencode", "upgrade"),
 ];
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum State {
+    Checking,
+    Ready,
+    Failed,
+    #[default]
+    Missing,
+}
 /// How long an updater may run, even after Crit has quit. One still running by then has hung, as
 /// `opencode upgrade` has: left waiting in epoll for hours, holding its runtime's memory and waking
 /// the CPU, until killed by hand.
@@ -25,12 +35,8 @@ const UPDATE_DEADLINE: Duration = Duration::from_secs(10 * 60);
 /// How long an updater stopped at its deadline gets to clean up before it is killed.
 const STOP_GRACE: Duration = Duration::from_secs(30);
 const DIAGNOSTIC_BYTES: u64 = 4096;
-/// In the workspace state directory. Its modification time is when the updaters last started;
-/// it holds no data.
-const STAMP_FILE: &str = "updates.stamp";
-/// The updaters start at most this often. Each one boots a heavy runtime that a low-power machine
-/// feels at every launch, while the tools release far less often than Crit starts.
-const UPDATE_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+/// A version lookup must not leave a runtime or network request hanging.
+const CHECK_DEADLINE: Duration = Duration::from_secs(15);
 
 // A private, automatically removed file captures both streams without pipe
 // backpressure, updater banners, or unbounded in-memory output buffers.
@@ -43,6 +49,7 @@ struct UpdateProcess {
 }
 
 /// Why an updater did not succeed.
+#[derive(Debug)]
 enum Failure {
     /// It was still running at its deadline, and was stopped.
     TimedOut(Duration),
@@ -51,6 +58,17 @@ enum Failure {
     Error(String),
 }
 
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut(deadline) => write!(f, "timed out after {}", in_words(*deadline)),
+            Self::Error(detail) => f.write_str(detail),
+        }
+    }
+}
+
+impl std::error::Error for Failure {}
+
 impl UpdateProcess {
     /// `None` when the program is not installed. Updaters outlive Crit, so only a process of
     /// their own can stop one that hangs: coreutils `timeout`, holding it to `deadline`. It leads
@@ -58,13 +76,16 @@ impl UpdateProcess {
     /// at the deadline it asks them all to stop (SIGTERM), and if the updater is still running
     /// `STOP_GRACE` later, it kills them (SIGKILL). Without `timeout`, the updater runs directly,
     /// with no deadline.
+    #[cfg(test)]
     fn spawn(program: &str, argument: &str, deadline: Duration) -> Result<Option<Self>> {
-        let context = || format!("start {program} {argument}");
-        // Looked up before anything starts: `timeout` starts whether or not the tool is
-        // installed, and would report one that is not as a failure.
-        let Some(path) = locate(program).with_context(context)? else {
+        let Some(path) = locate(program).with_context(|| format!("find {program}"))? else {
             return Ok(None);
         };
+        Self::spawn_at(&path, &[argument], deadline).map(Some)
+    }
+
+    fn spawn_at(path: &Path, arguments: &[&str], deadline: Duration) -> Result<Self> {
+        let context = || format!("start {} {}", path.display(), arguments.join(" "));
         let timeout = locate("timeout").ok().flatten();
         let mut command = match &timeout {
             Some(timeout) => {
@@ -80,7 +101,7 @@ impl UpdateProcess {
         let output = tempfile::tempfile().context("capture updater output")?;
         let started = Instant::now();
         let child = command
-            .arg(argument)
+            .args(arguments)
             .stdin(Stdio::null())
             .stdout(output.try_clone()?)
             .stderr(output.try_clone()?)
@@ -88,12 +109,12 @@ impl UpdateProcess {
             .process_group(0)
             .spawn()
             .with_context(context)?;
-        Ok(Some(Self {
+        Ok(Self {
             child,
             output,
             started,
             deadline: timeout.is_some().then_some(deadline),
-        }))
+        })
     }
 
     fn diagnostic(&mut self) -> Result<String> {
@@ -143,44 +164,73 @@ impl UpdateProcess {
             format!("{status}: {detail}")
         })))
     }
+
+    fn wait(&mut self) -> Result<(), Failure> {
+        loop {
+            if let Some(outcome) = self.poll() {
+                return outcome;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
-/// The updaters running in the background, each reported on once, when it finishes. Dropping
-/// this leaves the ones still running alone: an interrupted install is worse than an orphan, and
-/// each stays held to its deadline (see `UpdateProcess::spawn`).
+enum Check {
+    Running(UpdateProcess),
+    Ready,
+    Missing,
+}
+
+/// Background release checks and the installers they start. Dropping this never interrupts an
+/// installer; its separate `timeout` process still holds it to the deadline.
 #[derive(Default)]
 pub struct Checks {
-    /// In tool order, by the name their diagnostic carries. An updater that could not start keeps
-    /// its error here for the first `poll`.
+    pending: Option<mpsc::Receiver<(&'static str, Result<Check, String>)>>,
     updaters: Vec<(String, Result<UpdateProcess, String>)>,
+    states: [State; TOOLS.len()],
 }
 
-/// Starts every updater at once, unless they already started less than `UPDATE_INTERVAL` ago, and
-/// returns without waiting for any of them. `state_dir` is the directory of the workspace store
-/// this window owns, which keeps the stamp. Without one nothing starts: updating is the job of the
-/// window that owns the saved workspace, and with no usable state directory at all, nothing
-/// would keep every launch from updating again.
-pub fn start(state_dir: Option<&Path>) -> Checks {
-    Checks::start(state_dir, &TOOLS)
+/// Checks every owning-window launch, without waiting for either the network or an agent runtime.
+/// Other windows leave the installed tools alone.
+pub fn start(owns_workspace: bool) -> Checks {
+    if !owns_workspace {
+        return Checks::default();
+    }
+    let (tx, rx) = mpsc::channel();
+    let mut checks = Checks {
+        pending: Some(rx),
+        states: [State::Checking; TOOLS.len()],
+        ..Checks::default()
+    };
+    for (name, program, argument) in TOOLS {
+        let tx = tx.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name(format!("{program}-update"))
+            .spawn(move || {
+                let outcome =
+                    check_and_update(program, argument).map_err(|error| format!("{error:#}"));
+                let _ = tx.send((name, outcome));
+            })
+        {
+            checks
+                .updaters
+                .push((name.to_owned(), Err(error.to_string())));
+        }
+    }
+    checks
 }
 
 impl Checks {
-    /// `start`, with `tools` in place of the real updaters.
-    fn start(state_dir: Option<&Path>, tools: &[(&str, &str, &str)]) -> Self {
-        let Some(directory) = state_dir else {
-            return Self::default();
-        };
-        let stamp = directory.join(STAMP_FILE);
-        let now = SystemTime::now();
-        if fresh(&stamp, now) {
-            return Self::default();
-        }
-        // Updating matters more than the stamp: one that cannot be written only means the next
-        // launch updates again.
-        let _ = touch(&stamp, now);
-        Self::spawn(tools, UPDATE_DEADLINE)
+    /// Startup may launch agents only after every version check and installer has finished.
+    pub fn is_running(&self) -> bool {
+        self.pending.is_some() || !self.updaters.is_empty()
     }
 
+    pub fn states(&self) -> &[State; TOOLS.len()] {
+        &self.states
+    }
+
+    #[cfg(test)]
     /// Starts each of `tools`, held to `deadline`.
     fn spawn(tools: &[(&str, &str, &str)], deadline: Duration) -> Self {
         let updaters = tools
@@ -195,12 +245,39 @@ impl Checks {
                 Some((name.to_owned(), process))
             })
             .collect();
-        Self { updaters }
+        Self {
+            updaters,
+            pending: None,
+            ..Self::default()
+        }
     }
 
     /// Errors for the updaters that failed since the last call. Successful updates are silent.
     pub fn poll(&mut self) -> Vec<String> {
+        while let Some(pending) = &self.pending {
+            match pending.try_recv() {
+                Ok((name, Ok(check))) => {
+                    let state = match check {
+                        Check::Running(process) => {
+                            self.updaters.push((name.to_owned(), Ok(process)));
+                            State::Checking
+                        }
+                        Check::Ready => State::Ready,
+                        Check::Missing => State::Missing,
+                    };
+                    if let Some(index) = TOOLS.iter().position(|tool| tool.0 == name) {
+                        self.states[index] = state;
+                    }
+                }
+                Ok((name, Err(error))) => {
+                    self.updaters.push((name.to_owned(), Err(error)));
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => self.pending = None,
+            }
+        }
         let mut errors = Vec::new();
+        let states = &mut self.states;
         self.updaters.retain_mut(|(name, process)| {
             let outcome = match process {
                 Ok(process) => match process.poll() {
@@ -209,6 +286,13 @@ impl Checks {
                 },
                 Err(error) => Err(Failure::Error(std::mem::take(error))),
             };
+            if let Some(index) = TOOLS.iter().position(|tool| tool.0 == name.as_str()) {
+                states[index] = if outcome.is_ok() {
+                    State::Ready
+                } else {
+                    State::Failed
+                };
+            }
             let failure = match outcome {
                 Ok(()) => return false,
                 Err(Failure::TimedOut(deadline)) => {
@@ -225,43 +309,118 @@ impl Checks {
     }
 }
 
-/// Whether `stamp` says the updaters started less than `UPDATE_INTERVAL` before `now`. Only a
-/// private file counts. A time in the future counts as fresh: the clock has gone back since it
-/// was written (as on a machine without a battery-backed clock, before it syncs), so the stamp's
-/// own time is the likelier one.
-fn fresh(stamp: &Path, now: SystemTime) -> bool {
-    fs::symlink_metadata(stamp).is_ok_and(|metadata| {
-        private_file(&metadata)
-            && metadata.modified().is_ok_and(|modified| {
-                now.duration_since(modified)
-                    .map_or(true, |age| age < UPDATE_INTERVAL)
-            })
-    })
-}
-
-/// Sets `stamp`'s modification time to `now`, creating it if it is missing. Like the workspace
-/// state beside it, it is owner-private and never written through a link.
-fn touch(stamp: &Path, now: SystemTime) -> io::Result<()> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(stamp)?;
-    if !private_file(&file.metadata()?) {
-        return Err(io::Error::other(
-            "updates stamp is not a regular, singly linked file owned by the current user",
-        ));
+fn check_and_update(program: &str, argument: &str) -> Result<Check> {
+    let Some(path) = locate(program).with_context(|| format!("find {program}"))? else {
+        return Ok(Check::Missing);
+    };
+    // OMP's own updater already performs a metadata-only check before downloading anything.
+    // Let it resolve its build-service override, installation method and stable/canary setting.
+    if program == "omp" {
+        return UpdateProcess::spawn_at(&path, &[argument], UPDATE_DEADLINE).map(Check::Running);
     }
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    file.set_modified(now)
+    let installed = installed_version(&path)?;
+    let Some(tag) = opencode_tag(&installed) else {
+        // Other majors and custom builds carry channel information that `--version` cannot
+        // reveal. Preserve their native release check rather than guessing another feed.
+        return UpdateProcess::spawn_at(&path, &[argument], UPDATE_DEADLINE).map(Check::Running);
+    };
+    let metadata = release_json(&format!("https://registry.npmjs.org/opencode-ai/{tag}"))?;
+    let published = parse_version(
+        metadata["version"]
+            .as_str()
+            .context("release metadata has no version")?,
+    )?;
+    update_if_newer(&path, argument, &installed, &published)
+        .map(|process| process.map_or(Check::Ready, Check::Running))
 }
 
-/// What `restore` requires of its state files: a regular, singly linked file owned by the
-/// current user.
-fn private_file(metadata: &fs::Metadata) -> bool {
-    metadata.is_file() && metadata.uid() == unsafe { libc::geteuid() } && metadata.nlink() == 1
+fn opencode_tag(version: &Version) -> Option<&str> {
+    if version.major > 1 {
+        return None;
+    }
+    if version.pre.is_empty() {
+        return Some("latest");
+    }
+    // Official previews encode the complete channel before the final UTC YYYYMMDDHHmm suffix.
+    // A custom version need not identify its channel: never silently move it to stable.
+    if let Some((channel, timestamp)) = version.pre.as_str().rsplit_once('-')
+        && (version.major, version.minor, version.patch) == (0, 0, 0)
+        && !channel.is_empty()
+        && timestamp.len() == 12
+        && timestamp.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Some(if channel == "local" {
+            "latest"
+        } else {
+            channel
+        });
+    }
+    None
+}
+
+fn parse_version(text: &str) -> Result<Version> {
+    let text = text.trim();
+    Version::parse(text.strip_prefix('v').unwrap_or(text))
+        .with_context(|| format!("invalid tool version {text:?}"))
+}
+
+/// npm's manifest describes this exact executable. Reading it avoids booting OpenCode's runtime
+/// just to ask its version; standalone binaries and other installation layouts use `--version`.
+fn package_version(path: &Path) -> Option<Version> {
+    let binary = path.canonicalize().ok()?;
+    let root = binary.parent()?.parent()?;
+    let package: serde_json::Value =
+        serde_json::from_reader(File::open(root.join("package.json")).ok()?).ok()?;
+    if package["name"] != "opencode-ai" {
+        return None;
+    }
+    let entry = package["bin"]["opencode"].as_str()?;
+    if root.join(entry).canonicalize().ok()? != binary {
+        return None;
+    }
+    parse_version(package["version"].as_str()?).ok()
+}
+
+fn installed_version(path: &Path) -> Result<Version> {
+    if let Some(version) = package_version(path) {
+        return Ok(version);
+    }
+    let mut process = UpdateProcess::spawn_at(path, &["--version"], CHECK_DEADLINE)?;
+    process.wait().context("read installed version")?;
+    parse_version(&process.diagnostic()?)
+}
+
+fn release_json(url: &str) -> Result<serde_json::Value> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(CHECK_DEADLINE))
+        .user_agent(concat!("crit/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .into();
+    let body = agent
+        .get(url)
+        .header("Accept", "application/json")
+        .call()
+        .with_context(|| format!("check release at {url}"))?
+        .body_mut()
+        .with_config()
+        .limit(1024 * 1024)
+        .read_to_string()?;
+    serde_json::from_str(&body).context("read release metadata")
+}
+
+fn update_if_newer(
+    path: &Path,
+    argument: &str,
+    installed: &Version,
+    published: &Version,
+) -> Result<Option<UpdateProcess>> {
+    if published.major != installed.major || !published.cmp_precedence(installed).is_gt() {
+        return Ok(None);
+    }
+    // Pin the version we compared. The native installer still selects its installation method
+    // and registry, but cannot downgrade or cross a major if its feed changes during the check.
+    let target = published.to_string();
+    UpdateProcess::spawn_at(path, &[argument, &target], UPDATE_DEADLINE).map(Some)
 }
 
 /// Where `program` is, found the way spawning it finds it: a path with a slash as it is, a name in
@@ -314,12 +473,13 @@ fn in_words(duration: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     /// Polls until every updater has finished; the errors, in the order they came.
     fn finish(checks: &mut Checks) -> Vec<String> {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut errors = Vec::new();
-        while !checks.updaters.is_empty() {
+        while checks.is_running() {
             assert!(Instant::now() < deadline, "an updater never finished");
             errors.extend(checks.poll());
             std::thread::sleep(Duration::from_millis(5));
@@ -366,18 +526,17 @@ mod tests {
             ("Locked", locked.to_str().unwrap(), "update"),
         ];
         let mut checks = Checks::spawn(&tools, UPDATE_DEADLINE);
-        let mut errors = finish(&mut checks);
-        errors.sort();
-        assert_eq!(
-            errors,
-            [
-                "Failing update failed: exit status: 1: refused. Continuing with the installed version.".to_owned(),
-                format!(
-                    "Locked update failed: start {} update: Permission denied (os error 13). \
-                     Continuing with the installed version.",
-                    locked.display()
-                ),
-            ]
+        let errors = finish(&mut checks);
+        assert_eq!(errors.len(), 2);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("Failing") && error.contains("refused"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("Locked") && error.contains("Permission denied"))
         );
         assert!(checks.poll().is_empty());
     }
@@ -507,115 +666,47 @@ exit 9"#,
     }
 
     #[test]
-    fn deadlines_are_worded_in_whole_minutes_where_possible() {
-        assert_eq!(in_words(UPDATE_DEADLINE), "10 minutes");
-        assert_eq!(in_words(Duration::from_secs(60)), "1 minute");
-        assert_eq!(in_words(Duration::from_secs(90)), "90 seconds");
-        assert_eq!(in_words(Duration::from_secs(1)), "1 second");
-    }
-
-    /// One updater that always starts, so a start that is not skipped has one running.
-    const ALWAYS: [(&str, &str, &str); 1] = [("True", "/bin/true", "update")];
-
-    fn modified(path: &Path) -> SystemTime {
-        fs::metadata(path).unwrap().modified().unwrap()
-    }
-
-    fn set_modified(path: &Path, time: SystemTime) {
-        File::options()
-            .write(true)
-            .open(path)
-            .unwrap()
-            .set_modified(time)
-            .unwrap();
-    }
-
-    #[test]
-    fn without_the_saved_workspace_nothing_starts() {
-        assert!(Checks::start(None, &ALWAYS).updaters.is_empty());
-    }
-
-    #[test]
-    fn a_missing_stamp_starts_the_updaters_and_is_written() {
+    fn current_newer_installed_or_other_major_never_starts_an_upgrade() {
         let directory = tempfile::tempdir().unwrap();
-        let stamp = directory.path().join(STAMP_FILE);
-        let mut checks = Checks::start(Some(directory.path()), &ALWAYS);
-        assert_eq!(checks.updaters.len(), 1);
-        assert!(finish(&mut checks).is_empty());
-        let metadata = fs::symlink_metadata(&stamp).unwrap();
-        assert!(metadata.is_file());
-        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
-        // A launch later the same day leaves both the updaters and the stamp alone.
-        assert!(
-            Checks::start(Some(directory.path()), &ALWAYS)
-                .updaters
-                .is_empty()
-        );
-        assert_eq!(modified(&stamp), metadata.modified().unwrap());
-    }
-
-    #[test]
-    fn a_stale_stamp_starts_the_updaters_and_is_renewed() {
-        let directory = tempfile::tempdir().unwrap();
-        let stamp = directory.path().join(STAMP_FILE);
-        fs::write(&stamp, "").unwrap();
-        fs::set_permissions(&stamp, fs::Permissions::from_mode(0o644)).unwrap();
-        let stale = SystemTime::now() - UPDATE_INTERVAL - Duration::from_secs(60);
-        set_modified(&stamp, stale);
-        let mut checks = Checks::start(Some(directory.path()), &ALWAYS);
-        assert_eq!(checks.updaters.len(), 1);
-        assert!(finish(&mut checks).is_empty());
-        assert!(modified(&stamp) > stale + UPDATE_INTERVAL);
-        assert_eq!(
-            fs::metadata(&stamp).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert!(
-            Checks::start(Some(directory.path()), &ALWAYS)
-                .updaters
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn a_fresh_stamp_starts_nothing_and_is_left_alone() {
-        let directory = tempfile::tempdir().unwrap();
-        let stamp = directory.path().join(STAMP_FILE);
-        fs::write(&stamp, "").unwrap();
-        let now = SystemTime::now();
-        // A stamp from the future is fresh too: the clock went back after it was written.
-        for written in [
-            now - UPDATE_INTERVAL + Duration::from_secs(60),
-            now + UPDATE_INTERVAL,
-        ] {
-            set_modified(&stamp, written);
-            let before = modified(&stamp);
+        let updater = directory.path().join("updater");
+        fs::write(&updater, "#!/bin/sh\nprintf upgraded > \"$0.installed\"\n").unwrap();
+        fs::set_permissions(&updater, fs::Permissions::from_mode(0o755)).unwrap();
+        let installed = Version::parse("1.19.1+local").unwrap();
+        for candidate in ["1.19.1", "1.19.1+rebuilt", "1.18.9", "2.0.0"] {
             assert!(
-                Checks::start(Some(directory.path()), &ALWAYS)
-                    .updaters
-                    .is_empty()
+                update_if_newer(
+                    &updater,
+                    "upgrade",
+                    &installed,
+                    &Version::parse(candidate).unwrap()
+                )
+                .unwrap()
+                .is_none(),
+                "{candidate}"
             );
-            assert_eq!(modified(&stamp), before);
         }
+        assert!(!updater.with_extension("installed").exists());
+
+        let mut upgrade = update_if_newer(
+            &updater,
+            "upgrade",
+            &installed,
+            &Version::parse("1.19.2").unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        upgrade.wait().unwrap();
+        assert_eq!(
+            fs::read(updater.with_extension("installed")).unwrap(),
+            b"upgraded"
+        );
     }
 
     #[test]
-    fn a_stamp_that_cannot_be_written_does_not_hold_updates_back() {
-        let directory = tempfile::tempdir().unwrap();
-        let stamp = directory.path().join(STAMP_FILE);
-        let target = directory.path().join("elsewhere");
-        fs::write(&target, "").unwrap();
-        // Stale, so a stamp written through the link would renew it.
-        set_modified(&target, SystemTime::now() - UPDATE_INTERVAL * 2);
-        let before = modified(&target);
-        std::os::unix::fs::symlink(&target, &stamp).unwrap();
-        // The link is never followed, so every launch updates, as before there were stamps.
-        for _ in 0..2 {
-            let mut checks = Checks::start(Some(directory.path()), &ALWAYS);
-            assert_eq!(checks.updaters.len(), 1);
-            assert!(finish(&mut checks).is_empty());
-        }
-        assert_eq!(modified(&target), before);
-        assert!(fs::symlink_metadata(&stamp).unwrap().is_symlink());
+    fn preview_channels_keep_hyphens_and_custom_versions_are_not_assumed_stable() {
+        let preview = Version::parse("0.0.0-snapshot-opentui-upgrade-202610161232").unwrap();
+        assert_eq!(opencode_tag(&preview).unwrap(), "snapshot-opentui-upgrade");
+        assert!(opencode_tag(&Version::parse("0.0.0-custom").unwrap()).is_none());
+        assert!(parse_version("1.19.1\nunexpected output").is_err());
     }
 }

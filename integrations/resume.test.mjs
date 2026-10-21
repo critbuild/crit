@@ -21,6 +21,7 @@ async function hook(name, initial) {
   let source = await readFile(new URL(name, import.meta.url), "utf8");
   source = source.replace('"./reporter.js"', JSON.stringify(`data:text/javascript,${encodeURIComponent(reporter)}`));
   source = source.replace('"solid-js"', JSON.stringify(`data:text/javascript,${encodeURIComponent(solid)}`));
+  source = source.replace('"./checks.js"', JSON.stringify(new URL("./checks.js", import.meta.url).href));
   source = source.replaceAll("process.env.CRIT_RESUME_ID", initial === undefined ? "undefined" : JSON.stringify(initial));
   source += `\n// ${key}\n`;
   fixture.module = await import(`data:text/javascript,${encodeURIComponent(source)}`);
